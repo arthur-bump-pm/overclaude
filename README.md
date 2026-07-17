@@ -1,140 +1,175 @@
 # overclaude
 
-**Claude Code, overclocked.** A portable kit that turns a stock Claude Code install into a multi-account, context-aware, model-routed setup: hot-swap between Claude accounts without leaving your session, hand off to a fresh session before context fills up, watch every usage meter in the statusline, and route multi-agent workflow subagents to the right model tier automatically.
+[![PyPI version](https://img.shields.io/pypi/v/overclaude)](https://pypi.org/project/overclaude/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-Clone it, run the installer, register your accounts — same setup on any Mac.
+**Claude Code, overclocked.** Hot-swap between Claude accounts without leaving your session, hand off to a fresh session before context fills up, and watch every usage meter live:
 
-```
+```text
 Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2]
+└ model+effort   └ folder+branch*      └ live count └ account [slot/total]
+
 ctx [████░░░░░░] 42% | 5h [███████░░░] 71% | week [██░░░░░░░░] 18% | Fable [███████░░░] 73%
+└ context window       └ 5-hour limit         └ weekly limit           └ model-scoped bucket
+                       bars turn yellow at 50% · red at 80%
 ```
-
-## Features
-
-### `/swap` — hot account switching
-Switch which Claude account serves your sessions **without restarting anything**. Every live Claude Code session on the machine (CLI, VS Code, background) adopts the new credential within ~30 seconds, mid-conversation, full context preserved. Hit a rate limit on one account? `/swap work` and keep typing.
-
-- `/swap` — dashboard: accounts, aliases, token health, per-account 5h/7d/scoped usage, live-session table
-- `/swap <target>` — hot-swap (guarded: refuses if another session is mid-task, unless you `force`)
-- `/swap <target> handoff` — switch accounts AND continue in a fresh session with packaged context
-- `/swap <target> restart` — rare escape hatch for model-entitlement mismatches or wedged auth
-- `/swap add` — guided registration of a new account
-
-A busy-session preflight protects you from yanking credentials out from under an active session. Sessions too old to report status are judged by transcript activity instead of being assumed busy.
-
-### `/handoff` — context-threshold session handoff
-When a session's context crosses **60% / 75% / 85%**, Claude offers a handoff: it packages goals, state, decisions, files touched, and next steps into a structured document, then a fresh session auto-loads it via a SessionStart hook. You lose the token bloat, not the thread. Works same-account (`/handoff`) or combined with an account switch (`/swap <target> handoff`). Also: `/handoff status`, `/handoff cancel`.
-
-### Instrumented statusline
-Two lines, everything you actually check: model + effort, folder (git branch, dirty marker), live session count, active account `[slot/total]`, then four 10-char meters — **context window, 5-hour limit, weekly limit, and your model-scoped (Fable) bucket** — green/yellow/red at 50/80%. The statusline is also the data spine: it publishes each session's context % to a relay file the threshold hooks read.
-
-### `ULTRACODE.md` — model routing for multi-agent workflows
-A policy document loaded into every session that teaches the orchestrator to route workflow subagents by task: haiku/sonnet for bulk scouting and finding, opus for verification and judging, the top tier reserved for final synthesis and tie-breaks. Core rule: *spend the scarce model only where judgment is the bottleneck, never where volume is.* Includes a routing table, hard floors that never get downgraded, escalation rules, and a pre-dispatch lint.
-
-## Requirements
-
-- macOS (scripts use BSD `stat -f`, `shasum`), zsh
-- `jq`, `git`, `pipx`
-- [Claude Code](https://claude.com/claude-code) — tested on 2.1.212; the session-registry `status` field needs ~2.1.211+
-- Claude subscription accounts (Max-style) — the rate-limit meters read subscription usage buckets
-
-The credential-switching engine, **cswap**, ships with the kit as a full source tree (`vendor/claude-swap/`, v0.21.0) and is installed automatically by `install.sh` via pipx or uv — no separate install step. See [Credits](#credits).
 
 ## Install
 
-### One-liner (pipx or uv)
-
 ```bash
 pipx install overclaude && overclaude install
-# or
+```
+
+Then register your accounts (once):
+
+```bash
+cswap add             # registers the account you're logged in as
+cswap alias 1 work    # name your slots
+cswap alias 2 personal
+exec zsh              # reload shell
+```
+
+Start a **new** Claude Code session (hooks load at session start) and check the statusline shows `👤 work [1/2]`. Adding a second account is guided — run `/swap add` inside Claude Code.
+
+<details>
+<summary>Other install methods, requirements, upgrading</summary>
+
+```bash
+# uv
 uv tool install overclaude && overclaude install
+
+# from source
+git clone https://github.com/arthur-bump-pm/overclaude && cd overclaude && ./install.sh
+
+# track unreleased main
+pipx install git+https://github.com/arthur-bump-pm/overclaude.git
 ```
 
-The package carries the full kit (including the bundled cswap), so this is everything. The `overclaude` command stays around for later: `overclaude install` (refresh after an upgrade), `overclaude uninstall`, `overclaude path`, `overclaude version`. Upgrade with `pipx upgrade overclaude` / `uv tool upgrade overclaude`.
+Or paste this into any Claude Code session and let it install itself:
 
-To track the latest unreleased main instead: `pipx install git+https://github.com/arthur-bump-pm/overclaude.git`.
+> Install overclaude (https://github.com/arthur-bump-pm/overclaude) on this machine, fix anything its preflight complains about, and tell me what post-install steps I need to do myself.
 
-### From a clone
+**Requirements:** macOS, zsh, `jq`, `pipx` or `uv`, Max-style Claude subscription accounts. The credential engine (cswap) ships inside the package and installs automatically.
 
-```bash
-git clone https://github.com/arthur-bump-pm/overclaude.git
-cd overclaude
-./install.sh
+**Upgrade:** `pipx upgrade overclaude && overclaude install`
+
+**Uninstall:** `overclaude uninstall` — removes exactly what install added (backed up, settings merged out); account state in `~/.claude-swap-backup/` survives.
+
+The installer is idempotent and conservative: timestamped backups of everything it touches, jq-merge into your existing `settings.json` (other hooks survive), never overwrites an existing statusLine, re-running is a no-op.
+
+</details>
+
+## What you get
+
+### `/swap` — hot account switching
+Every live Claude Code session on the machine adopts the new account's credential within ~30 s — mid-conversation, no restart, context preserved. Hit a rate limit? `/swap work` and keep typing. A preflight blocks the swap while another session is mid-task (`force` overrides).
+
+### `/handoff` — escape context bloat, keep the thread
+
+```mermaid
+flowchart LR
+    A[Context fills up] --> B[Hook offers handoff at 60/75/85%]
+    B --> C[You accept]
+    C --> D[Claude packages goals, state, next steps]
+    D --> E[Session exits, shell wrapper relaunches]
+    E --> F[SessionStart hook auto-injects the package]
+    F --> G[Fresh session, ctx near zero]
+    G --> A
 ```
 
-Use the clone if you want to hack on the kit — `sync.sh` (live-setup → repo → push) only works from a git clone.
+You lose the token bloat, not the thread. Works same-account (`/handoff`) or combined with a switch (`/swap work handoff`).
 
-The installer is **idempotent and conservative**: every modified file gets a timestamped backup, your existing `settings.json` content (other hooks, permissions) is preserved by a jq merge, an existing statusLine is never overwritten (you get instructions instead), and re-running is a no-op.
+### Statusline
+The two-line display above — and the kit's data spine: it publishes each session's context % to a relay the threshold hooks read. **Skip the kit's statusline and handoff offers never fire.**
 
-The installer also sets up cswap from the bundled copy if it isn't on the machine yet (needs `pipx`; Python dependencies are resolved from PyPI).
+### `ULTRACODE.md` — model routing for multi-agent workflows
+A policy loaded into every session: bulk work rides cheap models, verification rides opus, only final judgment spends the top tier. Routing table, hard floors, escalation rules included.
 
-### Or just ask Claude
+## Cheat sheet
 
-If Claude Code is already running on the machine, paste this and let it do the work:
+| Command | Effect |
+|---|---|
+| `/swap` | Dashboard: accounts, usage, token health, live sessions |
+| `/swap <target>` | Hot-swap all sessions to `<target>` (alias, slot, or email) |
+| `/swap <target> force` | Same, bypassing the busy-session guard |
+| `/swap <target> handoff` | Switch account + package this session + resume fresh |
+| `/swap <target> restart` | Switch + restart this session in place (auth edge cases) |
+| `/swap add` | Guided registration of a new account |
+| `/handoff` | Package this session and continue fresh, same account |
+| `/handoff status` | Context %, thresholds fired, pending package state |
+| `/handoff cancel` | Cancel a pending handoff |
+| `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |
 
-> Clone https://github.com/arthur-bump-pm/overclaude, read its README, run ./install.sh, and fix anything the preflight complains about (jq, pipx, PATH). Then tell me what post-install steps I need to do myself.
+Or skip memorizing and **paste a prompt**:
 
-Claude will run the installer, resolve missing dependencies, and hand you back the two things only you can do: registering accounts (`cswap add` needs you to `/login` as each account) and restarting sessions. After a restart, `/swap add` gives you a guided flow for registering additional accounts from inside Claude Code.
+| Paste into Claude Code | Runs |
+|---|---|
+| "Swap me to my work account" | `/swap work` |
+| "Context is getting full — hand off to a fresh session" | `/handoff` |
+| "Swap to personal and hand off in one shot" | `/swap personal handoff` |
+| "What's my context and account usage right now?" | `/handoff status` + `/swap` dashboard |
+| "Install overclaude on this machine" | the whole install flow (works before the kit exists) |
+| "Upgrade overclaude and refresh the hooks" | `pipx upgrade overclaude && overclaude install` |
 
-Post-install:
+## How it fits together
 
-1. Register accounts: `cswap add` (repeat per account), then alias them: `cswap alias 1 work`, `cswap alias 2 personal`
-2. Open a new shell (or `source ~/.zshrc`)
-3. Start a **new** Claude Code session — hooks and statusline load at session start
-4. Verify: `swap-guard whoami` prints your session JSON; the statusline shows `👤 <alias> [n/N]` and four meters
+```mermaid
+flowchart TD
+    SL[Statusline publishes ctx relay] --> HK[ctx-watch and ctx-notify hooks]
+    HK --> SK[swap and handoff skills]
+    SK --> GD[swap-guard busy preflight]
+    GD --> CS[cswap vendored engine]
+    CS --> KC[macOS keychain credential]
+    KC --> AS[All live sessions adopt within 30s]
+```
 
-## Components
+The heavy lifting — credential storage, keychain switching, OAuth refresh, usage polling — is **[claude-swap](https://github.com/realiti4/claude-swap)** by [Onur Cetinkol](https://github.com/realiti4) (MIT), vendored unmodified in `vendor/claude-swap/` and installed automatically. Go star it.
 
-| File | Installs to | What it does |
+<details>
+<summary>Caveats worth knowing</summary>
+
+- A swap flips **all** live Claude Code sessions on the machine — it's the shared keychain credential, not per-terminal.
+- Hooks load at session start; sessions already open at install time won't offer handoffs until restarted (hot-swap works everywhere immediately).
+- The Fable/scoped meter reads cswap's cache — it refreshes whenever cswap runs and can lag between invocations. The 5h/week meters describe whichever account served the last response, so they lag ~1 turn after a swap; the 👤 segment is always current.
+- Legacy clients that don't report status (older VS Code extension builds) are judged busy/idle by transcript mtime during swap preflight.
+- claude.ai connectors (Gmail/Drive/…) are per-account server-side and don't follow a swap.
+- Context thresholds re-arm 10 points below a fired threshold; Claude Code's auto-compact stays as the backstop.
+
+</details>
+
+<details>
+<summary>Components (file → destination)</summary>
+
+| File | Installs to | Role |
 |---|---|---|
-| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: `whoami`, live-session table, busy-preflight for swaps, per-directory handoff state, relay status |
-| `skills/swap/SKILL.md` | `~/.claude/skills/swap/` | The `/swap` skill: dashboard, guarded hot-swap, handoff/restart modes, account registration |
-| `skills/handoff/SKILL.md` | `~/.claude/skills/handoff/` | The `/handoff` skill: context packaging, relaunch flags, status/cancel |
-| `hooks/handoff-inject.sh` | `~/.claude/hooks/` | SessionStart: auto-loads a pending handoff package into the new session (10-min TTL, per-directory) |
-| `hooks/ctx-watch.sh` | `~/.claude/hooks/` | UserPromptSubmit: fires the 60/75/85% handoff offers, with re-arm hysteresis |
-| `hooks/ctx-notify.sh` | `~/.claude/hooks/` | Stop: threshold banner notifications |
-| `statusline/statusline-command.sh` | `~/.claude/statusline-command.sh` | Renders the statusline; publishes the context relay the hooks depend on |
-| `claude/ULTRACODE.md` | `~/.claude/` + import in `CLAUDE.md` | Model/effort routing policy for multi-agent workflows |
-| `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | 3 hook groups, statusLine block, 2 permission allows |
-| `shell/zshrc-snippet.sh` | appended to `~/.zshrc` (markers) | `claude()` wrapper honoring handoff/restart relaunch flags, `swap` alias, PATH guard |
-| `vendor/claude-swap/` | pipx/uv-installed if `cswap` absent | The bundled credential-switching engine, full source (see [Credits](#credits)) |
+| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state |
+| `skills/swap/SKILL.md` | `~/.claude/skills/swap/` | The `/swap` skill |
+| `skills/handoff/SKILL.md` | `~/.claude/skills/handoff/` | The `/handoff` skill |
+| `hooks/handoff-inject.sh` | `~/.claude/hooks/` | SessionStart: auto-loads a pending handoff package (10-min TTL, per-directory) |
+| `hooks/ctx-watch.sh` | `~/.claude/hooks/` | UserPromptSubmit: fires the 60/75/85% offers with re-arm hysteresis |
+| `hooks/ctx-notify.sh` | `~/.claude/hooks/` | Stop: threshold banners |
+| `statusline/statusline-command.sh` | `~/.claude/statusline-command.sh` | Renders the statusline; publishes the ctx relay |
+| `claude/ULTRACODE.md` | `~/.claude/` + `CLAUDE.md` import | Model/effort routing policy |
+| `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | 3 hook groups, statusLine, 2 permission allows |
+| `shell/zshrc-snippet.sh` | `~/.zshrc` (markers) | `claude()` relaunch wrapper, `swap` alias, PATH guard |
+| `vendor/claude-swap/` | pipx/uv-installed if absent | The bundled credential engine |
 
-## Behaviors & caveats — read these
+</details>
 
-- **A swap flips ALL live Claude Code sessions on the machine** within ~30s. It's the shared keychain credential, not per-terminal.
-- **Hooks load at session start.** Sessions already running at install time won't offer handoffs until restarted; a plain hot-swap works everywhere immediately.
-- **The kit's statusline is a hard dependency for the handoff offers** — it publishes the context relay that `ctx-watch`/`ctx-notify` read. If the installer skipped it because you already had a statusLine, either switch (`.statusLine.command` → `bash ~/.claude/statusline-command.sh`) or merge the relay block into your own script; otherwise threshold prompts silently never fire.
-- The **Fable/scoped meter reads cswap's cache**, refreshed whenever cswap runs (any `/swap` dashboard, switch, or `cswap list`) — it can lag between invocations. The 5h/week meters describe the account that served the last response, so they lag ~1 turn right after a swap; the 👤 segment is always current.
-- Statusless legacy clients (older VS Code extension builds) are judged busy/idle by **transcript mtime** (2-min window) during swap preflight.
-- **claude.ai connectors (Gmail/Drive/…) are per-account server-side** — they don't follow a swap.
-- Context thresholds re-arm if usage drops 10 points below the fired threshold; Claude Code's auto-compact (~92%) remains the backstop.
-- The `swap` shell alias (`cswap switch`) works from any terminal even when sessions are hard rate-limited — the panic path when a session can't complete its own `/swap` turn.
-
-## Keeping the repo in sync with your live setup
-
-Improve your live setup (statusline tweaks, skill edits, ULTRACODE changes), then:
+<details>
+<summary>Maintainer workflow</summary>
 
 ```bash
-./sync.sh            # live files -> repo, scrub-check, show diff, commit, push
-./sync.sh --dry-run  # just show what would change
+./sync.sh            # live setup -> repo: scrub-gated diff, commit, push
+./sync.sh --release  # + version bump + GitHub release -> PyPI (trusted publishing)
+./sync.sh --dry-run  # preview either
 ```
 
-`sync.sh` copies the live files back into the repo layout, extracts your current zshrc block, **aborts if the diff contains personal data** (usernames, emails, `/Users/...` paths), and only then commits and pushes. On other machines: `git pull && ./install.sh` (no-ops everything unchanged).
+A plain `git push` updates git installs only — **PyPI users get changes only via releases**. The scrub gate aborts any commit whose diff contains usernames, emails, or `/Users/…` paths. See `CLAUDE.md` for the full protocol.
 
-`settings/settings-fragment.json` is curated by hand — if you add hooks or permissions the kit should ship, edit the fragment directly.
-
-## Uninstall
-
-```bash
-./uninstall.sh
-```
-
-Removes installed files, deletes the zshrc block, removes the `@ULTRACODE.md` import, and strips exactly the kit's entries from `settings.json` (your other settings survive; everything edited is backed up first). Runtime state in `~/.claude-swap-backup/` (cswap credentials/cache, handoff archives) is deliberately left — delete it manually for a clean slate. cswap itself, if the installer set it up, is removed with `pipx uninstall claude-swap`.
-
-## Credits
-
-The account-switching engine bundled in `vendor/claude-swap/` is **[claude-swap](https://github.com/realiti4/claude-swap)** by [Onur Cetinkol](https://github.com/realiti4) (MIT license) — the complete, unmodified v0.21.0 source as published to [PyPI](https://pypi.org/project/claude-swap/). overclaude's swap/handoff layer, statusline, hooks, and routing policy are built around it — cswap does the hard, careful work of credential storage, keychain switching, OAuth refresh, and usage polling. Go star it.
+</details>
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The vendored claude-swap package retains its own MIT license and copyright (Onur Cetinkol).
+MIT — see [LICENSE](LICENSE). Vendored claude-swap retains its own MIT license and copyright (Onur Cetinkol).
