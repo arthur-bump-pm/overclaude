@@ -21,6 +21,8 @@ ctx [████░░░░░░] 42% | 5h [███████░░░] 7
 pipx install overclaude && overclaude install
 ```
 
+> **Fresh machine?** If you get `command not found: overclaude`, pipx's bin folder isn't on your PATH yet — run `pipx ensurepath && source ~/.zshrc`, then `overclaude install`. (Use `source`, not `exec zsh`: replacing the shell swallows any commands you pasted after it.)
+
 Then register your accounts (once):
 
 ```bash

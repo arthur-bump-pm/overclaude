@@ -70,23 +70,36 @@ else
   # cswap is vendored as a full source tree (see vendor/README.md) — install it
   # with whichever Python tool-runner is available: pipx, else uv.
   VEND_SRC="$SCRIPT_DIR/vendor/claude-swap"
+  # mktemp creates the log with O_EXCL — a predictable $$-based name in /tmp
+  # could be pre-planted as a symlink by another local user.
+  CSWAP_LOG=$(mktemp "${TMPDIR:-/tmp}/overclaude-cswap-install.XXXXXX" 2>/dev/null) \
+    || CSWAP_LOG="$HOME/.overclaude-cswap-install.log"
+
+  # cswap_outcome <tool> <install-exit-code> — shared reporting for pipx/uv:
+  # distinguishes "installer failed" from "installed but does not resolve".
+  cswap_outcome() {
+    co_tool="$1"; co_rc="$2"
+    if [ "$co_rc" -ne 0 ]; then
+      note_warn "bundled cswap install FAILED — installer output (last 15 lines):"
+      tail -n 15 "$CSWAP_LOG" | sed 's/^/      /' >&2
+      note_warn "full log: $CSWAP_LOG — retry manually: $co_tool \"$VEND_SRC\""
+    elif command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; then
+      note_did "installed cswap from vendored source (vendor/claude-swap, via ${co_tool%% *})"
+      rm -f "$CSWAP_LOG"
+    else
+      note_warn "cswap installed cleanly but does not resolve — likely a PATH/prefix issue."
+      note_warn "  Open a new shell (or: source ~/.zshrc), then re-run the installer to re-check."
+      rm -f "$CSWAP_LOG"
+    fi
+  }
+
   if [ -f "$VEND_SRC/pyproject.toml" ]; then
     if command -v pipx >/dev/null 2>&1; then
       echo "  [..] cswap not found — installing bundled copy via pipx (deps come from PyPI)..."
-      if pipx install "$VEND_SRC" >/dev/null 2>&1 \
-         && { command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; }; then
-        note_did "installed cswap from vendored source (vendor/claude-swap)"
-      else
-        note_warn "bundled cswap install failed; try manually: pipx install claude-swap"
-      fi
+      pipx install "$VEND_SRC" >"$CSWAP_LOG" 2>&1; cswap_outcome "pipx install" $?
     elif command -v uv >/dev/null 2>&1; then
       echo "  [..] cswap not found — installing bundled copy via uv (deps come from PyPI)..."
-      if uv tool install "$VEND_SRC" >/dev/null 2>&1 \
-         && { command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; }; then
-        note_did "installed cswap from vendored source via uv (vendor/claude-swap)"
-      else
-        note_warn "bundled cswap install failed; try manually: uv tool install claude-swap"
-      fi
+      uv tool install "$VEND_SRC" >"$CSWAP_LOG" 2>&1; cswap_outcome "uv tool install" $?
     else
       note_warn "cswap not found and neither pipx nor uv is available."
       note_warn "  Install one (brew install pipx  |  brew install uv), then re-run ./install.sh."
@@ -281,6 +294,20 @@ else
   fi
   note_warn "Open a new shell or run: source $ZSHRC"
 fi
+echo
+
+# ---------------------------------------------------------------------------
+# Verify: the kit is only "installed" if its two executables actually resolve.
+# ---------------------------------------------------------------------------
+echo "-- verify --"
+for vcmd in cswap swap-guard; do
+  if command -v "$vcmd" >/dev/null 2>&1 || [ -x "$LOCALBIN/$vcmd" ]; then
+    echo "  [ok] $vcmd resolves"
+  else
+    note_warn "$vcmd does NOT resolve — the kit will not work until this is fixed."
+    note_warn "  If pipx just installed it, open a new shell (exec zsh) and re-check."
+  fi
+done
 echo
 
 # ---------------------------------------------------------------------------
