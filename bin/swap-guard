@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# swap-guard — shared state/guard engine for the /swap + /handoff Claude Code integration.
+# Contract: section A of the binding interface contract.
+# Subcommands:
+#   whoami                          own session registry JSON (compact); exit 1 if not in a session
+#   sessions                        JSON array of OTHER live claude sessions (always exit 0)
+#   preflight <target>              switch-safety verdict JSON for slot number / alias / email (always exit 0)
+#   path flag|handoff [--cwd <dir>] print per-cwd state-file path
+#   flag <json>                     validate + fill + atomic-write relaunch flag; prints path (exit 1 on bad input)
+#   status                          own-session status JSON (always exit 0)
+#   cancel [--cwd <dir>]            remove pending handoff + flag for cwd (always exit 0)
+#   schedule-kill <pid>             v1 stub (exit 1)
+set -u
+
+STATE_ROOT="$HOME/.claude-swap-backup"
+CTX_DIR="$STATE_ROOT/ctx"
+ARCHIVE_DIR="$STATE_ROOT/handoff-archive"
+SESSIONS_DIR="$HOME/.claude/sessions"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: swap-guard <subcommand> [args]
+  whoami                          own session registry JSON (compact)
+  sessions                        JSON array of other live claude sessions
+  preflight <target>              switch-safety verdict for slot / alias / email
+  path flag|handoff [--cwd <dir>] print per-cwd state-file path
+  flag <json>                     write relaunch flag ({"mode":"handoff"|"restart",...}); prints path
+  status                          own-session status JSON
+  cancel [--cwd <dir>]            remove pending handoff + flag for cwd
+  schedule-kill <pid>             phase-2 stub
+EOF
+  exit 2
+}
+
+# HASH(cwd) per shared constants: first 12 hex of sha256
+hash_cwd() { printf '%s' "$1" | /usr/bin/shasum -a 256 | awk '{print $1}' | cut -c1-12; }
+
+flag_path_for()    { printf '%s/relaunch-%s.json\n'      "$STATE_ROOT" "$(hash_cwd "$1")"; }
+pending_path_for() { printf '%s/handoff-pending-%s.md\n' "$STATE_ROOT" "$(hash_cwd "$1")"; }
+
+# whoami_json [start_pid] — walk the PPID chain from start_pid (default $$) up to pid 1;
+# print the first matching registry file's JSON (compact) and return 0, else return 1.
+whoami_json() {
+  local p="${1:-$$}"
+  while :; do
+    case "$p" in ''|*[!0-9]*) return 1;; esac
+    [ "$p" -gt 1 ] || return 1
+    if [ -f "$SESSIONS_DIR/$p.json" ]; then
+      jq -c . "$SESSIONS_DIR/$p.json" 2>/dev/null || cat "$SESSIONS_DIR/$p.json"
+      return 0
+    fi
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+  done
+}
+
+# session_live <pid> — true iff the process exists (kill -0) AND its comm contains "claude"
+session_live() {
+  local pid="${1:-}" comm
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
+  case "$comm" in *claude*) return 0;; *) return 1;; esac
+}
+
+# transcript_status <cwd> <sessionId> — activity fallback for sessions whose registry
+# file has no status field (clients < ~2.1.211 never publish one). An active session
+# appends to ~/.claude/projects/<flattened-cwd>/<sessionId>.jsonl on every turn, so:
+# mtime within TRANSCRIPT_ACTIVE_SECS -> "busy"; older -> "idle"; no transcript -> "unknown".
+TRANSCRIPT_ACTIVE_SECS=120
+transcript_status() {
+  local cwd="${1:-}" sid="${2:-}" t mtime now
+  [ -n "$cwd" ] && [ -n "$sid" ] || { printf 'unknown\n'; return 0; }
+  t="$HOME/.claude/projects/$(printf '%s' "$cwd" | sed 's/[^A-Za-z0-9]/-/g')/$sid.jsonl"
+  [ -f "$t" ] || { printf 'unknown\n'; return 0; }
+  mtime="$(stat -f %m "$t" 2>/dev/null)"
+  case "$mtime" in ''|*[!0-9]*) printf 'unknown\n'; return 0;; esac
+  now="$(date +%s)"
+  if [ $(( now - mtime )) -le "$TRANSCRIPT_ACTIVE_SECS" ]; then
+    printf 'busy\n'
+  else
+    printf 'idle\n'
+  fi
+}
+
+# sessions_json — JSON array of OTHER live sessions. status precedence: the value the
+# session itself reports (statusSource "reported") > transcript-mtime fallback
+# (statusSource "transcript-mtime") > "unknown" (statusSource "none").
+sessions_json() {
+  local own_pid="" out="[]" new_out f pid entry st
+  own_pid="$(whoami_json 2>/dev/null | jq -r '.pid // empty' 2>/dev/null)" || own_pid=""
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)" || continue
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$own_pid" ] && continue
+    session_live "$pid" || continue
+    entry="$(jq -c '{pid, sessionId, cwd, kind, entrypoint, status: (.status // "unknown"),
+      statusSource: (if .status then "reported" else "none" end)}' "$f" 2>/dev/null)" || continue
+    [ -n "$entry" ] || continue
+    if [ "$(printf '%s' "$entry" | jq -r '.statusSource' 2>/dev/null)" = "none" ]; then
+      st="$(transcript_status "$(printf '%s' "$entry" | jq -r '.cwd // empty')" \
+                              "$(printf '%s' "$entry" | jq -r '.sessionId // empty')")"
+      case "$st" in
+        busy|idle) entry="$(printf '%s' "$entry" | jq -c --arg s "$st" '.status = $s | .statusSource = "transcript-mtime"' 2>/dev/null)" || continue;;
+      esac
+    fi
+    new_out="$(printf '%s' "$out" | jq -c --argjson e "$entry" '. + [$e]' 2>/dev/null)" && [ -n "$new_out" ] && out="$new_out"
+  done
+  printf '%s\n' "$out"
+}
+
+# resolve_cwd [explicit] — precedence: explicit --cwd > whoami .cwd > $PWD
+resolve_cwd() {
+  local c="${1:-}"
+  if [ -z "$c" ]; then
+    c="$(whoami_json 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null)" || c=""
+  fi
+  [ -n "$c" ] || c="$PWD"
+  printf '%s\n' "$c"
+}
+
+# parse_cwd_opt "$@" — echo value of --cwd/--cwd= if present; return 1 if absent
+parse_cwd_opt() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) shift; printf '%s\n' "${1:-}"; return 0;;
+      --cwd=*) printf '%s\n' "${1#--cwd=}"; return 0;;
+    esac
+    shift
+  done
+  return 1
+}
+
+cmd_whoami() {
+  local out
+  if out="$(whoami_json)"; then
+    printf '%s\n' "$out"
+    exit 0
+  fi
+  printf '%s\n' '{"error":"not-in-session"}'
+  exit 1
+}
+
+cmd_sessions() {
+  sessions_json
+  exit 0
+}
+
+cmd_preflight() {
+  local raw="${1:-}" busy busy_n list tgt slot="" verdict detail target_json number email us
+  busy="$(sessions_json | jq -c '[.[] | select(.status == "busy" or .status == "unknown")]' 2>/dev/null)" || busy="[]"
+  [ -n "$busy" ] || busy="[]"
+  busy_n="$(printf '%s' "$busy" | jq 'length' 2>/dev/null)" || busy_n=0
+
+  if [ -z "$raw" ]; then
+    jq -cn --argjson busy "$busy" \
+      '{verdict:"unknown-target",target:{number:null,email:null},busy:$busy,detail:"no target given"}'
+    exit 0
+  fi
+
+  list="$(cswap list --json 2>/dev/null)"
+  if [ -z "$list" ] || ! printf '%s' "$list" | jq -e . >/dev/null 2>&1; then
+    jq -cn --argjson busy "$busy" --arg t "$raw" \
+      '{verdict:"unknown-target",target:{number:null,email:null},busy:$busy,detail:("cswap list --json failed - cannot verify target " + ($t|tojson))}'
+    exit 0
+  fi
+
+  # Resolve target: digits -> slot number; else alias in sequence.json; else email
+  case "$raw" in
+    *[!0-9]*)
+      slot="$(jq -r --arg a "$raw" '.accounts | to_entries[] | select((.value.alias // "") == $a) | .key' \
+        "$STATE_ROOT/sequence.json" 2>/dev/null | head -n1)" || slot=""
+      ;;
+    *) slot="$raw";;
+  esac
+  if [ -n "$slot" ]; then
+    tgt="$(printf '%s' "$list" | jq -c --arg n "$slot" '[.accounts[]? | select((.number|tostring) == $n)] | first // empty' 2>/dev/null)"
+  else
+    tgt="$(printf '%s' "$list" | jq -c --arg e "$raw" '[.accounts[]? | select(((.email // "") | ascii_downcase) == ($e | ascii_downcase))] | first // empty' 2>/dev/null)"
+  fi
+
+  if [ -z "$tgt" ]; then
+    jq -cn --argjson busy "$busy" --arg t "$raw" \
+      '{verdict:"unknown-target",target:{number:null,email:null},busy:$busy,detail:("no account matches " + ($t|tojson) + " (not a slot number, alias, or email)")}'
+    exit 0
+  fi
+
+  target_json="$(printf '%s' "$tgt" | jq -c '{number, email}')"
+  number="$(printf '%s' "$tgt" | jq -r '.number')"
+  email="$(printf '%s' "$tgt" | jq -r '.email // ""')"
+  us="$(printf '%s' "$tgt" | jq -r '.usageStatus // ""' | tr '[:upper:]' '[:lower:]')"
+
+  case "$us" in
+    *login*|*quarantin*|*expired*|*invalid*|*revoked*)
+      verdict="relogin-required"
+      detail="account $number ($email) requires re-login (usageStatus: $us) - recover with /login then: cswap add --slot $number"
+      ;;
+    *)
+      if [ "$busy_n" -gt 0 ] 2>/dev/null; then
+        verdict="busy"
+        detail="account $number ($email) is healthy, but $busy_n other session(s) are busy or possibly-busy - a switch flips ALL sessions within ~30s"
+      else
+        verdict="ok"
+        detail="account $number ($email) is healthy and no other session is busy"
+      fi
+      ;;
+  esac
+
+  jq -cn --arg v "$verdict" --argjson t "$target_json" --argjson busy "$busy" --arg d "$detail" \
+    '{verdict:$v,target:$t,busy:$busy,detail:$d}'
+  exit 0
+}
+
+cmd_path() {
+  local kind="${1:-}"
+  [ $# -gt 0 ] && shift
+  local cwd_opt="" cwd
+  cwd_opt="$(parse_cwd_opt "$@")" || cwd_opt=""
+  cwd="$(resolve_cwd "$cwd_opt")"
+  case "$kind" in
+    flag)    flag_path_for "$cwd";;
+    handoff) pending_path_for "$cwd";;
+    *) usage;;
+  esac
+  exit 0
+}
+
+cmd_flag() {
+  local input="${1:-}"
+  if [ -z "$input" ] || ! printf '%s' "$input" | jq -e . >/dev/null 2>&1; then
+    echo "swap-guard flag: input is not valid JSON" >&2
+    exit 1
+  fi
+  local mode
+  mode="$(printf '%s' "$input" | jq -r '.mode // empty')"
+  case "$mode" in
+    handoff|restart) ;;
+    *) echo 'swap-guard flag: .mode must be "handoff" or "restart"' >&2; exit 1;;
+  esac
+  local sid cwd created out p tmp
+  sid="$(printf '%s' "$input" | jq -r '.sessionId // ""')"
+  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+  cwd="$(resolve_cwd "$cwd")"
+  created="$(printf '%s' "$input" | jq -r '.created // empty' 2>/dev/null)"
+  case "$created" in ''|*[!0-9]*) created="$(date +%s)";; esac
+  out="$(jq -cn --arg m "$mode" --arg s "$sid" --arg c "$cwd" --argjson t "$created" \
+    '{mode:$m,sessionId:$s,cwd:$c,created:$t}')"
+  p="$(flag_path_for "$cwd")"
+  mkdir -p "$STATE_ROOT" 2>/dev/null || { echo "swap-guard flag: cannot create $STATE_ROOT" >&2; exit 1; }
+  tmp="$p.tmp.$$"
+  if printf '%s\n' "$out" > "$tmp" 2>/dev/null && mv "$tmp" "$p" 2>/dev/null; then
+    printf '%s\n' "$p"
+    exit 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  echo "swap-guard flag: write failed" >&2
+  exit 1
+}
+
+# _status_json <sessionId-or-empty> <cwd> — build the status JSON (factored for testability)
+_status_json() {
+  local sid="${1:-}" cwd="${2:-$PWD}"
+  local pct="" fired=0 bannered=0
+  if [ -n "$sid" ] && [ -f "$CTX_DIR/$sid.json" ]; then
+    pct="$(jq -r 'if (.pct|type) == "number" then (.pct|tostring) else "" end' "$CTX_DIR/$sid.json" 2>/dev/null)" || pct=""
+  fi
+  if [ -n "$sid" ] && [ -f "$CTX_DIR/$sid.state" ]; then
+    fired="$(jq -r '.fired // 0' "$CTX_DIR/$sid.state" 2>/dev/null)" || fired=0
+    bannered="$(jq -r '.bannered // 0' "$CTX_DIR/$sid.state" 2>/dev/null)" || bannered=0
+  fi
+  case "$fired" in ''|*[!0-9]*) fired=0;; esac
+  case "$bannered" in ''|*[!0-9]*) bannered=0;; esac
+
+  local h pending flagf pending_out="" page="" flag_out="" arch="" created
+  h="$(hash_cwd "$cwd")"
+  pending="$STATE_ROOT/handoff-pending-$h.md"
+  flagf="$STATE_ROOT/relaunch-$h.json"
+  if [ -f "$pending" ]; then
+    pending_out="$pending"
+    created="$(sed -n '1s/.*created="\([0-9][0-9]*\)".*/\1/p' "$pending" 2>/dev/null)"
+    [ -n "$created" ] || created="$(stat -f %m "$pending" 2>/dev/null)"
+    case "$created" in
+      ''|*[!0-9]*) page="";;
+      *) page="$(( $(date +%s) - created ))";;
+    esac
+  fi
+  [ -f "$flagf" ] && flag_out="$flagf"
+  if [ -d "$ARCHIVE_DIR" ]; then
+    arch="$(ls "$ARCHIVE_DIR" 2>/dev/null | grep -E -- "-$h(-expired)?\.md$" | sort | tail -n1)"
+    [ -n "$arch" ] && arch="$ARCHIVE_DIR/$arch"
+  fi
+
+  jq -cn --arg sid "$sid" --arg pct "$pct" --arg fired "$fired" --arg bannered "$bannered" \
+    --arg pending "$pending_out" --arg page "$page" --arg flagp "$flag_out" --arg arch "$arch" '
+    {sessionId: (if $sid == "" then null else $sid end),
+     pct: (if $pct == "" then null else ($pct|tonumber) end),
+     fired: ($fired|tonumber),
+     bannered: ($bannered|tonumber),
+     pendingHandoff: (if $pending == "" then null else $pending end),
+     pendingAgeSec: (if $page == "" then null else ($page|tonumber) end),
+     flag: (if $flagp == "" then null else $flagp end),
+     latestArchive: (if $arch == "" then null else $arch end)}'
+}
+
+cmd_status() {
+  local who sid="" cwd=""
+  if who="$(whoami_json 2>/dev/null)"; then
+    sid="$(printf '%s' "$who" | jq -r '.sessionId // empty' 2>/dev/null)" || sid=""
+    cwd="$(printf '%s' "$who" | jq -r '.cwd // empty' 2>/dev/null)" || cwd=""
+  fi
+  [ -n "$cwd" ] || cwd="$PWD"
+  _status_json "$sid" "$cwd"
+  exit 0
+}
+
+cmd_cancel() {
+  local cwd_opt="" cwd removed=0 f
+  cwd_opt="$(parse_cwd_opt "$@")" || cwd_opt=""
+  cwd="$(resolve_cwd "$cwd_opt")"
+  for f in "$(pending_path_for "$cwd")" "$(flag_path_for "$cwd")"; do
+    if [ -f "$f" ]; then
+      rm -f "$f" 2>/dev/null && { printf 'removed: %s\n' "$f"; removed=1; }
+    fi
+  done
+  [ "$removed" -eq 1 ] || printf 'nothing to remove for cwd %s\n' "$cwd"
+  exit 0
+}
+
+cmd_schedule_kill() {
+  echo "phase-2 feature not enabled" >&2
+  exit 1
+}
+
+main() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    whoami)        cmd_whoami "$@";;
+    sessions)      cmd_sessions "$@";;
+    preflight)     cmd_preflight "$@";;
+    path)          cmd_path "$@";;
+    flag)          cmd_flag "$@";;
+    status)        cmd_status "$@";;
+    cancel)        cmd_cancel "$@";;
+    schedule-kill) cmd_schedule_kill "$@";;
+    *) usage;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
+  main "$@"
+fi
