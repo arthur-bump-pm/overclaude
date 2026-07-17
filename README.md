@@ -38,15 +38,29 @@ A policy document loaded into every session that teaches the orchestrator to rou
 - [Claude Code](https://claude.com/claude-code) — tested on 2.1.212; the session-registry `status` field needs ~2.1.211+
 - Claude subscription accounts (Max-style) — the rate-limit meters read subscription usage buckets
 
-The credential-switching engine, **cswap**, ships with the kit (`vendor/claude_swap-0.21.0.tar.gz`) and is installed automatically by `install.sh` via pipx — no separate install step. See [Credits](#credits).
+The credential-switching engine, **cswap**, ships with the kit as a full source tree (`vendor/claude-swap/`, v0.21.0) and is installed automatically by `install.sh` via pipx or uv — no separate install step. See [Credits](#credits).
 
 ## Install
+
+### One-liner (pipx or uv)
+
+```bash
+pipx install git+https://github.com/arthur-bump-pm/overclaude.git && overclaude install
+# or
+uv tool install git+https://github.com/arthur-bump-pm/overclaude.git && overclaude install
+```
+
+The package wheel carries the full kit (including the bundled cswap), so this is everything. The `overclaude` command stays around for later: `overclaude install` (refresh after an upgrade), `overclaude uninstall`, `overclaude path`, `overclaude version`. Upgrade with `pipx upgrade overclaude` / `uv tool upgrade overclaude`. *(Not on PyPI yet — installs straight from GitHub.)*
+
+### From a clone
 
 ```bash
 git clone https://github.com/arthur-bump-pm/overclaude.git
 cd overclaude
 ./install.sh
 ```
+
+Use the clone if you want to hack on the kit — `sync.sh` (live-setup → repo → push) only works from a git clone.
 
 The installer is **idempotent and conservative**: every modified file gets a timestamped backup, your existing `settings.json` content (other hooks, permissions) is preserved by a jq merge, an existing statusLine is never overwritten (you get instructions instead), and re-running is a no-op.
 
@@ -81,7 +95,7 @@ Post-install:
 | `claude/ULTRACODE.md` | `~/.claude/` + import in `CLAUDE.md` | Model/effort routing policy for multi-agent workflows |
 | `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | 3 hook groups, statusLine block, 2 permission allows |
 | `shell/zshrc-snippet.sh` | appended to `~/.zshrc` (markers) | `claude()` wrapper honoring handoff/restart relaunch flags, `swap` alias, PATH guard |
-| `vendor/claude_swap-*.tar.gz` | pipx-installed if `cswap` absent | The bundled credential-switching engine (see [Credits](#credits)) |
+| `vendor/claude-swap/` | pipx/uv-installed if `cswap` absent | The bundled credential-switching engine, full source (see [Credits](#credits)) |
 
 ## Behaviors & caveats — read these
 
@@ -117,7 +131,7 @@ Removes installed files, deletes the zshrc block, removes the `@ULTRACODE.md` im
 
 ## Credits
 
-The account-switching engine bundled in `vendor/` is **[claude-swap](https://github.com/realiti4/claude-swap)** by [Onur Cetinkol](https://github.com/realiti4) (MIT license), vendored unmodified at v0.21.0 from [PyPI](https://pypi.org/project/claude-swap/). overclaude's swap/handoff layer, statusline, hooks, and routing policy are built around it — cswap does the hard, careful work of credential storage, keychain switching, OAuth refresh, and usage polling. Go star it.
+The account-switching engine bundled in `vendor/claude-swap/` is **[claude-swap](https://github.com/realiti4/claude-swap)** by [Onur Cetinkol](https://github.com/realiti4) (MIT license) — the complete, unmodified v0.21.0 source as published to [PyPI](https://pypi.org/project/claude-swap/). overclaude's swap/handoff layer, statusline, hooks, and routing policy are built around it — cswap does the hard, careful work of credential storage, keychain switching, OAuth refresh, and usage polling. Go star it.
 
 ## License
 

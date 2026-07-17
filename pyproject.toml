@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "overclaude"
+version = "1.0.0"
+description = "Claude Code, overclocked — multi-account hot-swap, context-threshold handoff, instrumented statusline, and model routing for multi-agent workflows"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "arthur-bump-pm" }]
+keywords = ["claude", "claude-code", "cli", "dotfiles"]
+
+[project.urls]
+Homepage = "https://github.com/arthur-bump-pm/overclaude"
+Repository = "https://github.com/arthur-bump-pm/overclaude"
+
+[project.scripts]
+overclaude = "overclaude.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/overclaude"]
+
+# The kit payload: the same files ./install.sh uses from a git clone, mapped
+# into the wheel so `pipx install` / `uv tool install` carries everything.
+[tool.hatch.build.targets.wheel.force-include]
+"bin" = "overclaude/payload/bin"
+"skills" = "overclaude/payload/skills"
+"hooks" = "overclaude/payload/hooks"
+"statusline" = "overclaude/payload/statusline"
+"claude" = "overclaude/payload/claude"
+"settings" = "overclaude/payload/settings"
+"shell" = "overclaude/payload/shell"
+"vendor/claude-swap" = "overclaude/payload/vendor/claude-swap"
+"install.sh" = "overclaude/payload/install.sh"
+"uninstall.sh" = "overclaude/payload/uninstall.sh"

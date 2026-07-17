@@ -67,21 +67,32 @@ echo "  [ok] jq: $(command -v jq)"
 if command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; then
   echo "  [ok] cswap: $(command -v cswap 2>/dev/null || echo "$LOCALBIN/cswap")"
 else
-  # cswap is vendored (see vendor/README.md) — install the bundled sdist via pipx.
-  VEND_SDIST=$(ls "$SCRIPT_DIR"/vendor/claude_swap-*.tar.gz 2>/dev/null | head -n1)
-  if [ -n "$VEND_SDIST" ] && command -v pipx >/dev/null 2>&1; then
-    echo "  [..] cswap not found — installing bundled copy via pipx (deps come from PyPI)..."
-    if pipx install "$VEND_SDIST" >/dev/null 2>&1 \
-       && { command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; }; then
-      note_did "installed cswap from vendored sdist ($(basename "$VEND_SDIST"))"
+  # cswap is vendored as a full source tree (see vendor/README.md) — install it
+  # with whichever Python tool-runner is available: pipx, else uv.
+  VEND_SRC="$SCRIPT_DIR/vendor/claude-swap"
+  if [ -f "$VEND_SRC/pyproject.toml" ]; then
+    if command -v pipx >/dev/null 2>&1; then
+      echo "  [..] cswap not found — installing bundled copy via pipx (deps come from PyPI)..."
+      if pipx install "$VEND_SRC" >/dev/null 2>&1 \
+         && { command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; }; then
+        note_did "installed cswap from vendored source (vendor/claude-swap)"
+      else
+        note_warn "bundled cswap install failed; try manually: pipx install claude-swap"
+      fi
+    elif command -v uv >/dev/null 2>&1; then
+      echo "  [..] cswap not found — installing bundled copy via uv (deps come from PyPI)..."
+      if uv tool install "$VEND_SRC" >/dev/null 2>&1 \
+         && { command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; }; then
+        note_did "installed cswap from vendored source via uv (vendor/claude-swap)"
+      else
+        note_warn "bundled cswap install failed; try manually: uv tool install claude-swap"
+      fi
     else
-      note_warn "bundled cswap install failed; install manually: pipx install claude-swap"
+      note_warn "cswap not found and neither pipx nor uv is available."
+      note_warn "  Install one (brew install pipx  |  brew install uv), then re-run ./install.sh."
     fi
-  elif [ -n "$VEND_SDIST" ]; then
-    note_warn "cswap not found and pipx is missing. Install pipx first (brew install pipx),"
-    note_warn "  then re-run ./install.sh to get the bundled cswap."
   else
-    note_warn "cswap not found and no vendored sdist present; install manually: pipx install claude-swap"
+    note_warn "cswap not found and no vendored source present; install manually: pipx install claude-swap"
   fi
 fi
 
