@@ -34,10 +34,11 @@ A policy document loaded into every session that teaches the orchestrator to rou
 ## Requirements
 
 - macOS (scripts use BSD `stat -f`, `shasum`), zsh
-- `jq`, `git`
+- `jq`, `git`, `pipx`
 - [Claude Code](https://claude.com/claude-code) — tested on 2.1.212; the session-registry `status` field needs ~2.1.211+
-- [cswap](https://pypi.org/project/claude-swap/) — the credential switcher this kit wraps (not shipped): `pipx install claude-swap` (tested on 0.21.0)
 - Claude subscription accounts (Max-style) — the rate-limit meters read subscription usage buckets
+
+The credential-switching engine, **cswap**, ships with the kit (`vendor/claude_swap-0.21.0.tar.gz`) and is installed automatically by `install.sh` via pipx — no separate install step. See [Credits](#credits).
 
 ## Install
 
@@ -49,13 +50,14 @@ cd overclaude
 
 The installer is **idempotent and conservative**: every modified file gets a timestamped backup, your existing `settings.json` content (other hooks, permissions) is preserved by a jq merge, an existing statusLine is never overwritten (you get instructions instead), and re-running is a no-op.
 
+The installer also sets up cswap from the bundled copy if it isn't on the machine yet (needs `pipx`; Python dependencies are resolved from PyPI).
+
 Post-install:
 
-1. Install cswap if you haven't: `pipx install claude-swap`
-2. Register accounts: `cswap add` (repeat per account), then alias them: `cswap alias 1 work`, `cswap alias 2 personal`
-3. Open a new shell (or `source ~/.zshrc`)
-4. Start a **new** Claude Code session — hooks and statusline load at session start
-5. Verify: `swap-guard whoami` prints your session JSON; the statusline shows `👤 <alias> [n/N]` and four meters
+1. Register accounts: `cswap add` (repeat per account), then alias them: `cswap alias 1 work`, `cswap alias 2 personal`
+2. Open a new shell (or `source ~/.zshrc`)
+3. Start a **new** Claude Code session — hooks and statusline load at session start
+4. Verify: `swap-guard whoami` prints your session JSON; the statusline shows `👤 <alias> [n/N]` and four meters
 
 ## Components
 
@@ -71,6 +73,7 @@ Post-install:
 | `claude/ULTRACODE.md` | `~/.claude/` + import in `CLAUDE.md` | Model/effort routing policy for multi-agent workflows |
 | `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | 3 hook groups, statusLine block, 2 permission allows |
 | `shell/zshrc-snippet.sh` | appended to `~/.zshrc` (markers) | `claude()` wrapper honoring handoff/restart relaunch flags, `swap` alias, PATH guard |
+| `vendor/claude_swap-*.tar.gz` | pipx-installed if `cswap` absent | The bundled credential-switching engine (see [Credits](#credits)) |
 
 ## Behaviors & caveats — read these
 
@@ -102,8 +105,12 @@ Improve your live setup (statusline tweaks, skill edits, ULTRACODE changes), the
 ./uninstall.sh
 ```
 
-Removes installed files, deletes the zshrc block, removes the `@ULTRACODE.md` import, and strips exactly the kit's entries from `settings.json` (your other settings survive; everything edited is backed up first). Runtime state in `~/.claude-swap-backup/` (cswap credentials/cache, handoff archives) is deliberately left — delete it manually for a clean slate.
+Removes installed files, deletes the zshrc block, removes the `@ULTRACODE.md` import, and strips exactly the kit's entries from `settings.json` (your other settings survive; everything edited is backed up first). Runtime state in `~/.claude-swap-backup/` (cswap credentials/cache, handoff archives) is deliberately left — delete it manually for a clean slate. cswap itself, if the installer set it up, is removed with `pipx uninstall claude-swap`.
+
+## Credits
+
+The account-switching engine bundled in `vendor/` is **[claude-swap](https://github.com/realiti4/claude-swap)** by [Onur Cetinkol](https://github.com/realiti4) (MIT license), vendored unmodified at v0.21.0 from [PyPI](https://pypi.org/project/claude-swap/). overclaude's swap/handoff layer, statusline, hooks, and routing policy are built around it — cswap does the hard, careful work of credential storage, keychain switching, OAuth refresh, and usage polling. Go star it.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). The vendored claude-swap package retains its own MIT license and copyright (Onur Cetinkol).

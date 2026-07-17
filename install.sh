@@ -64,11 +64,25 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 echo "  [ok] jq: $(command -v jq)"
 
-if ! command -v cswap >/dev/null 2>&1; then
-  note_warn "cswap not found on PATH. The kit WRAPS cswap; install it first:"
-  note_warn "  pipx install claude-swap   (PyPI package providing the cswap binary; tested with 0.21.0)"
+if command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; then
+  echo "  [ok] cswap: $(command -v cswap 2>/dev/null || echo "$LOCALBIN/cswap")"
 else
-  echo "  [ok] cswap: $(command -v cswap)"
+  # cswap is vendored (see vendor/README.md) — install the bundled sdist via pipx.
+  VEND_SDIST=$(ls "$SCRIPT_DIR"/vendor/claude_swap-*.tar.gz 2>/dev/null | head -n1)
+  if [ -n "$VEND_SDIST" ] && command -v pipx >/dev/null 2>&1; then
+    echo "  [..] cswap not found — installing bundled copy via pipx (deps come from PyPI)..."
+    if pipx install "$VEND_SDIST" >/dev/null 2>&1 \
+       && { command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; }; then
+      note_did "installed cswap from vendored sdist ($(basename "$VEND_SDIST"))"
+    else
+      note_warn "bundled cswap install failed; install manually: pipx install claude-swap"
+    fi
+  elif [ -n "$VEND_SDIST" ]; then
+    note_warn "cswap not found and pipx is missing. Install pipx first (brew install pipx),"
+    note_warn "  then re-run ./install.sh to get the bundled cswap."
+  else
+    note_warn "cswap not found and no vendored sdist present; install manually: pipx install claude-swap"
+  fi
 fi
 
 case ":$PATH:" in
