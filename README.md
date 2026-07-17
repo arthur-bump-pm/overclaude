@@ -45,12 +45,14 @@ The credential-switching engine, **cswap**, ships with the kit as a full source 
 ### One-liner (pipx or uv)
 
 ```bash
-pipx install git+https://github.com/arthur-bump-pm/overclaude.git && overclaude install
+pipx install overclaude && overclaude install
 # or
-uv tool install git+https://github.com/arthur-bump-pm/overclaude.git && overclaude install
+uv tool install overclaude && overclaude install
 ```
 
-The package wheel carries the full kit (including the bundled cswap), so this is everything. The `overclaude` command stays around for later: `overclaude install` (refresh after an upgrade), `overclaude uninstall`, `overclaude path`, `overclaude version`. Upgrade with `pipx upgrade overclaude` / `uv tool upgrade overclaude`. *(Not on PyPI yet — installs straight from GitHub.)*
+The package carries the full kit (including the bundled cswap), so this is everything. The `overclaude` command stays around for later: `overclaude install` (refresh after an upgrade), `overclaude uninstall`, `overclaude path`, `overclaude version`. Upgrade with `pipx upgrade overclaude` / `uv tool upgrade overclaude`.
+
+To track the latest unreleased main instead: `pipx install git+https://github.com/arthur-bump-pm/overclaude.git`.
 
 ### From a clone
 

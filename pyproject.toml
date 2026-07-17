@@ -8,13 +8,23 @@ version = "1.0.0"
 description = "Claude Code, overclocked — multi-account hot-swap, context-threshold handoff, instrumented statusline, and model routing for multi-agent workflows"
 readme = "README.md"
 license = { text = "MIT" }
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "arthur-bump-pm" }]
 keywords = ["claude", "claude-code", "cli", "dotfiles"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
 
 [project.urls]
 Homepage = "https://github.com/arthur-bump-pm/overclaude"
 Repository = "https://github.com/arthur-bump-pm/overclaude"
+Issues = "https://github.com/arthur-bump-pm/overclaude/issues"
 
 [project.scripts]
 overclaude = "overclaude.cli:main"
@@ -35,3 +45,29 @@ packages = ["src/overclaude"]
 "vendor/claude-swap" = "overclaude/payload/vendor/claude-swap"
 "install.sh" = "overclaude/payload/install.sh"
 "uninstall.sh" = "overclaude/payload/uninstall.sh"
+
+# hatchling's default sdist build respects VCS-ignore files and otherwise
+# only guarantees the `src/` package tree; it does NOT guarantee the payload
+# directories consumed above by force-include. Without this explicit list,
+# a source distribution built from a checkout with a permissive .gitignore
+# (or built with `--no-vcs`) could ship a wheel that silently drops parts of
+# the installer payload. Enumerate every path the wheel force-include needs,
+# plus packaging metadata, so the sdist is always sufficient to rebuild the
+# wheel from scratch.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/bin",
+    "/skills",
+    "/hooks",
+    "/statusline",
+    "/claude",
+    "/settings",
+    "/shell",
+    "/vendor/claude-swap",
+    "/install.sh",
+    "/uninstall.sh",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
