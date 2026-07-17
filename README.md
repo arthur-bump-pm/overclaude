@@ -52,6 +52,14 @@ The installer is **idempotent and conservative**: every modified file gets a tim
 
 The installer also sets up cswap from the bundled copy if it isn't on the machine yet (needs `pipx`; Python dependencies are resolved from PyPI).
 
+### Or just ask Claude
+
+If Claude Code is already running on the machine, paste this and let it do the work:
+
+> Clone https://github.com/arthur-bump-pm/overclaude, read its README, run ./install.sh, and fix anything the preflight complains about (jq, pipx, PATH). Then tell me what post-install steps I need to do myself.
+
+Claude will run the installer, resolve missing dependencies, and hand you back the two things only you can do: registering accounts (`cswap add` needs you to `/login` as each account) and restarting sessions. After a restart, `/swap add` gives you a guided flow for registering additional accounts from inside Claude Code.
+
 Post-install:
 
 1. Register accounts: `cswap add` (repeat per account), then alias them: `cswap alias 1 work`, `cswap alias 2 personal`
