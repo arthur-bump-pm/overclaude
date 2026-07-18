@@ -58,24 +58,58 @@ if [ -n "$relay_session_id" ] && [ -n "$ctx_used" ] && [ "$ctx_used" != "null" ]
   esac
 fi
 
-# --- Claude.ai subscription rate limits (only present for subscribers after first API response) ---
+# --- Usage meters: 5h / week / scoped "Fable" ---
+# Primary source: cswap's usage cache for the ACTIVE account. stdin's
+# rate_limits describe whichever account served this session's LAST response —
+# wrong right after a swap and frozen in idle sessions. The cache is
+# per-account-correct the moment a swap lands, and the debounced async
+# refresher below keeps it <= ~5 min old whenever any statusline is rendering.
+# stdin values remain the fallback when the cache is missing/corrupt.
 five_hour=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
-
-# --- Scoped "Fable" bucket (cswap cache; statusline stdin carries no scoped limits) ---
-# Read-only: sequence.json .activeAccountNumber -> cache/usage.json
-# .accounts[<n>].lastGood.scoped[name=="Fable"].pct. NEVER calls cswap
-# (token-refresh side effects). Missing/corrupt anywhere -> empty -> "n/a" bar.
 fable_pct=""
+usage_age=""
 fable_seq="${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}"
 fable_cache="${SWAP_USAGE_JSON:-$HOME/.claude-swap-backup/cache/usage.json}"
 if command -v jq >/dev/null 2>&1 && [ -r "$fable_seq" ] && [ -r "$fable_cache" ]; then
   fable_slot=$(jq -r '(.activeAccountNumber // empty) | tostring' "$fable_seq" 2>/dev/null) || fable_slot=""
   if [ -n "$fable_slot" ] && [ "$fable_slot" != "null" ]; then
-    fable_pct=$(jq -r --arg n "$fable_slot" \
-      '.accounts[$n].lastGood.scoped[]? | select(.name == "Fable") | .pct // empty' \
-      "$fable_cache" 2>/dev/null | head -n1) || fable_pct=""
-    [ "$fable_pct" = "null" ] && fable_pct=""
+    cache_vals=$(jq -r --arg n "$fable_slot" '
+      .accounts[$n].lastGood as $g
+      | [(($g.five_hour.pct // "") | tostring),
+         (($g.seven_day.pct // "") | tostring),
+         ((first($g.scoped[]? | select(.name == "Fable") | .pct) // "") | tostring)]
+      | join("\t")' "$fable_cache" 2>/dev/null) || cache_vals=""
+    c5=$(printf '%s' "$cache_vals" | cut -f1)
+    c7=$(printf '%s' "$cache_vals" | cut -f2)
+    cf=$(printf '%s' "$cache_vals" | cut -f3)
+    # Cache wins when it has a value: per-account-correct beats per-response-stale.
+    case "$c5" in ''|null) : ;; *) five_hour="$c5" ;; esac
+    case "$c7" in ''|null) : ;; *) seven_day="$c7" ;; esac
+    case "$cf" in ''|null) : ;; *) fable_pct="$cf" ;; esac
+    cache_mtime=$(stat -f %m "$fable_cache" 2>/dev/null)
+    case "$cache_mtime" in ''|*[!0-9]*) : ;; *) usage_age=$(( $(date +%s) - cache_mtime )) ;; esac
+  fi
+fi
+
+# --- Debounced async usage refresh ---
+# If the cache is older than 300s, kick ONE detached `cswap list --json`
+# (side effect: it refetches + rewrites the usage cache). The RENDER path
+# still never waits on cswap: the call is backgrounded, and the lock file is a
+# pure RATE-LIMITER — touched at spawn, never removed, aged out after 60s — so
+# a persistently-failing refresh (network down) attempts at most once a minute
+# instead of every render. Concurrent same-second spawns are tolerated (cswap
+# serializes on its own .usage.lock). SWAP_NO_REFRESH=1 disables (tests).
+if [ -z "${SWAP_NO_REFRESH:-}" ] && command -v cswap >/dev/null 2>&1; then
+  if [ -z "$usage_age" ] || [ "$usage_age" -gt 300 ]; then
+    refresh_lock="${SWAP_REFRESH_LOCK:-$HOME/.claude-swap-backup/cache/.statusline-refresh.lock}"
+    lock_m=$(stat -f %m "$refresh_lock" 2>/dev/null || echo 0)
+    case "$lock_m" in ''|*[!0-9]*) lock_m=0 ;; esac
+    if [ $(( $(date +%s) - lock_m )) -gt 60 ]; then
+      mkdir -p "$(dirname "$refresh_lock")" 2>/dev/null
+      touch "$refresh_lock" 2>/dev/null
+      ( cswap list --json >/dev/null 2>&1 ) >/dev/null 2>&1 &
+    fi
   fi
 fi
 
@@ -242,6 +276,12 @@ fi
 
 # --- Line 2: usage bars, all on one line ---
 line2="$(render_bar "ctx" "$ctx_used") | $(render_bar "5h" "$five_hour") | $(render_bar "week" "$seven_day") | $(render_bar "Fable" "$fable_pct")"
+# Honest-staleness marker: if the usage cache is >10 min old despite the
+# refresher (cswap gone, network down), say so instead of showing stale
+# numbers as if they were live.
+if [ -n "$usage_age" ] && [ "$usage_age" -gt 600 ]; then
+  line2="$line2 ${DIM}(usage $((usage_age / 60))m old)${RESET}"
+fi
 
 printf "%s\n" "$line1"
 printf "%s\n" "$line2"
