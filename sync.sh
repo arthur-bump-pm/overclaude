@@ -172,10 +172,14 @@ if [ "$DRY_RUN" = yes ]; then
   exit 0
 fi
 
-sed -i '' "s/^version = \"$CUR\"/version = \"$NEW\"/" pyproject.toml || exit 1
-git add pyproject.toml && git commit -m "release: v$NEW" && git push || {
-  echo "release: version-bump commit/push failed" >&2; exit 1
-}
+if [ "$NEW" != "$CUR" ]; then
+  sed -i '' "s/^version = \"$CUR\"/version = \"$NEW\"/" pyproject.toml || exit 1
+  git add pyproject.toml && git commit -m "release: v$NEW" || {
+    echo "release: version-bump commit failed" >&2; exit 1
+  }
+fi
+# Manual bump: the version is already committed, so there is no bump commit — just push.
+git push || { echo "release: push failed" >&2; exit 1; }
 gh release create "v$NEW" --title "overclaude v$NEW" --notes "$NOTES" || {
   echo "release: gh release create failed — the version bump IS committed; re-run: gh release create v$NEW" >&2
   exit 1
