@@ -1,7 +1,7 @@
 ---
 name: handoff
 description: "Context-threshold session handoff: package this session and continue in a fresh one, optionally switching accounts first. The model may invoke this skill ONLY after explicit user consent in the conversation."
-argument-hint: "[account] [now|force] | status | cancel"
+argument-hint: "[account] [now|force] | status | cancel | history | restore [n] [force]"
 allowed-tools: Write, Bash(swap-guard *), Bash(cswap *)
 ---
 
@@ -12,11 +12,11 @@ GATE — read before acting. If this skill was invoked by you (the model) rather
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Rulings:
-- `status` or `cancel` present → run that subcommand only, then stop.
+- `status`, `cancel`, `history`, or `restore` present → run that subcommand only, then stop (`restore` takes an optional number and `force`).
 - `restart` present → error: restart is a /swap mode; point to `/swap <target> restart`.
 - `force` with no target → proceed, note "no switch requested — force ignored".
 - Target present → `/handoff <target>` ≡ `/swap <target> handoff`: preflight is MANDATORY (the switch flips ALL live sessions). No target → same-account handoff, no preflight needed.
@@ -30,6 +30,14 @@ Run `swap-guard status`; render: context pct (null → "no relay yet"), threshol
 ## `/handoff cancel`
 
 Run `swap-guard cancel`; report exactly what it says was removed (pending package and/or flag for this cwd).
+
+## `/handoff history`
+
+Run `swap-guard history` (add `--all` if the user asks for every directory). Render a numbered table: n, title, archived time (local), expired yes/no, size. Empty → "no archived handoffs for this directory".
+
+## `/handoff restore [n] [force]`
+
+Recovers a package that expired (10-min TTL) or was injected into a session the user abandoned. Run `swap-guard restore [n]` (default n=1 = newest for this cwd; append `--force` only if the user gave `force`). Numbers refer to the THIS-directory listing; if the user picked from a `history --all` listing, restore by that entry's `.path` instead. Any pending package being replaced is moved to the archive first (`.replacedArchivedTo`) — mention it. On success it re-arms the package as this cwd's pending handoff with a fresh timestamp — then do Package steps 4–5 (flag + Ctrl+D instruction; VS Code: no flag, reload the window). On `.error`: `pending-exists` → say a live package is pending and offer `/handoff restore <n> force`; `cwd-mismatch` → tell the user to `cd` to `.packageCwd` first; `not-found` → show `/handoff history`.
 
 ## Switching (`/handoff <target> [now] [force]`)
 
@@ -63,7 +71,7 @@ Run recipe steps 1–2 NOW (the verdict gate). Run step 3 (the actual `cswap swi
 ## Session chain
 ```
 
-Fill every section from this conversation — concise and decision-dense; a summary, not a transcript. Files touched: absolute paths. Artifacts (omit the section if the manifest is empty; with many, list the ones still in play individually and point to the manifest for the rest): first line `Manifest: <manifest path> — owner: <.account>`, then one line per artifact `- <title> — <url> — source: <saved or "lost"> [— db rows: <export path>]`, then this rule verbatim: "Next session: check `jq -r .oauthAccount.emailAddress ~/.claude.json`. Same as owner → update in place (Artifact read, then publish with `url`). Different → those URLs are not editable from this account (still viewable by the owner account); when work next touches one, republish from the saved source as a NEW artifact (re-import exported db rows with ArtifactData) and give the user the new link — or, if the user has shared it to this account with edit access, update in place." Work in flight: anything half-done, with exact resume points. Session chain rules: if this session itself began with "## Handoff from previous session (loaded by handoff-inject)", copy that package's Session chain entries first; append one line for THIS session: `<sessionId> — <transcript path if known, else "unknown"> — <YYYY-MM-DD>`; keep only the last 3 entries.
+Fill every section from this conversation — concise and decision-dense; a summary, not a transcript. SIZE BUDGET: keep the whole package under ~8,000 bytes (≈8,000 English characters; Korean/CJK is ~3 bytes per character, so ≈2,700). Claude Code caps injected hook output at 10,000 characters; handoff-inject prints an over-budget package section by section in template order until the budget runs out, then points the next session at the full file — so the later sections (Gotchas, Artifacts, Session chain) are the ones that get deferred. Check with `wc -c <P>` after writing and tighten if over. Files touched: absolute paths. Artifacts (omit the section if the manifest is empty; list at most ~5 still-in-play artifacts individually and point to the manifest for the rest — the manifest, not the package, is the complete record): first line `Manifest: <manifest path> — owner: <.account>`, then one line per artifact `- <title> — <url> — source: <saved or "lost"> [— db rows: <export path>]`, then this rule verbatim: "Next session: check `jq -r .oauthAccount.emailAddress ~/.claude.json`. Same as owner → update in place (Artifact read, then publish with `url`). Different → those URLs are not editable from this account (still viewable by the owner account); when work next touches one, republish from the saved source as a NEW artifact (re-import exported db rows with ArtifactData) and give the user the new link — or, if the user has shared it to this account with edit access, update in place." Work in flight: anything half-done, with exact resume points. Session chain rules: if this session itself began with "## Handoff from previous session (loaded by handoff-inject)", copy that package's Session chain entries first; append one line for THIS session: `<sessionId> — <transcript path if known, else "unknown"> — <YYYY-MM-DD>`; keep only the last 3 entries.
 
 3b. If a target was given: run recipe step 3 now (`cswap switch <target> --json`, report `.reason` + `.warnings[]`).
 4. Flag: run `swap-guard flag '{"mode":"handoff"}'` (it fills cwd and created). Skip this step in VS Code (below).

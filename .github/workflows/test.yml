@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: {}
+
+jobs:
+  test:
+    name: shellcheck + test suite + payload check (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tooling
+        run: |
+          command -v jq >/dev/null || brew install jq
+          command -v shellcheck >/dev/null || brew install shellcheck
+
+      - name: shellcheck (errors)
+        run: |
+          shellcheck -S error bin/swap-guard hooks/*.sh statusline/statusline-command.sh \
+            install.sh uninstall.sh doctor.sh sync.sh tests/*.sh
+
+      - name: Test suite (macOS /bin/bash 3.2 — what users' `env bash` usually resolves to)
+        run: PATH=/bin:/usr/bin:$PATH /bin/bash tests/run.sh
+
+      - name: Test suite (bash 5)
+        run: bash tests/run.sh
+
+      - name: Wheel carries the full payload
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --wheel --outdir dist/ >/dev/null
+          whl=$(ls dist/*.whl)
+          for f in install.sh uninstall.sh doctor.sh bin/swap-guard hooks/handoff-inject.sh \
+                   hooks/ctx-watch.sh hooks/ctx-notify.sh statusline/statusline-command.sh \
+                   skills/swap/SKILL.md skills/handoff/SKILL.md claude/ULTRACODE.md \
+                   settings/settings-fragment.json shell/zshrc-snippet.sh vendor/claude-swap/pyproject.toml; do
+            unzip -l "$whl" | grep -q "overclaude/payload/$f" || { echo "payload missing: $f"; exit 1; }
+          done
+          echo "payload complete"

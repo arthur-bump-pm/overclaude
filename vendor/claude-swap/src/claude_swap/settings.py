@@ -1,9 +1,9 @@
 """Tool settings persisted at ``<backup_root>/settings.json``.
 
 One versioned JSON file for user-tunable claude-swap preferences, written
-atomically with the backup dir's 0600/0700 modes. v1 carries only the
-``autoswitch`` section; other sections can be added additively. Unknown keys
-(future fields, other tools' experiments) survive a round trip.
+atomically with the backup dir's 0600/0700 modes. v1 carries the
+``autoswitch`` and ``ui`` sections; other sections can be added additively.
+Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
+from claude_swap.fsutil import replace_with_retry
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -46,7 +47,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # reserved for future strategies; only "best" in v1
+    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -59,6 +60,17 @@ class AutoSwitchSettings:
 
 
 @dataclass(frozen=True)
+class UiSettings:
+    """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
+    color theme; ``auto`` follows terminal-background detection."""
+
+    theme: str = "auto"
+
+
+_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+
+
+@dataclass(frozen=True)
 class SettingSpec:
     """Metadata for one user-tunable settings.json key.
 
@@ -67,7 +79,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch")
+    section: str  # top-level JSON section ("autoswitch", "ui")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -82,7 +94,7 @@ class SettingSpec:
 
     @property
     def default(self):
-        return getattr(AutoSwitchSettings(), self.field)
+        return getattr(_SECTION_DEFAULT_SOURCES[self.section](), self.field)
 
 
 # settings.json uses camelCase (matching the repo's other JSON artifacts);
@@ -107,7 +119,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="A target must beat the active account by this many pct",
         ),
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice", choices=("best",),
+            "autoswitch", "strategy", "strategy", "choice",
+            choices=("best", "consume-first"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -122,11 +135,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
+        SettingSpec(
+            "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
+            help="Color theme; auto follows the terminal background",
+        ),
     )
 }
 
 _AUTOSWITCH_KEYS: dict[str, str] = {
-    spec.field: spec.json_key for spec in SETTING_SPECS.values()
+    spec.field: spec.json_key
+    for spec in SETTING_SPECS.values()
+    if spec.section == "autoswitch"
 }
 
 
@@ -158,6 +177,8 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
+        if spec.section != "autoswitch":
+            continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
@@ -208,6 +229,23 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     except TypeError:
         settings = AutoSwitchSettings()
     return _clamped(settings)
+
+
+def load_ui_settings(backup_root: Path) -> UiSettings:
+    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("ui")
+    default = UiSettings()
+    if not isinstance(section, dict):
+        return default
+    theme = section.get("theme", default.theme)
+    if theme not in SETTING_SPECS["ui.theme"].choices:
+        _logger.warning(
+            "settings.json: unsupported ui.theme %r; using %r",
+            theme, default.theme,
+        )
+        return default
+    return UiSettings(theme=theme)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -371,12 +409,15 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     reflects the file, not value equality.
     """
     raw = _read_raw(settings_path(backup_root))
-    effective = load_settings(backup_root)
+    loaded = {
+        "autoswitch": load_settings(backup_root),
+        "ui": load_ui_settings(backup_root),
+    }
     rows = []
     for spec in SETTING_SPECS.values():
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
-        rows.append((spec, getattr(effective, spec.field), is_set))
+        rows.append((spec, getattr(loaded[spec.section], spec.field), is_set))
     return rows
 
 
@@ -389,6 +430,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
+        ("strategy", "strategy"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -403,18 +445,39 @@ def atomic_write_json(path: Path, data: dict) -> None:
 
     Shared by settings.json and the autoswitch state file (and any future
     machine-local state files beside them).
+
+    **Writes THROUGH a symlink, never over it.** A rename swaps a directory
+    ENTRY and does not follow links, so renaming onto a symlinked path
+    DETACHES the link: the write succeeds, the content is right, and the
+    link target silently stops receiving updates — until something restores
+    the link (a dotfiles deploy), taking every change written since with
+    it. Same shape as #192/#193, which fixed ``session.py``'s own writer;
+    this is the shared JSON writer. Three consequences, each deliberate:
+
+    - A DANGLING link still writes where it points; linking a path is a
+      request to write there.
+    - The temp file is created beside the RESOLVED target, so the rename
+      stays on one filesystem and remains atomic (beside the LINK it would
+      hit EXDEV whenever the target lives on another mount).
+    - The 0700 hardening stays on the directory cswap owns. Applying it to
+      the resolved parent would narrow a directory belonging to something
+      else, and raise ``PermissionError`` outright when that parent is not
+      ours to chmod. The written file still gets 0600, and ``mkstemp``
+      creates it 0600 to begin with, so the secret is never exposed.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
+        # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(target))
         if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
+            os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)

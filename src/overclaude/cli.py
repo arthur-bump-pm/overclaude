@@ -2,7 +2,7 @@
 
 The package wheel carries the same payload a git clone has (bin/, skills/,
 hooks/, statusline/, claude/, settings/, shell/, vendor/claude-swap, and the
-install/uninstall scripts). This CLI just locates that payload and runs the
+install/uninstall/doctor scripts). This CLI just locates that payload and runs the
 battle-tested bash scripts against it.
 """
 
@@ -34,6 +34,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("install", help="install/refresh the kit into ~/.claude (idempotent, backs everything up)")
     sub.add_parser("uninstall", help="remove exactly what install added (state in ~/.claude-swap-backup survives)")
+    sub.add_parser("doctor", help="read-only health check of the live install, with a fix for each problem")
     sub.add_parser("path", help="print the bundled payload directory")
     sub.add_parser("version", help="print the overclaude version")
     args = ap.parse_args()
@@ -42,6 +43,8 @@ def main():
         sys.exit(_run_script("install.sh"))
     if args.cmd == "uninstall":
         sys.exit(_run_script("uninstall.sh"))
+    if args.cmd == "doctor":
+        sys.exit(_run_script("doctor.sh"))
     if args.cmd == "path":
         print(_payload_dir())
         return

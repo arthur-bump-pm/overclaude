@@ -64,12 +64,26 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 echo "  [ok] jq: $(command -v jq)"
 
-if command -v cswap >/dev/null 2>&1 || [ -x "$LOCALBIN/cswap" ]; then
-  echo "  [ok] cswap: $(command -v cswap 2>/dev/null || echo "$LOCALBIN/cswap")"
+# cswap is vendored as a full source tree (see vendor/README.md). Install it when
+# missing, and UPGRADE an installed copy older than the vendored one (the kit is
+# tested against the vendored version's JSON shapes). Never downgrade.
+VEND_SRC="$SCRIPT_DIR/vendor/claude-swap"
+VEND_VER=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$VEND_SRC/pyproject.toml" 2>/dev/null | head -1)
+CSWAP_BIN=$(command -v cswap 2>/dev/null || { [ -x "$LOCALBIN/cswap" ] && echo "$LOCALBIN/cswap"; })
+CSWAP_VER=""
+[ -n "$CSWAP_BIN" ] && CSWAP_VER=$("$CSWAP_BIN" --version 2>/dev/null | awk '{print $NF}')
+cswap_older() { # true iff installed < vendored (both known)
+  [ -n "$CSWAP_VER" ] && [ -n "$VEND_VER" ] && [ "$CSWAP_VER" != "$VEND_VER" ] &&
+    [ "$(printf '%s\n%s\n' "$CSWAP_VER" "$VEND_VER" | sort -V | head -1)" = "$CSWAP_VER" ]
+}
+if [ -n "$CSWAP_BIN" ] && ! cswap_older; then
+  echo "  [ok] cswap: $CSWAP_BIN${CSWAP_VER:+ ($CSWAP_VER)}"
 else
-  # cswap is vendored as a full source tree (see vendor/README.md) — install it
   # with whichever Python tool-runner is available: pipx, else uv.
-  VEND_SRC="$SCRIPT_DIR/vendor/claude-swap"
+  CSWAP_ACTION="cswap not found — installing"; CSWAP_FORCE=""
+  if [ -n "$CSWAP_BIN" ]; then
+    CSWAP_ACTION="cswap $CSWAP_VER is older than the bundled $VEND_VER — upgrading"; CSWAP_FORCE="--force"
+  fi
   # mktemp creates the log with O_EXCL — a predictable $$-based name in /tmp
   # could be pre-planted as a symlink by another local user.
   CSWAP_LOG=$(mktemp "${TMPDIR:-/tmp}/overclaude-cswap-install.XXXXXX" 2>/dev/null) \
@@ -95,13 +109,13 @@ else
 
   if [ -f "$VEND_SRC/pyproject.toml" ]; then
     if command -v pipx >/dev/null 2>&1; then
-      echo "  [..] cswap not found — installing bundled copy via pipx (deps come from PyPI)..."
-      pipx install "$VEND_SRC" >"$CSWAP_LOG" 2>&1; cswap_outcome "pipx install" $?
+      echo "  [..] $CSWAP_ACTION bundled copy via pipx (deps come from PyPI)..."
+      pipx install $CSWAP_FORCE "$VEND_SRC" >"$CSWAP_LOG" 2>&1; cswap_outcome "pipx install $CSWAP_FORCE" $?
     elif command -v uv >/dev/null 2>&1; then
-      echo "  [..] cswap not found — installing bundled copy via uv (deps come from PyPI)..."
-      uv tool install "$VEND_SRC" >"$CSWAP_LOG" 2>&1; cswap_outcome "uv tool install" $?
+      echo "  [..] $CSWAP_ACTION bundled copy via uv (deps come from PyPI)..."
+      uv tool install $CSWAP_FORCE "$VEND_SRC" >"$CSWAP_LOG" 2>&1; cswap_outcome "uv tool install $CSWAP_FORCE" $?
     else
-      note_warn "cswap not found and neither pipx nor uv is available."
+      note_warn "${CSWAP_ACTION%% —*}, but neither pipx nor uv is available."
       note_warn "  Install one (brew install pipx  |  brew install uv), then re-run ./install.sh."
     fi
   else

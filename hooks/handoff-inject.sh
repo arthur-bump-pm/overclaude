@@ -63,5 +63,36 @@ fi
 A="$ARCHIVE_DIR/$ts-$fhash.md"
 { mkdir -p "$ARCHIVE_DIR" && mv "$P" "$A"; } 2>/dev/null || exit 0
 printf '%s\n\n' "## Handoff from previous session (loaded by handoff-inject)"
-tail -n +2 "$A"
+# Claude Code caps hook stdout at 10,000 characters; past that the session sees
+# only a file path + 2,000-char preview. Budget in BYTES (always >= chars, so
+# multibyte text can never slip past the cap): a package that fits is printed
+# whole; a bigger one is printed whole-section-at-a-time up to the budget,
+# followed by a pointer to the archived full file.
+INJECT_MAX_BYTES="${HANDOFF_INJECT_MAX_BYTES:-9000}"
+INJECT_PART_BYTES="${HANDOFF_INJECT_PART_BYTES:-8000}"
+size="$(tail -n +2 "$A" | LC_ALL=C wc -c | tr -d ' ')"
+case "$size" in ''|*[!0-9]*) size=0 ;; esac
+if [ "$size" -le "$INJECT_MAX_BYTES" ]; then
+    tail -n +2 "$A"
+else
+    tail -n +2 "$A" | LC_ALL=C awk -v max="$INJECT_PART_BYTES" '
+        function flush() {
+            if (stopped || buf == "") return
+            if (acc + length(buf) <= max) { printf "%s", buf; acc += length(buf) }
+            else {
+                # Section does not fit: fill the remaining budget line by line, then stop.
+                n = split(buf, ls, "\n")
+                for (i = 1; i < n; i++) {
+                    if (acc + length(ls[i]) + 1 > max) break
+                    print ls[i]; acc += length(ls[i]) + 1
+                }
+                stopped = 1
+            }
+            buf = ""
+        }
+        /^## / { flush() }
+        { buf = buf $0 "\n" }
+        END { flush() }'
+    printf '\n%s\n' "[handoff-inject] This package is ${size} bytes, over the hook output budget, so only the sections above were injected. Read the FULL package before continuing: $A"
+fi
 exit 0

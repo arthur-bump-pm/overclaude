@@ -92,13 +92,14 @@ if [ "$NOTHING_TO_COMMIT" = no ]; then
   # Scrub gate: the diff must not contain personal data.
   # -------------------------------------------------------------------------
   ME=$(id -un)
-  DIFF=$(git diff; git diff --cached)
-  # First char after /Users/ must be alphanumeric so the literal "/Users/..."
-  # (used in docs to describe this very gate) doesn't false-positive.
-  HITS=$(printf '%s\n' "$DIFF" | grep -nE "^\+" | grep -E \
-    -e "/Users/[A-Za-z0-9_-][A-Za-z0-9._-]*" \
-    -e "[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}" \
-    -e "$ME" 2>/dev/null)
+  # Scanned: tracked changes AND brand-new untracked files (`git add -A` below
+  # commits those too). Not scanned: vendor/ — verbatim upstream source whose
+  # own test fixtures use placeholder emails; the repo rules forbid editing it.
+  # The matching rules live in scrub.sh (tested by tests/test_scrub.sh).
+  DIFF=$(git diff -- . ':(exclude)vendor'; git diff --cached -- . ':(exclude)vendor'
+         git ls-files --others --exclude-standard -z -- . ':(exclude)vendor' |
+           xargs -0 -I{} sed 's/^/+/' {} 2>/dev/null)
+  HITS=$(printf '%s\n' "$DIFF" | bash ./scrub.sh "$ME")
   if [ -n "$HITS" ]; then
     echo
     echo "sync: ABORTED — added lines contain personal data (username/email//Users path):" >&2

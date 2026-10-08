@@ -37,6 +37,16 @@ echo "   epoch: $EPOCH"
 echo
 
 # ---------------------------------------------------------------------------
+# 0. Auto-swap LaunchAgent (opt-in; must go before swap-guard is removed).
+# ---------------------------------------------------------------------------
+AUTO_PLIST="$HOME/Library/LaunchAgents/com.overclaude.autoswap.plist"
+if [ -f "$AUTO_PLIST" ] || launchctl print "gui/$(id -u)/com.overclaude.autoswap" >/dev/null 2>&1; then
+  echo "-- auto-swap agent --"
+  launchctl bootout "gui/$(id -u)/com.overclaude.autoswap" >/dev/null 2>&1
+  rm -f "$AUTO_PLIST" && note_did "removed auto-swap LaunchAgent" || note_warn "could not remove $AUTO_PLIST"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. Remove copied files.
 # ---------------------------------------------------------------------------
 echo "-- files --"

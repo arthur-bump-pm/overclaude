@@ -16,13 +16,18 @@ unit-tested in CI; ``rumps`` is imported lazily inside the app glue.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import plistlib
 import re
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
+from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -31,6 +36,50 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
+NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+
+
+def ensure_notification_identity(
+    executable: Path | None = None,
+    *,
+    platform: str = sys.platform,
+) -> Path | None:
+    """Ensure rumps can resolve a bundle identifier for notifications.
+
+    Command-line Python tools have no app bundle, so rumps looks for an
+    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
+    environment; repair the tiny plist on every launch when needed.
+    """
+    if platform != "darwin":
+        return None
+    path = (executable or Path(sys.executable)).parent / "Info.plist"
+    data: dict = {}
+    try:
+        if path.exists():
+            try:
+                loaded = plistlib.loads(path.read_bytes())
+            except Exception:
+                loaded = None  # unreadable/corrupt — rebuild from scratch
+            if isinstance(loaded, dict):
+                data = loaded
+        changed = False
+        if not data.get("CFBundleIdentifier"):
+            data["CFBundleIdentifier"] = NOTIFICATION_BUNDLE_ID
+            changed = True
+        if not data.get("CFBundleName"):
+            data["CFBundleName"] = "claude-swap"
+            changed = True
+        if changed or not path.exists():
+            # atomic: an interrupted write must not leave a half-written plist
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_bytes(plistlib.dumps(data))
+            os.replace(tmp, path)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        logging.getLogger("claude-swap").warning(
+            "Could not prepare menu-bar notification identity: %s", exc
+        )
+        return None
+    return path
 
 
 @dataclass
@@ -169,8 +218,15 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
-def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
-    """One-line usage summary for an account row (reset countdown computed live)."""
+def usage_summary(
+    usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
+) -> str:
+    """One-line usage summary for an account row (reset countdown computed live).
+
+    ``fetched_at`` is the underlying measurement's fetch time (may be older
+    than ``now`` when serving last-good data) — used only to flag a weekly
+    window that's meaningfully ahead of pace (issue #125), never the 5h one.
+    """
     if isinstance(usage, str):
         return usage
     if usage is None:
@@ -180,10 +236,19 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
+        pace_result = None
         if key == "seven_day":
             window = _rolled_weekly_window(window, now)  # reflect a passed weekly reset
+            # Pace against the rolled window, not the raw one: a stale window
+            # rolled to 0% has no current-cycle data to compare against, so
+            # its (correctly zeroed) pct naturally never reads as "ahead" —
+            # computing pace pre-roll would otherwise pair last cycle's high
+            # pct with this cycle's freshly-reset 0% display.
+            pace_result = pace.compute_pace(window, fetched_at=fetched_at)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             seg = f"{label} {window['pct']:.0f}%"
+            if key == "seven_day" and pace_result and pace_result.ahead:
+                seg += " (ahead)"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"  # time until this window resets
@@ -191,10 +256,13 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
     for window in usage.get("scoped") or []:
         window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
+        pace_result = pace.compute_pace(window, fetched_at=fetched_at)  # against the rolled window, see above
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
             seg = f"{window['name']} {window['pct']:.0f}%"
             if window["pct"] >= 100:
                 seg += " (!)"  # maxed model — the usual reason to switch
+            elif pace_result and pace_result.ahead:
+                seg += " (ahead)"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"
@@ -212,11 +280,12 @@ def format_account_label(
     now: float | None = None,
     alias: str | None = None,
     disabled: bool = False,
+    fetched_at: float | None = None,
 ) -> str:
     """Build one account row's menu label."""
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now)}"
+    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -340,11 +409,12 @@ EMPTY_SNAPSHOT: dict = {
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled), ...],
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
     "active_alias": str | None}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
-    fetching, no I/O.
+    fetching, no I/O. Per-account ``fetched_at`` is the underlying
+    measurement's fetch time, used only for the pace marker (issue #125).
     """
     accounts = []
     active_email = None
@@ -353,7 +423,10 @@ def _adapt_snapshot(snap) -> dict:
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         accounts.append(
-            (acc.number, acc.email, acc.is_active, display, acc.usage.last_good, acc.alias, acc.disabled)
+            (
+                acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
+                acc.alias, acc.disabled, acc.usage.fetched_at,
+            )
         )
         if acc.is_active:
             active_email, active_usage, active_alias = acc.email, display, acc.alias
@@ -367,7 +440,27 @@ def _adapt_snapshot(snap) -> dict:
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    import rumps  # lazy: optional dependency, imported only when launching
+    ensure_notification_identity()
+    try:
+        import rumps  # lazy: optional dependency, imported only when launching
+        import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
+    except ImportError as e:
+        # This module is import-safe without rumps by design, so the CLI's
+        # guard around ``from claude_swap.menubar import run`` can never see a
+        # missing extra — the failure lands here at call time. Raise the
+        # error type the CLI already renders cleanly instead of a traceback.
+        raise ClaudeSwitchError(
+            "Menu bar mode requires 'rumps'. "
+            "Install with: pip install 'claude-swap[menubar]'"
+        ) from e
+
+    # rumps never sets an activation policy, so under a framework Python the
+    # process launches as a regular app and parks a "Python" icon in the Dock
+    # for as long as the menu bar runs. Accessory keeps the status item and
+    # dialog windows but stays out of the Dock and the Cmd-Tab switcher.
+    AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+        AppKit.NSApplicationActivationPolicyAccessory
+    )
 
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
@@ -446,7 +539,7 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -561,11 +654,32 @@ def run(switcher) -> int:
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
             )
+            # Stop a rumps memory leak: rumps registers each menu item's callback
+            # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
+            # never removes them, so rebuilding the whole menu on every refresh
+            # leaks every item forever (~1GB after days on a busy machine). Purge
+            # this menu's entries before we tear it down. We walk the *native*
+            # NSMenu tree (itemArray, recursing into submenus) rather than the
+            # rumps Python dict: that dict is keyed by title and silently drops
+            # same-title items, which would leave leaked entries behind.
+            # Guard the private rumps attribute: if a future rumps release renames
+            # it, degrade to "leaks again" rather than crashing on every rebuild.
+            _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
+            if _reg is not None:
+                def _purge(nsmenu):
+                    for _it in nsmenu.itemArray():
+                        _reg.pop(_it, None)
+                        _sub = _it.submenu()
+                        if _sub is not None:
+                            _purge(_sub)
+                _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
-                    format_account_label(num, email, display, alias=alias, disabled=disabled),
+                    format_account_label(
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                    ),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
@@ -603,7 +717,7 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled in accounts:
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
@@ -613,7 +727,7 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled in accounts:
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
                 name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)

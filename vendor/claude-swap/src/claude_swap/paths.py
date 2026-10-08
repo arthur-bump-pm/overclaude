@@ -53,6 +53,16 @@ def get_global_config_path() -> Path:
     return base / ".claude.json"
 
 
+def get_default_claude_config_home() -> Path:
+    """Return the *default* profile's config home, ignoring ``CLAUDE_CONFIG_DIR``.
+
+    ``_read_capture_credentials`` has to tell an env var that names the default
+    profile from one that names another, since only the former's credential is
+    the active store's.
+    """
+    return Path.home() / ".claude"
+
+
 def get_default_global_config_path() -> Path:
     """Return the global config path of the *default* profile.
 
@@ -61,7 +71,7 @@ def get_default_global_config_path() -> Path:
     (session sharing) must not source from another session when invoked from
     inside one.
     """
-    legacy = Path.home() / ".claude" / ".config.json"
+    legacy = get_default_claude_config_home() / ".config.json"
     if legacy.exists():
         return legacy
     return Path.home() / ".claude.json"
@@ -135,6 +145,16 @@ def _wipe_throwaway_artifacts(target: Path) -> None:
     target.rmdir()
 
 
+def migration_flag_for(target: Path) -> Path:
+    """The interrupted-migration flag for ``target``: a SIBLING of the
+    backup root, not a child.
+
+    Spell it here only -- this flag is what turns the collision refusal
+    below into an rmtree of the destination, and a second copy drifts.
+    """
+    return target.parent / f".{target.name}.migrating"
+
+
 def migrate_legacy_backup_dir(target: Path) -> bool:
     """Move the legacy backup directory to ``target`` if needed.
 
@@ -167,7 +187,7 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
     if same_path:
         return False
 
-    flag = target.parent / f".{target.name}.migrating"
+    flag = migration_flag_for(target)
 
     if not legacy.exists():
         # Successful prior run that died before unlinking the flag.

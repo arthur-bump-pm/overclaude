@@ -1,9 +1,9 @@
 ---
 name: swap
 description: "Switch between Claude accounts from inside Claude Code: hot-swap the live session (default), show the accounts + live-sessions dashboard, or carry work onto the new account via handoff/restart modes; also guides adding a new account."
-argument-hint: "[account] [handoff|restart|now|force] | add"
+argument-hint: "[account] [handoff|restart|now|force] | add | auto [on|off|status] | doctor"
 disable-model-invocation: true
-allowed-tools: Bash(cswap *), Bash(swap-guard *)
+allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(bash *doctor.sh)
 ---
 
 # /swap — Claude account switcher
@@ -16,7 +16,7 @@ allowed-tools: Bash(cswap *), Bash(swap-guard *)
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Example: `/swap work handoff` ≡ `/swap handoff work`.
@@ -31,11 +31,14 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap <target> handoff [now] [force]` | delegate to `/handoff <target>`: preflight → package (+ artifact snapshot) → switch → flag + exit instructions | preflight |
 | `/swap <target> restart [now] [force]` | preflight → switch → flag `{mode:"restart", sessionId}` → exit → wrapper `--resume <id>` | preflight |
 | `/swap add` | guided registration of a new account | /logout blast-radius warning |
-| `/handoff ...` | same-account handoff, `status`, `cancel` — owned by the handoff skill, never duplicated here | — |
+| `/swap auto [on\|off\|status] [threshold N] [model X]` | busy-aware auto-switching LaunchAgent (opt-in) | defers proactive switches while sessions are busy |
+| `/swap doctor` | read-only health check of the whole kit, with fixes | — |
+| `/handoff ...` | same-account handoff, `status`, `cancel`, `history`, `restore` — owned by the handoff skill, never duplicated here | — |
 
 Edge rulings:
 - `/swap <target> now` without `handoff`/`restart` → error: `now` only modifies handoff/restart.
 - `/swap handoff` (no target) → error: "did you mean /handoff? For an account aliased 'handoff' use slot number/email."
+- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`, `threshold <50-99>`, `model <names>`), never a target.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
 - Flag mode vocabulary matches the command names exactly: `{"mode":"handoff"}` and `{"mode":"restart","sessionId":...}` — never "fresh"/"resume" or other synonyms.
 
@@ -75,6 +78,18 @@ The blast-radius line is mandatory in every hot-swap confirmation.
 4. Tell the user: exit with Ctrl+D — the shell wrapper relaunches `claude --resume <sessionId>` on the new account with full context (flag honored only in the same directory, within 300 s).
 5. `now` token: run `swap-guard schedule-kill <pid>` (pid from `swap-guard whoami`). If it errors (v1 stub), say phase-2 is not enabled and fall back to the Ctrl+D instruction.
 
+## `/swap auto [on|off|status] [threshold N] [model X]`
+
+Opt-in background auto-switching: a LaunchAgent runs `swap-guard auto tick` every 3 min. Each tick asks `cswap auto` for a dry-run decision; a PROACTIVE switch (nearing the threshold) is deferred while any live session is busy, an AT-LIMIT switch proceeds (the account is stalled anyway), dead-token targets are skipped, and cswap's cooldown applies. (cswap's "failover" for unreadable usage needs 3 consecutive failures inside one long-running process, so the per-tick agent does not fail over.) Install validates the arguments and runs a probe tick that never switches; a bad value is refused up front. A macOS notification announces each switch.
+- `on` → confirm the blast radius first ("switches flip ALL live sessions"), then run `swap-guard auto install` with `--threshold N` (default 90) and `--model X` if given (suggest `--model Fable` when the scoped bucket is the usual wall). Report the JSON.
+- `off` → `swap-guard auto uninstall`.
+- `status` (default) → `swap-guard auto status`; render loaded yes/no and the recent ticks (ts, action, reason) as a table.
+Note: a session paused at a usage limit does NOT resume by itself after a background switch — the user sends any message and it goes through on the new account.
+
+## `/swap doctor`
+
+Run `overclaude doctor` (fallback: `bash "$(overclaude path)/doctor.sh"`). Relay the [FAIL]/[warn] lines with their fixes; offer to run any fix that is a plain command. It never changes anything itself.
+
 ## `/swap add` — register a new account
 
 Warn FIRST and get explicit confirmation: `/logout` invalidates the shared credential for ALL live Claude Code sessions on this machine — do it at an idle moment.
@@ -83,7 +98,7 @@ Warn FIRST and get explicit confirmation: `/logout` invalidates the shared crede
 2. `/logout`.
 3. `/login` — the user signs in as the NEW account.
 4. `cswap add --json` — registers the new credential in the next free slot `<N>`.
-5. `cswap alias <N> <name>` — optional; do not use a reserved word (`add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`).
+5. `cswap alias <N> <name>` — optional; do not use a reserved word (`add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`).
 6. `cswap switch <back> --json` — return to the original account, or skip to stay on the new one.
 
 ## VS Code sessions

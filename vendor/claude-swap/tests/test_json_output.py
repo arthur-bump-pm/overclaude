@@ -98,6 +98,45 @@ class TestJsonHelpers:
         assert out["spend"]["countdown"] == countdown
         assert out["spend"]["clock"] == clock
 
+    def test_usage_to_json_adds_pace_fields_when_fetched_at_given(self):
+        # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert out["sevenDay"]["aheadOfPace"] is True
+        assert out["sevenDay"]["expectedPct"] == pytest.approx(14.3, abs=0.1)
+        assert "projectedExhaustionAt" in out["sevenDay"]
+        assert out["sevenDay"]["willLastToReset"] is False  # 50% after 1/7 of the week won't last
+
+    def test_usage_to_json_pace_fields_on_scoped_windows(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at}]}
+        out = usage_to_json(usage, fetched_at=now)
+        assert out["scoped"][0]["aheadOfPace"] is True
+
+    def test_usage_to_json_five_hour_never_gets_pace_fields(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)).isoformat()
+        usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["fiveHour"]
+        assert "expectedPct" not in out["fiveHour"]
+
+    def test_usage_to_json_no_pace_fields_without_fetched_at(self):
+        usage = {"seven_day": {"pct": 50.0, "resets_at":
+                                (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()}}
+        out = usage_to_json(usage)
+        assert "aheadOfPace" not in out["sevenDay"]
+
+    def test_usage_to_json_no_pace_fields_within_suppression_window(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)).isoformat()
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["sevenDay"]
+
     def test_usage_fields_variants(self):
         from claude_swap.json_output import (
             USAGE_KEYCHAIN_UNAVAILABLE,
@@ -278,9 +317,13 @@ class TestListJson:
         if expected_status == "ok":
             assert row["usage"]["fiveHour"]["pct"] == 25.0
             assert row["usageAgeSeconds"] >= age_s
+            assert "lastGoodUsage" not in row
         else:
             assert row["usage"] is None
             assert "usageFetchedAt" not in row
+            assert row["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+            assert row["lastGoodAgeSeconds"] >= age_s
+            assert row["lastGoodFetchedAt"].endswith("Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -324,6 +367,37 @@ class TestStatusJson:
         assert active["usageStatus"] == "ok"
         assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
         assert payload["totalManagedAccounts"] == 2
+
+    def test_status_managed_includes_display_grade_last_good(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        import time as time_mod
+
+        from claude_swap.usage_store import UsageEntry
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        fetched_at = time_mod.time() - 4000
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 25.0}},
+            fetched_at=fetched_at,
+            age_s=4000.0,
+        )
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_active_account_usage", return_value=entry):
+            payload = switcher.status(json_output=True)
+
+        active = payload["active"]
+        assert active["usageStatus"] == "unavailable"
+        assert active["usage"] is None
+        assert active["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+        assert active["lastGoodAgeSeconds"] == 4000.0
 
     def test_status_managed_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
@@ -380,6 +454,11 @@ def _install_patches(switcher, creds_store, configs_store, live_state):
     patches = [
         patch.object(switcher, "_read_account_credentials",
                      side_effect=lambda n, e: creds_store.get((str(n), e), "")),
+        # The strict reader must answer from the same double: a caller that
+        # asks absent-vs-unreadable would otherwise bypass it entirely and
+        # read the real (empty) store.
+        patch.object(switcher, "_read_account_credentials_ex",
+                     side_effect=lambda n, e: (creds_store.get((str(n), e), ""), False)),
         patch.object(switcher, "_write_account_credentials",
                      side_effect=lambda n, e, c: creds_store.__setitem__((str(n), e), c)),
         patch.object(switcher, "_read_account_config",

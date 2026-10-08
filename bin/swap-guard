@@ -9,6 +9,11 @@
 #   flag <json>                     validate + fill + atomic-write relaunch flag; prints path (exit 1 on bad input)
 #   status                          own-session status JSON (always exit 0)
 #   cancel [--cwd <dir>]            remove pending handoff + flag for cwd (always exit 0)
+#   history [--cwd <dir>] [--all]   archived handoff packages (newest first, numbered) as JSON
+#   restore [<n>|<path>] [--cwd <dir>] [--force]
+#                                   re-arm an archived package as this cwd's pending handoff
+#   auto tick|install|uninstall|status [opts]
+#                                   busy-aware wrapper around `cswap auto --once` (+ opt-in LaunchAgent)
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
 #                                   $STATE_ROOT/handoff-artifacts/<sid>/ + manifest.json; prints manifest
@@ -31,6 +36,13 @@ usage: swap-guard <subcommand> [args]
   flag <json>                     write relaunch flag ({"mode":"handoff"|"restart",...}); prints path
   status                          own-session status JSON
   cancel [--cwd <dir>]            remove pending handoff + flag for cwd
+  history [--cwd <dir>] [--all]   list archived handoff packages (newest first)
+  restore [<n>|<path>] [--cwd <dir>] [--force]
+                                  re-arm an archived package (default: newest for cwd)
+  auto tick [--threshold PCT] [--model NAMES] [--no-notify]
+                                  one busy-aware auto-switch evaluation (JSON line; exit = cswap's)
+  auto install [--interval SEC] [--threshold PCT] [--model NAMES] [--no-notify]
+  auto uninstall | auto status    manage the LaunchAgent that runs `auto tick` periodically
   artifacts [--session <id>] [--cwd <dir>]
                                   snapshot this session's artifacts (sources + manifest) for handoff
   schedule-kill <pid>             phase-2 stub
@@ -332,6 +344,335 @@ cmd_cancel() {
   exit 0
 }
 
+# _history_files <cwd> <all:0|1> — archive paths, newest first (max 20).
+# Archive names are <UTC-ts>-<cwdhash>[-expired].md, so the cwd filter is a name match.
+_history_files() {
+  local cwd="$1" all="$2" h
+  [ -d "$ARCHIVE_DIR" ] || return 0
+  h="$(hash_cwd "$cwd")"
+  ls "$ARCHIVE_DIR" 2>/dev/null | grep -E '^[0-9]{8}-[0-9]{6}-[0-9a-f]{12}(-expired|-replaced)?\.md$' |
+    { if [ "$all" = 1 ]; then cat; else grep -E -- "-$h(-expired|-replaced)?\.md$"; fi; } |
+    sort -r | head -n 20 | sed "s|^|$ARCHIVE_DIR/|"
+}
+
+cmd_history() {
+  local cwd_opt="" cwd all=0 a n=0 f base hdr pcwd pcreated title bytes expired out="[]"
+  for a in "$@"; do [ "$a" = "--all" ] && all=1; done
+  cwd_opt="$(parse_cwd_opt "$@")" || cwd_opt=""
+  cwd="$(resolve_cwd "$cwd_opt")"
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    n=$((n + 1))
+    base="${f##*/}"
+    hdr="$(head -n 1 "$f")"
+    pcwd="$(printf '%s' "$hdr" | sed -n 's/^<!-- handoff cwd="\(.*\)" created="[0-9][0-9]*" -->.*$/\1/p')"
+    pcreated="$(printf '%s' "$hdr" | sed -n 's/^<!-- handoff cwd=".*" created="\([0-9][0-9]*\)" -->.*$/\1/p')"
+    title="$(sed -n '2s/^# *//p' "$f" | cut -c1-120)"
+    bytes="$(LC_ALL=C wc -c < "$f" | tr -d ' ')"
+    # (no `case` inside $(...): bash 3.2 mis-parses its `)` patterns there)
+    expired=false; case "$base" in *-expired.md) expired=true;; esac
+    out="$(printf '%s' "$out" | jq -c --argjson n "$n" --arg path "$f" --arg cwd "$pcwd" \
+      --arg created "$pcreated" --arg title "$title" --arg bytes "$bytes" \
+      --arg arch "$(printf '%s' "$base" | sed -E 's/^([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2}).*/\1-\2-\3T\4:\5:\6Z/')" \
+      --argjson expired "$expired" '
+      . + [{n: $n, path: $path, title: $title, cwd: (if $cwd == "" then null else $cwd end),
+            created: (if $created == "" then null else ($created | tonumber) end),
+            archivedAt: $arch, expired: $expired, bytes: ($bytes | tonumber)}]')"
+  done <<EOF
+$(_history_files "$cwd" "$all")
+EOF
+  printf '%s\n' "$out"
+  exit 0
+}
+
+cmd_restore() {
+  local cwd_opt="" cwd force=0 sel="" src="" hdr pcwd P created_old now age
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1;;
+      --cwd) shift; cwd_opt="${1:-}";;
+      --cwd=*) cwd_opt="${1#--cwd=}";;
+      --*) :;;
+      *) [ -z "$sel" ] && sel="$1";;
+    esac
+    shift
+  done
+  cwd="$(resolve_cwd "$cwd_opt")"
+  case "$sel" in
+    '') src="$(_history_files "$cwd" 0 | head -n 1)";;
+    *[!0-9]*)
+      # Paths are reduced to their basename and must look like an archive name, so
+      # `..`, foreign dirs, and look-alike prefixes cannot escape the archive dir.
+      # Restored text is injected as trusted context — symlinks are refused too.
+      local b="${sel##*/}"
+      if printf '%s' "$b" | grep -Eq '^[0-9]{8}-[0-9]{6}-[0-9a-f]{12}(-expired|-replaced)?\.md$' &&
+         [ -f "$ARCHIVE_DIR/$b" ] && [ ! -L "$ARCHIVE_DIR/$b" ]; then
+        src="$ARCHIVE_DIR/$b"
+      fi;;
+    *) src="$(_history_files "$cwd" 0 | sed -n "${sel}p")";;
+  esac
+  if [ -z "$src" ] || [ ! -f "$src" ] || [ -L "$src" ]; then
+    jq -cn --arg cwd "$cwd" --arg sel "$sel" '{error:"not-found", cwd:$cwd, selector:$sel,
+      detail:"no archived package matches; run swap-guard history (paths must be inside the archive dir)"}'
+    exit 1
+  fi
+  hdr="$(head -n 1 "$src")"
+  pcwd="$(printf '%s' "$hdr" | sed -n 's/^<!-- handoff cwd="\(.*\)" created="[0-9][0-9]*" -->.*$/\1/p')"
+  if [ -z "$pcwd" ]; then
+    jq -cn --arg src "$src" '{error:"malformed-header", path:$src}'; exit 1
+  fi
+  if [ "$pcwd" != "$cwd" ]; then
+    jq -cn --arg src "$src" --arg pcwd "$pcwd" --arg cwd "$cwd" '{error:"cwd-mismatch", path:$src,
+      packageCwd:$pcwd, cwd:$cwd, detail:"the startup injector only loads a package in its own directory: cd there, or pass --cwd <packageCwd>"}'
+    exit 1
+  fi
+  P="$(pending_path_for "$cwd")"
+  now="$(date +%s)"
+  if [ -f "$P" ] && [ "$force" -ne 1 ]; then
+    created_old="$(sed -n '1s/.*created="\([0-9][0-9]*\)".*/\1/p' "$P" 2>/dev/null)"
+    case "$created_old" in ''|*[!0-9]*) age=0;; *) age=$(( now - created_old ));; esac
+    if [ "$age" -lt 600 ]; then
+      jq -cn --arg p "$P" --argjson age "$age" '{error:"pending-exists", pending:$p, pendingAgeSec:$age,
+        detail:"a live pending handoff exists for this cwd; re-run with --force to replace it"}'
+      exit 1
+    fi
+  fi
+  mkdir -p "$STATE_ROOT" "$ARCHIVE_DIR" || exit 1
+  # Build the new package BEFORE touching the old one (src may be re-read below).
+  { printf '<!-- handoff cwd="%s" created="%s" -->\n' "$cwd" "$now"; tail -n +2 "$src"; } > "$P.tmp.$$" ||
+    { rm -f "$P.tmp.$$"; exit 1; }
+  # An existing pending package (live with --force, or expired but never archived
+  # because no session started here since) is moved to the archive, never lost.
+  local replaced=""
+  if [ -f "$P" ]; then
+    replaced="$ARCHIVE_DIR/$(date -u +%Y%m%d-%H%M%S)-$(hash_cwd "$cwd")-replaced.md"
+    mv "$P" "$replaced" || { rm -f "$P.tmp.$$"; exit 1; }
+  fi
+  mv "$P.tmp.$$" "$P" || { rm -f "$P.tmp.$$"; exit 1; }
+  jq -cn --arg src "$src" --arg p "$P" --arg cwd "$cwd" --argjson now "$now" --arg rep "$replaced" \
+    '{restored:$src, pending:$p, cwd:$cwd, created:$now, expiresInSec:600,
+      replacedArchivedTo:(if $rep == "" then null else $rep end)}'
+  exit 0
+}
+
+# --- auto: busy-aware auto-switching ------------------------------------------
+# `cswap auto` knows rate limits but not whether a Claude session is mid-turn.
+# A tick asks cswap for a DRY-RUN decision first; a proactive switch is deferred
+# while any live session is busy (swap-guard preflight), while an at-limit /
+# failover switch proceeds (every session on that account is stalled anyway).
+# The real switch is a non-dry `cswap auto --once`, which re-checks under its own
+# state lock and records lastSwitchAt, so cswap's cooldown keeps working.
+AUTO_LABEL="com.overclaude.autoswap"
+AUTO_LOG="$STATE_ROOT/auto.log"
+auto_plist() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$AUTO_LABEL"; }
+
+_auto_log() { # _auto_log <json> — append + keep the last 500 lines
+  mkdir -p "$STATE_ROOT" 2>/dev/null || return 0
+  printf '%s\n' "$1" >> "$AUTO_LOG"
+  if [ "$(wc -l < "$AUTO_LOG" 2>/dev/null || echo 0)" -gt 600 ]; then
+    tail -n 500 "$AUTO_LOG" > "$AUTO_LOG.tmp.$$" && mv "$AUTO_LOG.tmp.$$" "$AUTO_LOG"
+  fi
+}
+
+_auto_notify() { # _auto_notify <message>
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$(printf '%s' "$1" | tr -d '"\\')\" with title \"overclaude auto-swap\"" >/dev/null 2>&1 || true
+}
+
+_auto_tick() {
+  local notify=1 probe=0 cargs=() dry rc ev trigger to_num to_email pre verdict busy_n out real_rc now
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-notify) notify=0;;
+      --probe) probe=1;;
+      --threshold|--model|--strategy|--cooldown) cargs+=("$1" "${2:-}"); shift;;
+      *) :;;
+    esac
+    shift
+  done
+  command -v cswap >/dev/null 2>&1 || { printf '%s\n' '{"event":"error","detail":"cswap not found"}'; return 1; }
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local errf; errf="$(mktemp "${TMPDIR:-/tmp}/swap-guard-auto.XXXXXX")" || errf=/dev/null
+  dry="$(cswap auto --once --dry-run --json ${cargs[@]+"${cargs[@]}"} 2>"$errf")"; rc=$?
+  # argparse rejects bad arguments with rc 2 and no JSON on stdout — rc 2 alone is
+  # indistinguishable from NO_ACTION, so treat "no events at all" as an error.
+  if ! printf '%s\n' "$dry" | jq -e 'select(.event != null)' >/dev/null 2>&1; then
+    out="$(jq -cn --arg ts "$now" --argjson rc "$rc" --arg err "$(tail -c 400 "$errf" 2>/dev/null)" \
+      '{ts:$ts, action:"error", rc:$rc, detail:("cswap auto produced no decision: " + $err)}')"
+    [ "$errf" = /dev/null ] || rm -f "$errf"
+    _auto_log "$out"; printf '%s\n' "$out"; return 1
+  fi
+  [ "$errf" = /dev/null ] || rm -f "$errf"
+  # --probe (used by `auto install`): the args parse and cswap decides — stop
+  # here; a probe never switches and never writes the log.
+  if [ "$probe" -eq 1 ]; then
+    jq -cn --arg ts "$now" --argjson rc "$rc" '{ts:$ts, action:"probe-ok", rc:$rc}'; return 0
+  fi
+  ev="$(printf '%s\n' "$dry" | jq -c 'select(.event == "switch")' 2>/dev/null | tail -n 1)"
+  if [ "$rc" -ne 0 ] || [ -z "$ev" ]; then
+    # no-switch / blocked / error: log the last decisive event and pass cswap's exit code through
+    out="$(printf '%s\n' "$dry" | jq -c --arg ts "$now" --argjson rc "$rc" \
+      'select(.event != "poll") | {ts: $ts, action: "none", rc: $rc, event, reason, detail}' 2>/dev/null | tail -n 1)"
+    [ -n "$out" ] || out="$(jq -cn --arg ts "$now" --argjson rc "$rc" '{ts:$ts, action:"none", rc:$rc}')"
+    _auto_log "$out"; printf '%s\n' "$out"
+    if [ "$rc" -eq 3 ] && [ "$notify" -eq 1 ]; then
+      _auto_notify "Every account is at its limit — nothing to switch to."
+    fi
+    return "$rc"
+  fi
+  trigger="$(printf '%s' "$ev" | jq -r '.trigger // ""')"
+  to_num="$(printf '%s' "$ev" | jq -r '.to.number // ""')"
+  to_email="$(printf '%s' "$ev" | jq -r '.to.email // ""')"
+  pre="$( (cmd_preflight "$to_num") 2>/dev/null)"
+  verdict="$(printf '%s' "$pre" | jq -r '.verdict // "unknown"' 2>/dev/null)"
+  busy_n="$(printf '%s' "$pre" | jq -r '(.busy // []) | length' 2>/dev/null)"
+  case "$verdict" in
+    relogin-required|unknown-target)
+      out="$(jq -cn --arg ts "$now" --arg v "$verdict" --arg to "$to_num" '{ts:$ts, action:"skipped", reason:$v, to:$to}')"
+      _auto_log "$out"; printf '%s\n' "$out"; return 3;;
+    busy)
+      if [ "$trigger" = "proactive" ] || [ "$trigger" = "consume-first" ]; then
+        out="$(jq -cn --arg ts "$now" --arg to "$to_num" --arg t "$trigger" --argjson n "${busy_n:-0}" \
+          '{ts:$ts, action:"deferred", reason:"busy", trigger:$t, to:$to, busySessions:$n}')"
+        _auto_log "$out"; printf '%s\n' "$out"; return 2
+      fi;;
+  esac
+  out="$(cswap auto --once --json ${cargs[@]+"${cargs[@]}"} 2>/dev/null)"; real_rc=$?
+  ev="$(printf '%s\n' "$out" | jq -c 'select(.event == "switch")' 2>/dev/null | tail -n 1)"
+  if [ "$real_rc" -eq 0 ] && [ -n "$ev" ]; then
+    to_num="$(printf '%s' "$ev" | jq -r '.to.number // ""')"
+    to_email="$(printf '%s' "$ev" | jq -r '.to.email // ""')"
+    out="$(printf '%s' "$ev" | jq -c --arg ts "$now" --arg v "$verdict" --argjson n "${busy_n:-0}" \
+      '{ts:$ts, action:"switched", trigger, from:.from.number, to:.to.number, warnings, preflight:$v, busySessions:$n}')"
+    _auto_log "$out"; printf '%s\n' "$out"
+    if [ "$notify" -eq 1 ]; then
+      local label
+      label="$(jq -r --arg n "$to_num" '.accounts[$n].alias // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
+      _auto_notify "Switched to ${label:-${to_email%%@*}} ($trigger). A paused session continues when you send any message."
+    fi
+    return 0
+  fi
+  out="$(printf '%s\n' "$out" | jq -c --arg ts "$now" --argjson rc "$real_rc" \
+    'select(.event != "poll") | {ts:$ts, action:"none", rc:$rc, event, reason, detail, note:"dry-run wanted a switch; recheck declined"}' 2>/dev/null | tail -n 1)"
+  [ -n "$out" ] || out="$(jq -cn --arg ts "$now" --argjson rc "$real_rc" '{ts:$ts, action:"none", rc:$rc}')"
+  _auto_log "$out"; printf '%s\n' "$out"
+  return "$real_rc"
+}
+
+_auto_install() {
+  local interval=180 targs=() plist path_env d self uid a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval="${2:-180}"; shift;;
+      --threshold|--model) targs+=("$1" "${2:-}"); shift;;
+      --no-notify) targs+=("$1");;
+    esac
+    shift
+  done
+  case "$interval" in ''|*[!0-9]*) echo "auto install: --interval must be whole seconds" >&2; return 1;; esac
+  [ "$interval" -ge 60 ] || interval=60
+  # Validate up front: a bad value would otherwise fail silently on every tick.
+  local i=0 v
+  while [ "$i" -lt "${#targs[@]}" ]; do
+    case "${targs[$i]}" in
+      --threshold)
+        v="${targs[$((i + 1))]:-}"
+        if ! printf '%s' "$v" | grep -Eq '^[0-9]+(\.[0-9]+)?$' ||
+           ! awk -v t="$v" 'BEGIN { exit !(t >= 50 && t <= 99.9) }'; then
+          echo "auto install: --threshold must be a number from 50 to 99.9 (got '$v')" >&2; return 1
+        fi; i=$((i + 2));;
+      --model)
+        v="${targs[$((i + 1))]:-}"
+        printf '%s' "$v" | grep -Eq '^[A-Za-z0-9_,.-]+$' ||
+          { echo "auto install: --model must be names like Fable or 'Fable,Opus' (got '$v')" >&2; return 1; }
+        i=$((i + 2));;
+      *) i=$((i + 1));;
+    esac
+  done
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  # launchd's PATH is minimal: pin the dirs of every tool a tick needs, in priority
+  # order — the cswap that install.sh manages first, so a stale brew/pip copy
+  # elsewhere can never shadow it.
+  path_env=""
+  for d in "$(dirname "$(command -v cswap 2>/dev/null || echo /usr/bin/cswap)")" "$(dirname "$self")" \
+           "$(dirname "$(command -v jq 2>/dev/null || echo /usr/bin/jq)")" /opt/homebrew/bin /usr/local/bin \
+           /usr/bin /bin /usr/sbin /sbin; do
+    case ":$path_env:" in *":$d:"*) :;; *) path_env="${path_env:+$path_env:}$d";; esac
+  done
+  # Dry-run one tick with these exact args before installing anything.
+  local probe
+  probe="$(PATH="$path_env" _auto_tick --probe --no-notify ${targs[@]+"${targs[@]}"} 2>/dev/null | tail -n 1)"
+  if [ "$(printf '%s' "$probe" | jq -r '.action // "error"' 2>/dev/null)" != "probe-ok" ]; then
+    echo "auto install: a test tick failed, not installing: $probe" >&2; return 1
+  fi
+  plist="$(auto_plist)"
+  mkdir -p "$(dirname "$plist")" "$STATE_ROOT" || return 1
+  xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+      '<plist version="1.0"><dict>' \
+      "  <key>Label</key><string>$AUTO_LABEL</string>" \
+      '  <key>ProgramArguments</key><array>' \
+      "    <string>$(xml "$self")</string><string>auto</string><string>tick</string>"
+    for a in ${targs[@]+"${targs[@]}"}; do printf '    <string>%s</string>\n' "$(xml "$a")"; done
+    # stdout -> /dev/null: every tick already logs itself to the (trimmed) auto.log;
+    # stderr is kept for genuine crashes and stays tiny.
+    printf '%s\n' '  </array>' \
+      "  <key>StartInterval</key><integer>$interval</integer>" \
+      '  <key>RunAtLoad</key><true/>' \
+      "  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$(xml "$path_env")</string><key>HOME</key><string>$(xml "$HOME")</string></dict>" \
+      '  <key>StandardOutPath</key><string>/dev/null</string>' \
+      "  <key>StandardErrorPath</key><string>$(xml "$STATE_ROOT/auto-launchd.err")</string>" \
+      '</dict></plist>'
+  } > "$plist.tmp.$$" || { rm -f "$plist.tmp.$$"; return 1; }
+  # Lint BEFORE replacing, so a bad write never clobbers a working plist.
+  plutil -lint "$plist.tmp.$$" >/dev/null 2>&1 ||
+    { echo "auto install: generated plist failed plutil -lint (kept: $plist.tmp.$$)" >&2; return 1; }
+  mv "$plist.tmp.$$" "$plist" || return 1
+  if [ -n "${SWAP_GUARD_NO_LAUNCHCTL:-}" ]; then  # tests: generate + lint only
+    jq -cn --arg p "$plist" --argjson i "$interval" '{installed:false, generated:true, plist:$p, intervalSec:$i}'
+    return 0
+  fi
+  uid="$(id -u)"
+  launchctl bootout "gui/$uid/$AUTO_LABEL" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null; then
+    jq -cn --arg p "$plist" --argjson i "$interval" --arg a "${targs[*]+${targs[*]}}" \
+      '{installed:true, plist:$p, intervalSec:$i, args:$a}'
+  else
+    echo "auto install: launchctl bootstrap failed (plist written: $plist)" >&2; return 1
+  fi
+}
+
+_auto_uninstall() {
+  local plist uid removed=false
+  plist="$(auto_plist)"; uid="$(id -u)"
+  launchctl bootout "gui/$uid/$AUTO_LABEL" >/dev/null 2>&1 && removed=true
+  [ -f "$plist" ] && rm -f "$plist" && removed=true
+  jq -cn --argjson r "$removed" '{uninstalled:$r}'
+}
+
+_auto_status() {
+  local plist uid loaded=false last=""
+  plist="$(auto_plist)"; uid="$(id -u)"
+  launchctl print "gui/$uid/$AUTO_LABEL" >/dev/null 2>&1 && loaded=true
+  [ -f "$AUTO_LOG" ] && last="$(tail -n 5 "$AUTO_LOG" | jq -sc '.' 2>/dev/null)"
+  jq -cn --argjson loaded "$loaded" --arg plist "$plist" --argjson exists "$([ -f "$plist" ] && echo true || echo false)" \
+    --argjson last "${last:-[]}" --arg log "$AUTO_LOG" \
+    '{loaded:$loaded, plistExists:$exists, plist:$plist, log:$log, recent:$last}'
+}
+
+cmd_auto() {
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    tick)      _auto_tick "$@"; exit $?;;
+    install)   _auto_install "$@"; exit $?;;
+    uninstall) _auto_uninstall; exit 0;;
+    status)    _auto_status; exit 0;;
+    *) echo "usage: swap-guard auto tick|install|uninstall|status" >&2; exit 1;;
+  esac
+}
+
 # cmd_artifacts — snapshot every claude.ai artifact this session (and its subagents /
 # workflows) published or touched, so a handoff can carry them across sessions and
 # accounts. Source of truth is the transcript's structured toolUseResult
@@ -455,6 +796,9 @@ main() {
     flag)          cmd_flag "$@";;
     status)        cmd_status "$@";;
     cancel)        cmd_cancel "$@";;
+    history)       cmd_history "$@";;
+    restore)       cmd_restore "$@";;
+    auto)          cmd_auto "$@";;
     artifacts)     cmd_artifacts "$@";;
     schedule-kill) cmd_schedule_kill "$@";;
     *) usage;;

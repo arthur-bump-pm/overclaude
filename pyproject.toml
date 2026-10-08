@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "overclaude"
-version = "1.1.0"
+version = "1.2.0"
 description = "Claude Code, overclocked — multi-account hot-swap, context-threshold handoff, instrumented statusline, and model routing for multi-agent workflows"
 readme = "README.md"
 license = { text = "MIT" }
@@ -45,6 +45,7 @@ packages = ["src/overclaude"]
 "vendor/claude-swap" = "overclaude/payload/vendor/claude-swap"
 "install.sh" = "overclaude/payload/install.sh"
 "uninstall.sh" = "overclaude/payload/uninstall.sh"
+"doctor.sh" = "overclaude/payload/doctor.sh"
 
 # hatchling's default sdist build respects VCS-ignore files and otherwise
 # only guarantees the `src/` package tree; it does NOT guarantee the payload
@@ -67,6 +68,7 @@ include = [
     "/vendor/claude-swap",
     "/install.sh",
     "/uninstall.sh",
+    "/doctor.sh",
     "/README.md",
     "/LICENSE",
     "/pyproject.toml",

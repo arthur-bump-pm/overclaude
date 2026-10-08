@@ -19,6 +19,15 @@ ctx [████░░░░░░] 42% | 5h [███████░░░] 7
 bars and percentages turn yellow at 50% · red at 80%
 ```
 
+## What's new in 1.2
+
+- **Busy-aware auto-swap (opt-in)** — `/swap auto on` installs a background agent that switches accounts *before* you hit a wall. It never flips credentials while a session is mid-task (proactive switches wait); at-limit switches go through, dead tokens are skipped, bad settings are refused at install, and a macOS notification tells you what happened.
+- **`overclaude doctor`** — one read-only command that checks dependencies, installed files, hooks, statusline, account tokens, sessions running stale hooks, and the auto-swap agent, with the exact fix for each problem. Also `/swap doctor`.
+- **Recover expired handoffs** — `/handoff history` lists past packages; `/handoff restore [n]` re-arms one (packages expire 10 minutes after you leave a session). A package it replaces is archived, never discarded.
+- **Handoffs never get truncated** — Claude Code caps hook output at 10,000 characters; oversized packages now inject section by section with a pointer to the full file, and the skill writes to a size budget.
+- **cswap 0.26** bundled (was 0.21), and `overclaude install` upgrades an older copy.
+- **Tests + CI** — a plain-bash suite (statusline, handoff budget, history/restore, auto-swap decisions, artifact snapshots) runs on macOS for every push, and releases only publish when it passes.
+
 ## What's new in 1.1
 
 - **Weekly reset on the statusline** — `↻ Thu Oct 9 23:59 (1d 6h)` next to the account, in local time.
@@ -43,7 +52,7 @@ cswap alias 2 personal
 exec zsh              # reload shell
 ```
 
-Start a **new** Claude Code session (hooks load at session start) and check the statusline shows `👤 work [1/2]`. Adding a second account is guided — run `/swap add` inside Claude Code.
+Start a **new** Claude Code session (hooks load at session start) and check the statusline shows `👤 work [1/2]`. Adding a second account is guided — run `/swap add` inside Claude Code. Anything look wrong? `overclaude doctor` checks the whole setup and prints the fix for each problem.
 
 <details>
 <summary>Other install methods, requirements, upgrading</summary>
@@ -116,6 +125,10 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/handoff` | Package this session and continue fresh, same account |
 | `/handoff status` | Context %, thresholds fired, pending package state |
 | `/handoff cancel` | Cancel a pending handoff |
+| `/handoff history` | List archived handoff packages for this folder |
+| `/handoff restore [n]` | Re-arm an archived package (default: newest), then Ctrl+D |
+| `/swap auto on\|off\|status` | Busy-aware background auto-swap (`threshold N`, `model Fable`) |
+| `/swap doctor` *(or `overclaude doctor`)* | Health check with fixes |
 | `swap-guard artifacts` *(shell)* | Snapshot this session's claude.ai artifacts (sources + manifest) |
 | `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |
 
@@ -127,6 +140,9 @@ Or skip memorizing and **paste a prompt**:
 | "Context is getting full — hand off to a fresh session" | `/handoff` |
 | "Swap to personal and hand off in one shot" | `/swap personal handoff` |
 | "What's my context and account usage right now?" | `/handoff status` + `/swap` dashboard |
+| "Switch accounts automatically before I hit my Fable limit" | `/swap auto on model Fable` |
+| "Something's off with my setup — check it" | `/swap doctor` |
+| "My handoff expired — bring it back" | `/handoff restore` |
 | "Install overclaude on this machine" | the whole install flow (works before the kit exists) |
 | "Upgrade overclaude and refresh the hooks" | `pipx upgrade overclaude && overclaude install` |
 
@@ -155,6 +171,7 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 - Legacy clients that don't report status (older VS Code extension builds) are judged busy/idle by transcript mtime during swap preflight.
 - claude.ai connectors (Gmail/Drive/…) are per-account server-side and don't follow a swap.
 - Context thresholds re-arm 10 points below a fired threshold; Claude Code's auto-compact stays as the backstop.
+- Auto-swap: a session that Claude Code paused at a usage limit doesn't resume by itself after a background switch (Claude Code only re-checks after `/model`, `/usage-credits`, or `/upgrade`) — send any message and it continues on the new account. Proactive switches wait while any session is busy, so a machine that is never idle only switches at the limit. The agent doesn't do cswap's "failover" for an account whose usage can't be read — that needs a long-running `cswap auto` loop.
 
 </details>
 
@@ -163,7 +180,7 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 
 | File | Installs to | Role |
 |---|---|---|
-| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state, artifact snapshots |
+| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state, handoff history/restore, artifact snapshots, busy-aware auto-swap |
 | `skills/swap/SKILL.md` | `~/.claude/skills/swap/` | The `/swap` skill |
 | `skills/handoff/SKILL.md` | `~/.claude/skills/handoff/` | The `/handoff` skill |
 | `hooks/handoff-inject.sh` | `~/.claude/hooks/` | SessionStart: auto-loads a pending handoff package (10-min TTL, per-directory) |
@@ -173,7 +190,9 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 | `claude/ULTRACODE.md` | `~/.claude/` + `CLAUDE.md` import | Model/effort routing policy |
 | `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | 3 hook groups, statusLine, 2 permission allows |
 | `shell/zshrc-snippet.sh` | `~/.zshrc` (markers) | `claude()` relaunch wrapper, `swap` alias, PATH guard |
-| `vendor/claude-swap/` | pipx/uv-installed if absent | The bundled credential engine |
+| `vendor/claude-swap/` | pipx/uv-installed if absent or older | The bundled credential engine (0.26.0) |
+| `doctor.sh` | run by `overclaude doctor` | Read-only health check |
+| `~/Library/LaunchAgents/com.overclaude.autoswap.plist` | only via `/swap auto on` | Runs `swap-guard auto tick` every 3 min (opt-in; removed by uninstall) |
 
 </details>
 
@@ -186,9 +205,22 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 ./sync.sh --dry-run  # preview either
 ```
 
+`bash tests/run.sh` runs the suite locally (throwaway `$HOME`, never touches your live setup); CI runs it plus shellcheck and a wheel-payload check on macOS for every push, and the PyPI publish job waits for it.
+
 A plain `git push` updates git installs only — **PyPI users get changes only via releases**. The scrub gate aborts any commit whose diff contains usernames, emails, or `/Users/…` paths. See `CLAUDE.md` for the full protocol.
 
 </details>
+
+## Roadmap
+
+Prioritized by value for effort; each item was feasibility-checked against the Claude Code docs and cswap source.
+
+1. **Instant swap on rate limit** — a `StopFailure` hook (`error: rate_limit`, which Claude Code also reports for "You've reached your Fable limit") runs the same busy-aware `swap-guard auto tick` the moment a turn dies, instead of waiting for the next 3-minute tick. Observe-only hook, so you still send one message to continue.
+2. **Handoff relaunch that starts by itself** — the shell wrapper relaunches with `claude -n "↪ <goal>" "Continue from the handoff"`, so the fresh session is titled and already working.
+3. **Notifications** — dead-token and weekly-reset alerts via macOS notifications (Terminal.app ignores the escape-code notifications hooks can emit).
+4. **Compaction awareness** — re-inject what compaction drops (artifact URLs, handoff state) via the `SessionStart` `compact` matcher; optionally offer a handoff before the first proactive auto-compact.
+5. **Per-directory accounts** — wire cswap's `map`/`run` into the wrapper so a folder always opens as one account without flipping other terminals. Needs every component to honor `CLAUDE_CONFIG_DIR`; upstream marks `run` experimental.
+6. **Claude Code plugin packaging** — skills and hooks via `/plugin install`; deferred because plugins can't set the main statusline or install the shell wrapper and cswap, so it would add a second install path.
 
 ## License
 

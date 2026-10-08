@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-from claude_swap import __version__
+from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
@@ -19,6 +19,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
+from claude_swap.settings import load_ui_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -130,6 +131,7 @@ Examples:
   cswap run user@example.com
   cswap run 2 --no-share
   cswap run 2 --share-history
+  cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
     )
@@ -162,6 +164,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--require-session",
+        action="store_true",
+        help=(
+            "Refuse to launch when the account is already the active default "
+            "login, instead of running plain claude on that login (which a "
+            "later switch could pull out from under the session)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -182,6 +193,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -193,6 +205,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                require_session=args.require_session,
             )
             return  # only reachable in tests
         if email is not None:
@@ -325,6 +338,158 @@ def _unmap_command(argv: list[str]) -> None:
             print(f"{accent('Unmapped')} {shown}")
         else:
             print(dimmed(f"No mapping for {shown}"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _unclaimed_command(argv: list[str]) -> None:
+    """Handle `cswap unclaimed [--purge ID]` — inspect or drop a stash row.
+
+    The stash holds credential bytes a switch or a consume gate could not
+    attribute to a slot. Rows normally clear themselves (the next gate pass
+    adopts or retires them), but two states need a human: a row whose bytes
+    are unreadable until a keychain is unlocked or a mode is fixed, and one
+    whose metadata was lost, which no pass can ever adopt. ``--json`` lists
+    only bare ids, so without this there is nothing to look at and nothing to
+    drop short of hand-editing the manifest.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} unclaimed",
+        description=(
+            "List stashed credential entries, or purge one by id. "
+            "Purging deletes the bytes — recovery is /login + `cswap add`."
+        ),
+    )
+    parser.add_argument(
+        "--purge",
+        metavar="ID",
+        help="Delete this entry's bytes and manifest row",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        entries = switcher.list_unclaimed_credentials()
+
+        if args.purge:
+            if args.purge not in entries:
+                error(f"Error: no unclaimed entry {args.purge}")
+                sys.exit(1)
+            switcher._store._remove_unclaimed_credential(args.purge)
+            print(f"{accent('Purged')} {args.purge}")
+            return
+
+        if not entries:
+            print(dimmed("No unclaimed credential entries"))
+            return
+        for entry_id, meta in sorted(entries.items()):
+            slot = meta.get("configSlot") or "?"
+            reason = meta.get("reason") or "orphaned (no manifest row)"
+            print(f"{entry_id}  slot {slot}  {reason}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _swap_command(argv: list[str]) -> None:
+    """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
+
+    Exchanges the two accounts' slot numbers (list order and numeric
+    targets). Pre-dispatched before the main parser for the same reason as
+    `alias` (the main parser's required mutually-exclusive group can't hold
+    a positional subcommand).
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} swap",
+        description=(
+            "Exchange two accounts' slot numbers, so they trade places in "
+            "`cswap list` and as numeric targets. Aliases, backups, and "
+            "session history move with their account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap swap 1 2
+  cswap swap dev user@example.com
+        """,
+    )
+    parser.add_argument("first", metavar="NUM|EMAIL|ALIAS", help="One account")
+    parser.add_argument("second", metavar="NUM|EMAIL|ALIAS", help="The other account")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        num_a, num_b = switcher.swap_accounts(args.first, args.second)
+        print(f"{accent('Swapped')} Account {num_a} and Account {num_b}:")
+        data = switcher._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        for num in sorted((num_a, num_b), key=int):
+            email = accounts.get(num, {}).get("email", "")
+            print(f"  {num}: {email}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _move_command(argv: list[str]) -> None:
+    """Handle `cswap move NUM|EMAIL|ALIAS SLOT`.
+
+    Assigns an account to a specific slot number. If the slot is empty the
+    account is relocated there (its old slot is freed); if it is occupied the
+    two accounts trade places. `swap a b` is exactly `move a <b's slot>`.
+    Pre-dispatched before the main parser for the same reason as `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} move",
+        description=(
+            "Assign an account to a slot number. An empty slot relocates the "
+            "account there and frees its old slot; an occupied slot swaps the "
+            "two. Aliases, backups, and session history move with the account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap move user@example.com 1   move an account onto shortcut 1
+  cswap move dev 1                by alias
+  cswap move 2 1                  by number (swaps if slot 1 is taken)
+        """,
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS", help="Account to move")
+    parser.add_argument("slot", metavar="SLOT", help="Destination slot number")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        num_src, num_target, swapped = switcher.move_account(args.account, args.slot)
+        data = switcher._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        if num_src == num_target:
+            email = accounts.get(num_target, {}).get("email", "")
+            print(f"{dimmed('Already in')} slot {num_target}: {email}")
+        elif swapped:
+            print(f"{accent('Swapped')} Account {num_src} and Account {num_target}:")
+            for num in sorted((num_src, num_target), key=int):
+                email = accounts.get(num, {}).get("email", "")
+                print(f"  {num}: {email}")
+        else:
+            email = accounts.get(num_target, {}).get("email", "")
+            print(f"{accent('Moved')} {email} to slot {num_target}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -495,6 +660,16 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Allow switching onto managed API-key accounts as a last resort "
             "(they bill per token; default: excluded)"
+        ),
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("best", "consume-first"),
+        default=None,
+        help=(
+            "Target selection: 'best' (most quota left; default) or "
+            "'consume-first' (proactively use the account whose weekly window "
+            "resets soonest)"
         ),
     )
     parser.add_argument(
@@ -740,11 +915,66 @@ def _use_native_tls() -> None:
         pass
 
 
+def _menubar_service(args) -> int:
+    """Handle ``menubar --install-service|--uninstall-service|--service-status``.
+
+    Split out of the dispatch chain because these three share one import and
+    one output shape, and because the menu bar branch below them is a
+    non-returning call — folding the service paths inline would leave the
+    reader tracing which branches fall through to launching the app.
+    """
+    from claude_swap import launch_agent
+
+    if args.install_service:
+        result = launch_agent.install()
+        print(f"Menu bar service installed ({result['label']}).")
+        print(f"  plist: {result['plist']}")
+        print(f"  logs:  {result['stderr_log']}")
+        print(
+            dimmed(
+                "It starts at login from now on. Re-run this after a cswap "
+                "upgrade to point launchd at the new build."
+            )
+        )
+        return 0
+
+    if args.uninstall_service:
+        result = launch_agent.uninstall()
+        if result["was_loaded"] or result["removed_plist"]:
+            print("Menu bar service removed.")
+        else:
+            print("Menu bar service was not installed.")
+        return 0
+
+    result = launch_agent.status()
+    if not result["installed"] and not result["loaded"]:
+        print("Menu bar service is not installed.")
+        print(dimmed("Install it with: cswap menubar --install-service"))
+        return 0
+    state = result["state"] or ("loaded" if result["loaded"] else "stopped")
+    pid = f" (pid {result['pid']})" if result["pid"] else ""
+    print(f"Menu bar service: {state}{pid}")
+    print(f"  plist: {result['plist']}")
+    if not result["installed"]:
+        print(dimmed("launchd still has it loaded, but the plist is gone."))
+    return 0
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
+    try:
+        from claude_swap.appearance import cli_should_probe, cli_theme
+        # `run` execs a child that takes over the terminal, and `--json`
+        # must stay machine-readable — never probe (and emit the OSC query)
+        # in either case.
+        probe = cli_should_probe(argv, colors_enabled=printer.colors_enabled())
+        name = cli_theme(load_ui_settings(paths.get_backup_root()).theme, colors=probe)
+        printer.set_theme(name)
+    except Exception:
+        pass  # theme is cosmetic; never block the CLI on it
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
@@ -762,8 +992,17 @@ def main() -> None:
     if argv and argv[0] == "unmap":
         _unmap_command(argv[1:])
         return
+    if argv and argv[0] == "unclaimed":
+        _unclaimed_command(argv[1:])
+        return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
+        return
+    if argv and argv[0] == "swap":
+        _swap_command(argv[1:])
+        return
+    if argv and argv[0] == "move":
+        _move_command(argv[1:])
         return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
@@ -801,13 +1040,17 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s swap <a> <b>               exchange two accounts' slot numbers
+  %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -817,6 +1060,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
+  %(prog)s list --token-status
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
@@ -842,7 +1086,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     parser.add_argument(
         "--token-status",
         action="store_true",
-        help="Show OAuth token expiry state (use with 'list')",
+        help="Show source-labelled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
         "--json",
@@ -910,6 +1154,27 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
+    )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "With 'menubar': install a launchd LaunchAgent so the menu bar "
+            "starts at login and restarts on crash (macOS)"
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="With 'menubar': stop the LaunchAgent and remove its plist (macOS)",
+    )
+    parser.add_argument(
+        "--service-status",
+        action="store_true",
+        help=(
+            "With 'menubar': report whether the LaunchAgent is installed "
+            "and running"
+        ),
     )
 
     # Legacy `--flag` interface. Still fully supported (bare subcommands rewrite
@@ -1069,6 +1334,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
+    if (
+        args.install_service or args.uninstall_service or args.service_status
+    ) and not args.menubar:
+        parser.error(
+            "--install-service, --uninstall-service and --service-status "
+            "can only be used with 'menubar'"
+        )
+
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.
     if args.upgrade:
@@ -1165,14 +1438,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")
                 sys.exit(1)
-            try:
-                from claude_swap.menubar import run as menubar_run
-            except ImportError:
-                error(
-                    "Menu bar mode requires 'rumps'. "
-                    "Install with: pip install 'claude-swap[menubar]'"
-                )
-                sys.exit(1)
+            if args.install_service or args.uninstall_service or args.service_status:
+                sys.exit(_menubar_service(args))
+            # menubar is import-safe without the extra; a missing rumps
+            # surfaces from run() as a ClaudeSwitchError with the install hint.
+            from claude_swap.menubar import run as menubar_run
+
             sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
