@@ -28,7 +28,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap` | dashboard (accounts, usage, token health, live-session table); never switches | — |
 | `/swap <target>` | hot-swap, session continues (default, ~90% of uses) | preflight |
 | `/swap <target> force` | hot-swap bypassing busy guard | health gate only |
-| `/swap <target> handoff [now] [force]` | preflight → switch → invoke the handoff skill (package + flag + exit instructions) | preflight |
+| `/swap <target> handoff [now] [force]` | delegate to `/handoff <target>`: preflight → package (+ artifact snapshot) → switch → flag + exit instructions | preflight |
 | `/swap <target> restart [now] [force]` | preflight → switch → flag `{mode:"restart", sessionId}` → exit → wrapper `--resume <id>` | preflight |
 | `/swap add` | guided registration of a new account | /logout blast-radius warning |
 | `/handoff ...` | same-account handoff, `status`, `cancel` — owned by the handoff skill, never duplicated here | — |
@@ -64,9 +64,8 @@ The blast-radius line is mandatory in every hot-swap confirmation.
 
 ## `/swap <target> handoff [now] [force]`
 
-1. Run the preflight recipe (`force` applies to its busy step).
-2. After a successful switch, INVOKE the handoff skill with no target, passing `now` through if present.
-3. Do not write the package, flag, or exit instructions yourself — that logic lives ONLY in the handoff skill.
+1. INVOKE the handoff skill WITH the target, passing `now`/`force` through (`/handoff <target> [now] [force]`). It runs preflight steps 1–2, packages (including the artifact snapshot, which must happen while still on the owning account), THEN switches.
+2. Do not run the preflight, switch, package, flag, or exit instructions yourself — that logic lives ONLY in the handoff skill.
 
 ## `/swap <target> restart [now] [force]`
 

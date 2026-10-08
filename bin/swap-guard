@@ -9,12 +9,16 @@
 #   flag <json>                     validate + fill + atomic-write relaunch flag; prints path (exit 1 on bad input)
 #   status                          own-session status JSON (always exit 0)
 #   cancel [--cwd <dir>]            remove pending handoff + flag for cwd (always exit 0)
+#   artifacts [--session <id>] [--cwd <dir>]
+#                                   collect this session's claude.ai artifacts: copy sources to
+#                                   $STATE_ROOT/handoff-artifacts/<sid>/ + manifest.json; prints manifest
 #   schedule-kill <pid>             v1 stub (exit 1)
 set -u
 
 STATE_ROOT="$HOME/.claude-swap-backup"
 CTX_DIR="$STATE_ROOT/ctx"
 ARCHIVE_DIR="$STATE_ROOT/handoff-archive"
+ARTIFACTS_DIR="$STATE_ROOT/handoff-artifacts"
 SESSIONS_DIR="$HOME/.claude/sessions"
 
 usage() {
@@ -27,6 +31,8 @@ usage: swap-guard <subcommand> [args]
   flag <json>                     write relaunch flag ({"mode":"handoff"|"restart",...}); prints path
   status                          own-session status JSON
   cancel [--cwd <dir>]            remove pending handoff + flag for cwd
+  artifacts [--session <id>] [--cwd <dir>]
+                                  snapshot this session's artifacts (sources + manifest) for handoff
   schedule-kill <pid>             phase-2 stub
 EOF
   exit 2
@@ -326,6 +332,113 @@ cmd_cancel() {
   exit 0
 }
 
+# cmd_artifacts — snapshot every claude.ai artifact this session (and its subagents /
+# workflows) published or touched, so a handoff can carry them across sessions and
+# accounts. Source of truth is the transcript's structured toolUseResult
+# ({url, artifact_id, title, path, ...}) — never the model's recollection. Sources
+# live in the session-scoped /tmp scratchpad, so they are COPIED to a durable dir.
+# Artifacts are owned server-side by the account that published them; the manifest
+# records the account active at collection time as `account`.
+cmd_artifacts() {
+  local sid="" cwd="" who flat tdir out_dir manifest tmp acct now
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) sid="${2:-}"; shift 2 || shift;;
+      --cwd)     cwd="${2:-}"; shift 2 || shift;;
+      *) shift;;
+    esac
+  done
+  if [ -z "$sid" ] || [ -z "$cwd" ]; then
+    who="$(whoami_json 2>/dev/null)" || who=""
+    [ -n "$sid" ] || sid="$(printf '%s' "$who" | jq -r '.sessionId // empty' 2>/dev/null)"
+    [ -n "$cwd" ] || cwd="$(printf '%s' "$who" | jq -r '.cwd // empty' 2>/dev/null)"
+  fi
+  [ -n "$cwd" ] || cwd="$PWD"
+  case "$sid" in ''|*/*|*..*) printf '%s\n' '{"error":"no-session-id"}'; exit 1;; esac
+  flat="$(printf '%s' "$cwd" | sed 's/[^A-Za-z0-9]/-/g')"
+  tdir="$HOME/.claude/projects/$flat"
+  [ -f "$tdir/$sid.jsonl" ] || { printf '{"error":"no-transcript","path":"%s"}\n' "$tdir/$sid.jsonl"; exit 1; }
+
+  out_dir="$ARTIFACTS_DIR/$sid"
+  mkdir -p "$out_dir" || exit 1
+  acct="$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null)"
+  now="$(date +%s)"
+
+  # One record per artifact_id (last touch wins). Join each result with its tool_use
+  # input to recover supporting `files` (map form: pub -> src | {from}).
+  tmp="$(mktemp)"
+  { printf '%s\n' "$tdir/$sid.jsonl"
+    [ -d "$tdir/$sid" ] && find "$tdir/$sid" -name '*.jsonl' -type f
+  } | while IFS= read -r f; do
+    jq -c '
+      if .type == "assistant" then
+        (.message.content[]? | select(.type == "tool_use" and .name == "Artifact")
+         | {k: "use", id, files: (.input.files // null), file_path: (.input.file_path // null)})
+      elif .type == "user" and (.toolUseResult | type) == "object"
+           and (.toolUseResult.artifact_id // .toolUseResult.url // null) != null then
+        {k: "res", id: (.message.content[0].tool_use_id // null), ts: (.timestamp // ""),
+         r: (.toolUseResult | {url, artifact_id, title, path, audience, capabilities})}
+      else empty end' "$f" 2>/dev/null
+  done > "$tmp"
+
+  jq -s '
+    (map(select(.k == "use")) | map({key: (.id // ""), value: .}) | from_entries) as $uses
+    | map(select(.k == "res" and (.r.url // "") != ""))
+    | sort_by(.ts)
+    | map(. as $x | $x.r + {ts: $x.ts,
+          path: ($x.r.path // $uses[$x.id // ""].file_path // null),
+          files: ($uses[$x.id // ""].files // null)})
+    | map(.artifact_id = (.artifact_id // (.url | sub(".*/artifact/"; ""))))
+    | group_by(.artifact_id)
+    | map(reduce .[] as $e ({}; . + ($e | with_entries(select(.value != null)))))
+    | sort_by(.ts)' "$tmp" > "$tmp.recs" 2>/dev/null || printf '[]' > "$tmp.recs"
+  rm -f "$tmp"
+
+  # Copy sources: page -> <id>/<basename>; supporting files -> <id>/<published path>.
+  local n i rec aid src dst saved files_saved pub fsrc
+  n="$(jq 'length' "$tmp.recs")"
+  printf '[]' > "$tmp.out"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    rec="$(jq -c ".[$i]" "$tmp.recs")"
+    aid="$(printf '%s' "$rec" | jq -r '.artifact_id' | tr -cd 'A-Za-z0-9_-')"
+    src="$(printf '%s' "$rec" | jq -r '.path // empty')"
+    saved="null"; files_saved="{}"
+    if [ -n "$aid" ] && [ -n "$src" ] && [ -f "$src" ]; then
+      mkdir -p "$out_dir/$aid"
+      dst="$out_dir/$aid/${src##*/}"
+      cp -p "$src" "$dst" 2>/dev/null && saved="$(jq -Rn --arg d "$dst" '$d')"
+      while IFS=$'\t' read -r pub fsrc; do
+        [ -n "$pub" ] && [ -n "$fsrc" ] || continue
+        case "$pub" in /*|*..*) continue;; esac
+        case "$fsrc" in /*) :;; *) fsrc="$cwd/$fsrc";; esac
+        [ -f "$fsrc" ] || continue
+        mkdir -p "$(dirname "$out_dir/$aid/$pub")" &&
+          cp -p "$fsrc" "$out_dir/$aid/$pub" 2>/dev/null &&
+          files_saved="$(printf '%s' "$files_saved" | jq -c --arg k "$pub" --arg v "$out_dir/$aid/$pub" '. + {($k): $v}')"
+      done < <(printf '%s' "$rec" | jq -r '
+        (.files // {}) | if type == "object" then to_entries[]
+          | [.key, (if (.value | type) == "string" then .value
+                    elif (.value | type) == "object" then (.value.from // empty)
+                    else empty end)] | @tsv else empty end' 2>/dev/null)
+    fi
+    jq --argjson r "$rec" --argjson s "$saved" --argjson fs "$files_saved" \
+      '. + [$r + {saved: $s, savedFiles: $fs} | del(.files)]' "$tmp.out" > "$tmp.out2" && mv "$tmp.out2" "$tmp.out"
+    i=$((i + 1))
+  done
+
+  manifest="$out_dir/manifest.json"
+  jq -n --arg sid "$sid" --arg cwd "$cwd" --arg acct "$acct" --argjson now "$now" \
+     --slurpfile a "$tmp.out" \
+     '{sessionId: $sid, cwd: $cwd, account: $acct, collected: $now, artifacts: $a[0]}' > "$manifest.tmp" &&
+    mv "$manifest.tmp" "$manifest"
+  rm -f "$tmp.recs" "$tmp.out"
+  # Keep the store bounded: drop snapshots untouched for 30+ days.
+  find "$ARTIFACTS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null
+  jq -c --arg m "$manifest" '. + {manifest: $m}' "$manifest"
+  exit 0
+}
+
 cmd_schedule_kill() {
   echo "phase-2 feature not enabled" >&2
   exit 1
@@ -342,6 +455,7 @@ main() {
     flag)          cmd_flag "$@";;
     status)        cmd_status "$@";;
     cancel)        cmd_cancel "$@";;
+    artifacts)     cmd_artifacts "$@";;
     schedule-kill) cmd_schedule_kill "$@";;
     *) usage;;
   esac

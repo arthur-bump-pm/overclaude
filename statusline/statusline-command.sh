@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Claude Code status line - two-line layout
 #
-# Line 1: model (effort) | dir (branch*) | N sessions | account
+# Line 1: model (effort) | dir (branch*) | N sessions | account ↻ weekly reset
 # Line 2: ctx bar | 5h bar | week bar | Fable bar  (10-char bars, one line)
+# Line 3+: one compact line per OTHER cswap account (limits + weekly reset)
 #
-# Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2]
+# Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
 # ctx [████░░░░░░] 42% | 5h [███████░░░] 71% | week [██░░░░░░░░] 18% | Fable [███████░░░] 73%
+# ↳ personal [2] 5h 10% · week 85% · Fable 100% ↻ Thu Oct 9 17:59 (1d 1h)
 
 input=$(cat)
 
@@ -69,6 +71,7 @@ five_hour=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // emp
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
 fable_pct=""
 usage_age=""
+week_reset_epoch=""
 fable_seq="${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}"
 fable_cache="${SWAP_USAGE_JSON:-$HOME/.claude-swap-backup/cache/usage.json}"
 if command -v jq >/dev/null 2>&1 && [ -r "$fable_seq" ] && [ -r "$fable_cache" ]; then
@@ -78,11 +81,17 @@ if command -v jq >/dev/null 2>&1 && [ -r "$fable_seq" ] && [ -r "$fable_cache" ]
       .accounts[$n].lastGood as $g
       | [(($g.five_hour.pct // "") | tostring),
          (($g.seven_day.pct // "") | tostring),
-         ((first($g.scoped[]? | select(.name == "Fable") | .pct) // "") | tostring)]
+         ((first($g.scoped[]? | select(.name == "Fable") | .pct) // "") | tostring),
+         (($g.seven_day.resets_at // "")
+            | if type == "string" and test("(Z|\\+00:00)$")
+              then (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z")
+                    | try (fromdateiso8601 | floor | tostring) catch "")
+              else "" end)]
       | join("\t")' "$fable_cache" 2>/dev/null) || cache_vals=""
     c5=$(printf '%s' "$cache_vals" | cut -f1)
     c7=$(printf '%s' "$cache_vals" | cut -f2)
     cf=$(printf '%s' "$cache_vals" | cut -f3)
+    week_reset_epoch=$(printf '%s' "$cache_vals" | cut -f4)
     # Cache wins when it has a value: per-account-correct beats per-response-stale.
     case "$c5" in ''|null) : ;; *) five_hour="$c5" ;; esac
     case "$c7" in ''|null) : ;; *) seven_day="$c7" ;; esac
@@ -90,6 +99,11 @@ if command -v jq >/dev/null 2>&1 && [ -r "$fable_seq" ] && [ -r "$fable_cache" ]
     cache_mtime=$(stat -f %m "$fable_cache" 2>/dev/null)
     case "$cache_mtime" in ''|*[!0-9]*) : ;; *) usage_age=$(( $(date +%s) - cache_mtime )) ;; esac
   fi
+fi
+
+# Weekly reset fallback: stdin's rate_limits.seven_day.resets_at (epoch seconds).
+if [ -z "$week_reset_epoch" ]; then
+  week_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty | if type == "number" then floor | tostring else empty end' 2>/dev/null) || week_reset_epoch=""
 fi
 
 # --- Debounced async usage refresh ---
@@ -219,6 +233,109 @@ swap_account_segment() {
 }
 # --- end cswap account segment ---
 
+# --- Weekly reset segment: "↻ Thu Oct 9 23:59 (1d 6h)" in local time ---
+# Appended to the account segment. A reset time already in the past means the
+# cached numbers predate the reset (refresh pending / token dead): dim marker.
+week_reset_segment() {
+  local e="$week_reset_epoch" now left d h m when
+  case "$e" in ''|*[!0-9]*) return 0 ;; esac
+  now=$(date +%s)
+  left=$(( e - now ))
+  if [ "$left" -le 0 ]; then
+    printf '%s↻ week reset — refreshing%s' "$DIM" "$RESET"
+    return 0
+  fi
+  when=$(date -r "$e" '+%a %b %-d %H:%M' 2>/dev/null) || return 0
+  d=$(( left / 86400 )); h=$(( left % 86400 / 3600 )); m=$(( left % 3600 / 60 ))
+  if [ "$d" -gt 0 ]; then left="${d}d ${h}h"
+  elif [ "$h" -gt 0 ]; then left="${h}h ${m}m"
+  else left="${m}m"; fi
+  printf '↻ %s %s(%s)%s' "$when" "$DIM" "$left" "$RESET"
+}
+
+# --- Line 3: the OTHER accounts' limits (one line each; omitted with 1 account) ---
+# "↳ personal [1] 5h 10% · week 85% · Fable 100% ↻ Thu Oct 9 17:59 (1d 1h)"
+# Same cswap cache as the meters. An inactive account consumes nothing, so a
+# window whose reset time has passed is genuinely back at 0% — shown as such.
+# Dead token (cswap lastError invalid_grant / auth strikes) -> "⚠ relogin".
+# Cached numbers older than 15 min get a dim "(Nm old)".
+# fmt_pct <pct> -> colored integer percentage (same thresholds as the bars)
+fmt_pct() {
+  local v
+  v=$(awk -v p="$1" 'BEGIN { v = int(p + 0.5); if (v < 0) v = 0; if (v > 100) v = 100; print v }')
+  if [ "$v" -ge 80 ]; then printf '%s%d%%%s' "$RED" "$v" "$RESET"
+  elif [ "$v" -ge 50 ]; then printf '%s%d%%%s' "$YELLOW" "$v" "$RESET"
+  else printf '%s%d%%%s' "$GREEN" "$v" "$RESET"; fi
+}
+# fmt_left <seconds> -> "1d 6h" / "3h 12m" / "8m"
+fmt_left() {
+  local l="$1" d h m
+  d=$(( l / 86400 )); h=$(( l % 86400 / 3600 )); m=$(( l % 3600 / 60 ))
+  if [ "$d" -gt 0 ]; then printf '%dd %dh' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf '%dh %dm' "$h" "$m"
+  else printf '%dm' "$m"; fi
+}
+other_accounts_lines() {
+  local seq_json="${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}"
+  local cache="${SWAP_USAGE_JSON:-$HOME/.claude-swap-backup/cache/usage.json}"
+  local now rows label slot p5 r5 p7 r7 pf rf dead fetched seg part out=""
+  command -v jq >/dev/null 2>&1 && [ -r "$seq_json" ] || return 0
+  [ -r "$cache" ] || cache=/dev/null
+  now=$(date +%s)
+  rows=$(jq -r -n --slurpfile s "$seq_json" --slurpfile c "$cache" '
+    def ep: if type == "string" and test("(Z|\\+00:00)$")
+            then (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z")
+                  | try (fromdateiso8601 | floor | tostring) catch "")
+            else "" end;
+    def s: if . == null then "" else tostring end;
+    ($s[0] // {}) as $seq | (($c[0] // {}).accounts // {}) as $acc
+    | (($seq.activeAccountNumber // "") | tostring) as $active
+    | ($seq.sequence // ($seq.accounts // {} | keys | map(tonumber? // .)))[]
+    | tostring as $n
+    | select($n != $active)
+    | ($seq.accounts[$n] // {}) as $a | ($acc[$n] // {}) as $u | ($u.lastGood // {}) as $g
+    | (first($g.scoped[]? | select(.name == "Fable")) // {}) as $f
+    | [ (($a.alias // "") | s | if . == "" then (($a.email // "?") | split("@")[0]) else . end),
+        $n,
+        ($g.five_hour.pct | s), ($g.five_hour.resets_at | ep),
+        ($g.seven_day.pct | s), ($g.seven_day.resets_at | ep),
+        ($f.pct | s), ($f.resets_at | ep),
+        (if ($u.lastError // "") == "invalid_grant" or (($u.authDeadStrikes // 0) > 0) then "1" else "" end),
+        ($u.fetchedAt // "" | s | sub("\\..*"; "")) ]
+    | join("\u001f")' 2>/dev/null) || return 0
+  [ -n "$rows" ] || return 0
+  # \x1f, not tab: read collapses consecutive whitespace delimiters (empty fields).
+  while IFS=$'\x1f' read -r label slot p5 r5 p7 r7 pf rf dead fetched; do
+    [ -n "$slot" ] || continue
+    seg="↳ ${BOLD}${label}${RESET} [${slot}]"
+    # window <name> <pct> <reset-epoch>: passed reset -> 0% (inactive = unused)
+    for part in "5h|$p5|$r5" "week|$p7|$r7" "Fable|$pf|$rf"; do
+      local nm="${part%%|*}" rest="${part#*|}" pc re
+      pc="${rest%%|*}"; re="${rest#*|}"
+      case "$re" in ''|*[!0-9]*) : ;; *) [ "$re" -le "$now" ] && pc=0 ;; esac
+      if [ -z "$pc" ] || [ "$pc" = "null" ]; then
+        seg="$seg ${DIM}${nm} n/a${RESET}"
+      else
+        seg="$seg ${nm} $(fmt_pct "$pc")"
+      fi
+      [ "$nm" = "Fable" ] || seg="$seg ·"
+    done
+    case "$r7" in
+      ''|*[!0-9]*) : ;;
+      *) if [ "$r7" -gt "$now" ]; then
+           seg="$seg ↻ $(date -r "$r7" '+%a %b %-d %H:%M') ${DIM}($(fmt_left $(( r7 - now ))))${RESET}"
+         fi ;;
+    esac
+    [ -n "$dead" ] && seg="$seg ${RED}⚠ relogin${RESET}"
+    case "$fetched" in
+      ''|*[!0-9]*) [ -z "$p7$p5" ] && seg="$seg ${DIM}(no usage data)${RESET}" ;;
+      *) [ $(( now - fetched )) -gt 900 ] && seg="$seg ${DIM}($(fmt_left $(( now - fetched ))) old)${RESET}" ;;
+    esac
+    out="${out}${seg}"$'\n'
+  done <<< "$rows"
+  printf '%s' "$out"
+}
+
 # --- Line 1: model (effort) | dir (branch*) | N sessions | account ---
 
 model_seg="$model_name"
@@ -272,6 +389,8 @@ line1="${BOLD}${model_seg}${RESET} | ${BOLD}${segment_dir}${RESET} | ${BOLD}${se
 account_seg=$(swap_account_segment 2>/dev/null) || account_seg=""
 if [ -n "$account_seg" ]; then
   line1="$line1 | ${BOLD}${account_seg}${RESET}"
+  reset_seg=$(week_reset_segment 2>/dev/null) || reset_seg=""
+  [ -n "$reset_seg" ] && line1="$line1 ${reset_seg}"
 fi
 
 # --- Line 2: usage bars, all on one line ---
@@ -285,3 +404,8 @@ fi
 
 printf "%s\n" "$line1"
 printf "%s\n" "$line2"
+# SWAP_HIDE_OTHERS=1 hides the other-accounts line(s).
+if [ -z "${SWAP_HIDE_OTHERS:-}" ]; then
+  others=$(other_accounts_lines 2>/dev/null) || others=""
+  [ -n "$others" ] && printf "%s\n" "$others"
+fi

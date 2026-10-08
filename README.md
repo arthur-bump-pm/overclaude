@@ -7,13 +7,24 @@
 **Claude Code, overclocked.** Hot-swap between Claude accounts without leaving your session, hand off to a fresh session before context fills up, and watch every usage meter live:
 
 ```text
-Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2]
-└ model+effort   └ folder+branch*      └ live count └ account [slot/total]
+Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
+└ model+effort   └ folder+branch*      └ live count └ account     └ when its weekly limit resets
 
 ctx [████░░░░░░] 42% | 5h [███████░░░] 71% | week [██░░░░░░░░] 18% | Fable [███████░░░] 73%
 └ context window       └ 5-hour limit         └ weekly limit           └ model-scoped bucket
-                       bars turn yellow at 50% · red at 80%
+
+↳ personal [2] 5h 10% · week 85% · Fable 100% ↻ Thu Oct 9 17:59 (1d 1h)
+└ every OTHER account: its limits + weekly reset, so you know where to swap next
+
+bars and percentages turn yellow at 50% · red at 80%
 ```
+
+## What's new in 1.1
+
+- **Weekly reset on the statusline** — `↻ Thu Oct 9 23:59 (1d 6h)` next to the account, in local time.
+- **See every account's limits** — one compact line per other account (5h / week / Fable + reset), with `⚠ relogin` when a token has died.
+- **Artifacts survive a handoff** — claude.ai artifacts the session made are snapshotted (sources + URLs + owner) before an account switch and handed to the next session, which keeps editing them or re-homes them on the new account.
+- **Handoff packages before it switches** — so nothing that needs the old account (artifacts, artifact data) is lost to the credential flip.
 
 ## Install
 
@@ -73,7 +84,7 @@ Every live Claude Code session on the machine adopts the new account's credentia
 flowchart LR
     A[Context fills up] --> B[Hook offers handoff at 60/75/85%]
     B --> C[You accept]
-    C --> D[Claude packages goals, state, next steps]
+    C --> D[Claude packages goals, state, next steps, artifacts]
     D --> E[Session exits, shell wrapper relaunches]
     E --> F[SessionStart hook auto-injects the package]
     F --> G[Fresh session, ctx near zero]
@@ -82,8 +93,12 @@ flowchart LR
 
 You lose the token bloat, not the thread. Works same-account (`/handoff`) or combined with a switch (`/swap work handoff`).
 
+**Artifacts travel too.** Before switching accounts, handoff runs `swap-guard artifacts`: it reads the session transcript (subagents and workflows included), finds every claude.ai artifact the session published or touched, copies each source out of the session's temporary scratchpad into `~/.claude-swap-backup/handoff-artifacts/<session>/`, and lists them in the package with their URLs and owner account. Artifacts belong server-side to the account that published them, so the next session updates them in place on the same account, and on a different account republishes from the saved source as a new artifact (or updates in place if you shared the original with edit access). Artifact database rows can be exported before the switch on request.
+
 ### Statusline
-The two-line display above — and the kit's data spine: it publishes each session's context % to a relay the threshold hooks read. **Skip the kit's statusline and handoff offers never fire.**
+The display at the top. Line 1 ends with the active account and when its **weekly limit resets** (local time + countdown). Line 2 is the live meters. Below that, each **other account** gets a compact line with its 5h / week / Fable usage and weekly reset, so you can see where to swap before you hit a wall — `⚠ relogin` flags a dead token, a dim `(2h old)` flags stale numbers, and `SWAP_HIDE_OTHERS=1` hides these lines.
+
+Usage numbers come from cswap's per-account cache, kept ≤ ~5 min fresh by a debounced background refresh (the render itself never waits on the network). It is also the kit's data spine: it publishes each session's context % to a relay the threshold hooks read. **Skip the kit's statusline and handoff offers never fire.**
 
 ### `ULTRACODE.md` — model routing for multi-agent workflows
 A policy loaded into every session: bulk work rides cheap models, verification rides opus, only final judgment spends the top tier. Routing table, hard floors, escalation rules included.
@@ -95,12 +110,13 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap` | Dashboard: accounts, usage, token health, live sessions |
 | `/swap <target>` | Hot-swap all sessions to `<target>` (alias, slot, or email) |
 | `/swap <target> force` | Same, bypassing the busy-session guard |
-| `/swap <target> handoff` | Switch account + package this session + resume fresh |
+| `/swap <target> handoff` | Package this session (+ its artifacts), switch account, resume fresh |
 | `/swap <target> restart` | Switch + restart this session in place (auth edge cases) |
 | `/swap add` | Guided registration of a new account |
 | `/handoff` | Package this session and continue fresh, same account |
 | `/handoff status` | Context %, thresholds fired, pending package state |
 | `/handoff cancel` | Cancel a pending handoff |
+| `swap-guard artifacts` *(shell)* | Snapshot this session's claude.ai artifacts (sources + manifest) |
 | `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |
 
 Or skip memorizing and **paste a prompt**:
@@ -133,7 +149,9 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 
 - A swap flips **all** live Claude Code sessions on the machine — it's the shared keychain credential, not per-terminal.
 - Hooks load at session start; sessions already open at install time won't offer handoffs until restarted (hot-swap works everywhere immediately).
-- The Fable/scoped meter reads cswap's cache — it refreshes whenever cswap runs and can lag between invocations. The 5h/week meters describe whichever account served the last response, so they lag ~1 turn after a swap; the 👤 segment is always current.
+- Usage meters read cswap's cache for the active account (correct the moment a swap lands) and are refreshed in the background every ~5 min while any statusline renders; past 10 min a dim `(usage Nm old)` marker appears. The ctx meter is real-time.
+- An inactive account whose reset time has passed is shown at 0% — nothing on this machine has used it since. Usage from elsewhere (claude.ai web, another machine) appears on the next refresh.
+- claude.ai artifacts are owned by the account that published them. After a cross-account handoff the old URLs stay viewable from the owner account but aren't editable from the new one — the next session re-homes them from the saved source (new URL), unless you share the original with edit access.
 - Legacy clients that don't report status (older VS Code extension builds) are judged busy/idle by transcript mtime during swap preflight.
 - claude.ai connectors (Gmail/Drive/…) are per-account server-side and don't follow a swap.
 - Context thresholds re-arm 10 points below a fired threshold; Claude Code's auto-compact stays as the backstop.
@@ -145,7 +163,7 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 
 | File | Installs to | Role |
 |---|---|---|
-| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state |
+| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state, artifact snapshots |
 | `skills/swap/SKILL.md` | `~/.claude/skills/swap/` | The `/swap` skill |
 | `skills/handoff/SKILL.md` | `~/.claude/skills/handoff/` | The `/handoff` skill |
 | `hooks/handoff-inject.sh` | `~/.claude/hooks/` | SessionStart: auto-loads a pending handoff package (10-min TTL, per-directory) |

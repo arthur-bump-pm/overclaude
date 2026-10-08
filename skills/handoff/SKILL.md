@@ -31,9 +31,9 @@ Run `swap-guard status`; render: context pct (null → "no relay yet"), threshol
 
 Run `swap-guard cancel`; report exactly what it says was removed (pending package and/or flag for this cwd).
 
-## Switching first (`/handoff <target> [now] [force]`)
+## Switching (`/handoff <target> [now] [force]`)
 
-Run this recipe, then continue to Package:
+Run recipe steps 1–2 NOW (the verdict gate). Run step 3 (the actual `cswap switch`) only AFTER Package step 3 — the artifact snapshot and any db export must happen while this session is still on the account that owns those artifacts; the switch flips this session's credentials within ~30s.
 
 <!-- SHARED:PREFLIGHT-RECIPE BEGIN -->
 1. Run `swap-guard preflight <target>` and read `.verdict` from its JSON output.
@@ -45,6 +45,7 @@ Run this recipe, then continue to Package:
 
 1. Facts: `swap-guard whoami` → `.pid`, `.sessionId`, `.cwd`, `.entrypoint` (on error, use `$PWD` as cwd). `swap-guard path handoff` → target path P. `date +%s` → created.
 2. Overwrite guard: `swap-guard status` → if `.pendingHandoff` is non-null and `.pendingAgeSec` < 600, warn: "another handoff pending for this cwd (<N> min ago) — proceeding replaces it" and STOP until the user confirms.
+2b. Artifacts: run `swap-guard artifacts`. It reads this session's transcript (plus subagent/workflow transcripts), copies every published/touched artifact's source into `~/.claude-swap-backup/handoff-artifacts/<sessionId>/<artifact_id>/` (the scratchpad is session-scoped /tmp and dies with the session), and prints a manifest (`.account` = owner at collection time, `.artifacts[]` with `url`, `title`, `saved`, `savedFiles`, `capabilities`). `saved: null` → source already gone; say so in the package. If switching to a DIFFERENT account and an artifact has a `db` capability, ask the user whether to export its rows first; if yes, read them with ArtifactData now and write them as JSON next to `saved` (the new account cannot read them later).
 3. Write the package to P with the Write tool. Line 1 of the file MUST be exactly this comment — first line, no blank line before it, `cwd` = the absolute cwd from step 1, `created` = the epoch integer from step 1:
 
 ```markdown
@@ -58,11 +59,13 @@ Run this recipe, then continue to Package:
 ## Work in flight
 ## Next steps
 ## Gotchas
+## Artifacts
 ## Session chain
 ```
 
-Fill every section from this conversation — concise and decision-dense; a summary, not a transcript. Files touched: absolute paths. Work in flight: anything half-done, with exact resume points. Session chain rules: if this session itself began with "## Handoff from previous session (loaded by handoff-inject)", copy that package's Session chain entries first; append one line for THIS session: `<sessionId> — <transcript path if known, else "unknown"> — <YYYY-MM-DD>`; keep only the last 3 entries.
+Fill every section from this conversation — concise and decision-dense; a summary, not a transcript. Files touched: absolute paths. Artifacts (omit the section if the manifest is empty; with many, list the ones still in play individually and point to the manifest for the rest): first line `Manifest: <manifest path> — owner: <.account>`, then one line per artifact `- <title> — <url> — source: <saved or "lost"> [— db rows: <export path>]`, then this rule verbatim: "Next session: check `jq -r .oauthAccount.emailAddress ~/.claude.json`. Same as owner → update in place (Artifact read, then publish with `url`). Different → those URLs are not editable from this account (still viewable by the owner account); when work next touches one, republish from the saved source as a NEW artifact (re-import exported db rows with ArtifactData) and give the user the new link — or, if the user has shared it to this account with edit access, update in place." Work in flight: anything half-done, with exact resume points. Session chain rules: if this session itself began with "## Handoff from previous session (loaded by handoff-inject)", copy that package's Session chain entries first; append one line for THIS session: `<sessionId> — <transcript path if known, else "unknown"> — <YYYY-MM-DD>`; keep only the last 3 entries.
 
+3b. If a target was given: run recipe step 3 now (`cswap switch <target> --json`, report `.reason` + `.warnings[]`).
 4. Flag: run `swap-guard flag '{"mode":"handoff"}'` (it fills cwd and created). Skip this step in VS Code (below).
 5. Tell the user: "Press Ctrl+D — the wrapper opens a fresh session with the handoff preloaded." Injection requires the same directory and happens only within 10 minutes; after that the package is archived as expired.
 6. `now` token: run `swap-guard schedule-kill <pid>` (pid from step 1). If it errors (v1 stub), say phase-2 is not enabled and fall back to the Ctrl+D instruction in step 5.

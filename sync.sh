@@ -151,6 +151,11 @@ case "$CUR" in
   *) echo "release: could not parse version from pyproject.toml (got: '$CUR')" >&2; exit 1 ;;
 esac
 NEW=$(printf '%s' "$CUR" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')
+# Manual minor/major bump (version already ahead of the last tag): release it as-is.
+if [ -n "$LAST_TAG" ] && [ "$CUR" != "${LAST_TAG#v}" ] \
+   && [ "$(printf '%s\n%s\n' "${LAST_TAG#v}" "$CUR" | sort -V | tail -1)" = "$CUR" ]; then
+  NEW="$CUR"
+fi
 
 # Release notes: the commits since the last tag (before the bump commit).
 if [ -n "$LAST_TAG" ]; then
