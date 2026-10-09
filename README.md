@@ -19,6 +19,19 @@ ctx [████░░░░░░] 42% | 5h [███████░░░] 7
 bars and percentages turn yellow at 50% · red at 80%
 ```
 
+## Versions
+
+| Version | Status | Highlights |
+|---|---|---|
+| **1.4** | 🚧 in progress | Codex as a fallback and a reviewer (`/handoff codex`, Codex limits on the statusline, `swap-guard codex-review`), model-routing guard for subagents, spend report with API-price value of your usage, overcodex fixes; QA audit before release |
+| **1.3.1** | ✅ released 2026-10-09 | QA fixes for 1.3: `/swap` from plain requests (behind a consent gate), artifact links, terminal y/N during re-login, accurate token status in doctor |
+| 1.3.0 | released 2026-10-09 | Instant swap on usage caps, safe re-login, usage notes for the model, artifact registry, `overclaude update`, `doctor --fix`, release gate |
+| 1.2.0 | released 2026-10-09 | Busy-aware auto-swap, `overclaude doctor`, handoff history/restore, handoff size budget, tests + CI |
+| 1.1.0 | released 2026-10-08 | Weekly reset + other accounts on the statusline, artifacts carried through handoffs |
+| 1.0.x | released 2026-07-17/18 | First release: `/swap`, `/handoff`, statusline, ULTRACODE routing, PyPI package |
+
+Install or upgrade: `pipx install overclaude && overclaude install` (upgrade: `overclaude update`, or `pipx upgrade overclaude && overclaude install` from versions before 1.3).
+
 ## What's new in 1.3.1
 
 QA fixes for 1.3, found by an audit of the released package:
