@@ -19,8 +19,9 @@ cat > "$S" <<'EOF'
 EOF
 ORIG="$(jq -S . "$S")"
 
-bash "$REPO/install.sh" >/dev/null 2>&1
+bash "$REPO/install.sh" > "$HOME/i1.log" 2>&1
 assert_eq "$?" "0" "install exits 0"
+assert_contains "$(cat "$HOME/i1.log")" "Instant swap is ON" "the installer says when it turns instant swap on"
 for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "UserPromptSubmit:swap-guard budget --hook" \
             "Stop:ctx-notify.sh" "StopFailure:swap-guard ratelimit" "PostToolUse:swap-guard artifact-log"; do
   ev="${pair%%:*}"; hk="${pair#*:}"
@@ -33,7 +34,8 @@ assert_eq "$(jq -r '.model' "$S")" "opus" "unrelated settings survive"
 assert_eq "$([ -x "$HOME/.local/bin/swap-guard" ] && echo yes)" "yes" "swap-guard installed"
 
 AFTER1="$(jq -S . "$S")"
-bash "$REPO/install.sh" >/dev/null 2>&1
+bash "$REPO/install.sh" > "$HOME/i2.log" 2>&1
+assert_absent "$(cat "$HOME/i2.log")" "Instant swap is ON" "and only the first time"
 assert_eq "$(jq -S . "$S")" "$AFTER1" "a second install changes nothing"
 
 bash "$REPO/uninstall.sh" >/dev/null 2>&1

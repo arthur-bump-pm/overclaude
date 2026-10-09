@@ -2,7 +2,7 @@
 name: handoff
 description: "Context-threshold session handoff: package this session and continue in a fresh one, optionally switching accounts first. The model may invoke this skill ONLY after explicit user consent in the conversation."
 argument-hint: "[account] [now|force] | status | cancel | history | restore [n] [force]"
-allowed-tools: Write, Bash(swap-guard *), Bash(cswap *)
+allowed-tools: Write, Bash(swap-guard *), Bash(cswap *), Bash(date +%s), Bash(wc -c *)
 ---
 
 GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff or /swap ... handoff themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, STOP — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
@@ -37,7 +37,7 @@ Run `swap-guard history` (add `--all` if the user asks for every directory). Ren
 
 ## `/handoff restore [n] [force]`
 
-Recovers a package that expired (10-min TTL) or was injected into a session the user abandoned. Run `swap-guard restore [n]` (default n=1 = newest for this cwd; append `--force` only if the user gave `force`). Numbers refer to the THIS-directory listing; if the user picked from a `history --all` listing, restore by that entry's `.path` instead. Any pending package being replaced is moved to the archive first (`.replacedArchivedTo`) — mention it. On success it re-arms the package as this cwd's pending handoff with a fresh timestamp — then do Package steps 4–5 (flag + Ctrl+D instruction; VS Code: no flag, reload the window). On `.error`: `pending-exists` → say a live package is pending and offer `/handoff restore <n> force`; `cwd-mismatch` → tell the user to `cd` to `.packageCwd` first; `not-found` → show `/handoff history`.
+Recovers a package that expired (10-min TTL) or was injected into a session the user abandoned. Run `swap-guard restore [n]` (default n=1 = newest for this cwd; append `--force` only if the user gave `force`). Numbers refer to the THIS-directory listing; if the user picked from a `history --all` listing, restore by that entry's `.path` instead. Any pending package being replaced is moved to the archive first (`.replacedArchivedTo`) — mention it. On success it re-arms the package as this cwd's pending handoff with a fresh timestamp — then do Package steps 4–5 (flag + Ctrl+D instruction; VS Code: no flag, reload the window). On `.error`: `pending-exists` → say a live package is pending and offer `/handoff restore <n> force`; `cwd-mismatch` → tell the user to `cd` to `.packageCwd` first; `not-found` → show `/handoff history`; `malformed-header` → that archive's first line is damaged, so the injector would never load it — pick another entry or open the file and copy what is needed by hand.
 
 ## Switching (`/handoff <target> [now] [force]`)
 

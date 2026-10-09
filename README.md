@@ -19,6 +19,15 @@ ctx [████░░░░░░] 42% | 5h [███████░░░] 7
 bars and percentages turn yellow at 50% · red at 80%
 ```
 
+## What's new in 1.3.1
+
+QA fixes for 1.3, found by an audit of the released package:
+- `/swap` can now be started by plain requests ("my work account says relogin — fix it"): the skill is model-invocable behind the same explicit-consent gate as `/handoff`, so the paste-a-prompt rows below actually run the safe flows.
+- `swap-guard artifacts link <old-url> <new-url>` now connects republished copies (tool responses carry UUID ids while URLs end in a short code; both are matched, and `find` shows the linked URL).
+- A cswap y/N confirmation during `/swap relogin` or `/swap add` (an organization change) now reaches you when you run `swap-guard login` in a terminal; `/swap add` reports the slot it registered.
+- An expired-but-refreshing token (`token_expired`) is no longer reported as dead; accounts without an alias show their real status in `doctor`.
+- The installer says when it turns instant swap on, and the update badge suggests `git pull && ./install.sh` for git-checkout installs.
+
 ## What's new in 1.3
 
 - **Instant swap on a usage cap** — the moment "You've reached your Fable limit" stops a session, a hook switches to the account with the most room on that limit and wakes the session to carry on. Sessions that hit the cap together share one swap; a short-lived 429 slowdown never swaps; dead, disabled and API-key accounts are never targets. On by default (`/swap auto instant off` to disable), independent of the opt-in background auto-swap.
@@ -27,7 +36,7 @@ bars and percentages turn yellow at 50% · red at 80%
 - **One list of every artifact** — every publish is recorded with the account that owns it and a durable copy of its source. `/swap artifacts villa` finds it from any account; `swap-guard artifacts index` backfills artifacts published before 1.3 (owner inferred from cswap's switch history).
 - **Same link across accounts** — handoffs now say which account owns each artifact and suggest sharing it to the next account with edit access, so the new session updates it in place instead of republishing a copy at a new URL.
 - **`overclaude update`** — upgrades however you installed it (pipx, uv or pip) and reinstalls the kit. The statusline shows `⬆ overclaude X available` when a release is out (checked in the background once a day; `OVERCLAUDE_NO_UPDATE_CHECK=1` hides it).
-- **`overclaude doctor --fix`** (or `/swap doctor fix`) — reinstalls drifted or missing files and hooks, reloads a stopped auto-swap agent, offers the safe re-login for dead tokens, then checks again.
+- **`overclaude doctor --fix`** (or `/swap doctor fix`) — reinstalls drifted or missing files and hooks, offers to restart a stopped auto-swap agent and to run the safe re-login for dead tokens (both only when run in a terminal), then checks again.
 - **Safer releases** — the release script runs shellcheck and the full test suite before anything is committed or tagged, and the publish job reuses the push's test run instead of queueing a second macOS job.
 
 ## What's new in 1.2
@@ -144,7 +153,7 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap artifacts [words]` | Search every artifact you published, with its owning account |
 | `/swap doctor [fix]` *(or `overclaude doctor [--fix]`)* | Health check with fixes; `fix` applies the safe ones |
 | `overclaude update` *(shell)* | Upgrade from PyPI and reinstall the kit |
-| `swap-guard artifacts` *(shell)* | Snapshot this session's claude.ai artifacts (sources + manifest) |
+| `swap-guard artifacts find <words>` *(shell)* | Search every artifact published from this machine, with its owner |
 | `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |
 
 Or skip memorizing and **paste a prompt**:

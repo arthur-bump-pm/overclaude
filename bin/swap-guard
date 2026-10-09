@@ -225,7 +225,9 @@ cmd_preflight() {
   us="$(printf '%s' "$tgt" | jq -r '.usageStatus // ""' | tr '[:upper:]' '[:lower:]')"
 
   case "$us" in
-    *login*|*quarantin*|*expired*|*invalid*|*revoked*)
+    # Dead = needs a re-login. token_expired / unavailable / keychain_unavailable are
+    # transient (cswap retries the refresh itself) and must never trigger one.
+    *relogin*|*quarantin*|*invalid*|*revoked*|no_credentials)
       verdict="relogin-required"
       detail="account $number ($email) requires re-login (usageStatus: $us) - recover with: swap-guard login $number (never a plain /login: it kills the live account's token)"
       ;;
@@ -906,15 +908,15 @@ cmd_ratelimit() {
   }
   [ "$err" = rate_limit ] || exit 0
   if [ -f "$INSTANT_OFF" ]; then
-    _rl_out "$(jq -cn --argjson ts "$now" '{ts:$ts, source:"ratelimit", action:"skipped", reason:"instant-swap-off"}')"; exit 0
+    _rl_out "$(jq -cn --argjson ts "$now" '{ts:($ts|todate), source:"ratelimit", action:"skipped", reason:"instant-swap-off"}')"; exit 0
   fi
   if ! _rl_is_cap "$msg"; then
     _rl_out "$(jq -cn --argjson ts "$now" --arg m "$(printf '%s' "$msg" | cut -c1-160)" \
-      '{ts:$ts, source:"ratelimit", action:"ignored", reason:"transient-429", message:$m}')"; exit 0
+      '{ts:($ts|todate), source:"ratelimit", action:"ignored", reason:"transient-429", message:$m}')"; exit 0
   fi
   model="$(_rl_model "$msg")"
   command -v cswap >/dev/null 2>&1 || {
-    _rl_out "$(jq -cn --argjson ts "$now" '{ts:$ts, source:"ratelimit", action:"error", detail:"cswap not found"}')"; exit 0; }
+    _rl_out "$(jq -cn --argjson ts "$now" '{ts:($ts|todate), source:"ratelimit", action:"error", detail:"cswap not found"}')"; exit 0; }
 
   # One swap for a burst: several sessions on the capped account fail together.
   mkdir -p "$STATE_ROOT" "$CTX_DIR" 2>/dev/null
@@ -939,7 +941,7 @@ cmd_ratelimit() {
   if [ $(( now - last_ts )) -lt "$RL_COOLDOWN" ]; then
     last_to="$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)"
     _rl_out "$(jq -cn --argjson ts "$now" --arg to "$last_to" --arg s "$sid" \
-      '{ts:$ts, source:"ratelimit", action:"reused", to:$to, session:$s}')"
+      '{ts:($ts|todate), source:"ratelimit", action:"reused", to:$to, session:$s}')"
     rmdir "$lock" 2>/dev/null; trap - EXIT
     [ "$dry" -eq 1 ] && exit 0
     _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was already switched to $(_label_for "$last_to") moments ago. Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying." && exit 2
@@ -952,7 +954,7 @@ cmd_ratelimit() {
   pick="$(_rl_pick "$list" "$model" "$now")"
   if [ -z "$pick" ]; then
     _rl_out "$(jq -cn --argjson ts "$now" --arg m "$model" --arg f "$from" \
-      '{ts:$ts, source:"ratelimit", action:"none", reason:"no-account-with-room", model:$m, from:$f}')"
+      '{ts:($ts|todate), source:"ratelimit", action:"none", reason:"no-account-with-room", model:$m, from:$f}')"
     [ "$notify" -eq 1 ] && [ "$dry" -eq 0 ] &&
       _auto_notify "${model:-Usage} limit on $from_l, and no other account has room (or they need: swap-guard login)."
     exit 0
@@ -961,7 +963,7 @@ cmd_ratelimit() {
   to_l="$(_label_for "$to")"
   if [ "$dry" -eq 1 ]; then
     _rl_out "$(printf '%s' "$pick" | jq -c --argjson ts "$now" --arg m "$model" --arg f "$from" \
-      '{ts:$ts, source:"ratelimit", action:"would-switch", model:$m, from:$f, to:(.number|tostring), score}')"
+      '{ts:($ts|todate), source:"ratelimit", action:"would-switch", model:$m, from:$f, to:(.number|tostring), score}')"
     exit 0
   fi
   sw="$(cswap switch "$to" --json 2>/dev/null)"; rc=$?
@@ -972,7 +974,7 @@ cmd_ratelimit() {
   fi
   if [ "$rc" -ne 0 ]; then
     _rl_out "$(jq -cn --argjson ts "$now" --arg to "$to" --argjson rc "$rc" --arg d "$(printf '%s' "$sw" | tail -c 300)" \
-      '{ts:$ts, source:"ratelimit", action:"error", to:$to, rc:$rc, detail:$d}')"
+      '{ts:($ts|todate), source:"ratelimit", action:"error", to:$to, rc:$rc, detail:$d}')"
     [ "$notify" -eq 1 ] && _auto_notify "${model:-Usage} limit on $from_l — switching to $to_l failed (see auto.log)."
     exit 0
   fi
@@ -990,11 +992,11 @@ cmd_ratelimit() {
       + [{slot: $f, model: $m, until: (if $r != null and $r > $now then $r else $now + 18000 end)}]' \
     > "$RL_CAPPED.tmp.$$" 2>/dev/null && mv "$RL_CAPPED.tmp.$$" "$RL_CAPPED"
   _rl_out "$(printf '%s' "$pick" | jq -c --argjson ts "$now" --arg m "$model" --arg f "$from" --arg s "$sid" \
-    '{ts:$ts, source:"ratelimit", action:"switched", model:$m, from:$f, to:(.number|tostring), score, session:$s}')"
+    '{ts:($ts|todate), source:"ratelimit", action:"switched", model:$m, from:$f, to:(.number|tostring), score, session:$s}')"
   rmdir "$lock" 2>/dev/null; trap - EXIT
   [ "$notify" -eq 1 ] &&
     _auto_notify "${model:-Usage} limit on $from_l → switched to $to_l. If the session does not resume by itself, send any message."
-  wake_txt="overclaude: the ${model:-usage} limit stopped this session, so the account was switched from $from_l to $to_l (now $(printf '%s' "$pick" | jq -r '"5h \(.h5)% · week \(.d7)%"')). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying."
+  wake_txt="overclaude: the ${model:-usage} limit stopped this session, so the account was switched from $from_l to $to_l (now $(printf '%s' "$pick" | jq -r --arg m "$model" '"5h \(.h5)% · week \(.d7)%" + (if $m != "" then " · \($m) \(.m)%" else "" end)')). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying."
   _rl_wake "$sid" "$wake_txt" && exit 2
   exit 0
 }
@@ -1140,7 +1142,10 @@ cmd_artifact_log() {
     size="$(stat -f %z "$src" 2>/dev/null || echo 0)"
     if [ "$size" -le "$ART_SRC_MAX" ] 2>/dev/null; then
       mkdir -p "$ART_INDEX_DIR/src/$aid" && dst="$ART_INDEX_DIR/src/$aid/${src##*/}" &&
-        cp -p "$src" "$dst" && rec="$(printf '%s' "$rec" | jq -c --arg d "$dst" '. + {saved: $d}')"
+        cp -p "$src" "$dst" && touch "$ART_INDEX_DIR/src/$aid" &&
+        rec="$(printf '%s' "$rec" | jq -c --arg d "$dst" '. + {saved: $d}')"
+      # Sources of artifacts not published again for 180 days are pruned.
+      find "$ART_INDEX_DIR/src" -mindepth 1 -maxdepth 1 -type d -mtime +180 -exec rm -rf {} + 2>/dev/null
     fi
   fi
   printf '%s\n' "$rec" >> "$ART_INDEX"
@@ -1161,9 +1166,16 @@ _art_catalog() {
               account: $c.account, slot: $c.slot, alias: $c.alias, inferred: ($c.inferred // false),
               lastPublishedBy: (($g | last) | .alias // .account),
               saved: ([$g[] | .saved // empty] | last // null)})
-    | map(.artifact_id as $id
-          | . + {republishedAs: ([$links[] | select(.from == $id) | .to] | last // null),
-                 republishOf: ([$links[] | select(.to == $id) | .from] | last // null)})
+    # Links name artifacts by URL slug or by id: tool responses carry a UUID
+    # artifact_id while URLs end in a short slug, so match either and report URLs.
+    | map(. + {slug: ((.url // "") | sub(".*/artifact/"; "") | sub("[?#].*"; ""))})
+    | (reduce .[] as $e ({}; . + {($e.artifact_id): $e.url, ($e.slug): $e.url})) as $urlOf
+    | map(. as $e
+          | . + {republishedAs: ([$links[] | select(.from == $e.artifact_id or .from == $e.slug) | .to] | last
+                                 | if . == null then null else ($urlOf[.] // .) end),
+                 republishOf: ([$links[] | select(.to == $e.artifact_id or .to == $e.slug) | .from] | last
+                                 | if . == null then null else ($urlOf[.] // .) end)}
+          | del(.slug))
     | sort_by(-.ts)' 2>/dev/null || printf '[]\n'
 }
 
@@ -1264,8 +1276,8 @@ cmd_login() {
   for a in "$@"; do
     case "$a" in --new) new=1;; -*) :;; *) [ -z "$raw" ] && raw="$a";; esac
   done
-  command -v cswap >/dev/null 2>&1 || { echo '{"error":"cswap not found"}'; exit 1; }
-  command -v claude >/dev/null 2>&1 || { echo '{"error":"claude not found"}'; exit 1; }
+  command -v cswap >/dev/null 2>&1 || { echo '{"error":"cswap-not-found"}'; exit 1; }
+  command -v claude >/dev/null 2>&1 || { echo '{"error":"claude-not-found"}'; exit 1; }
   if [ "$new" -eq 0 ]; then
     [ -n "$raw" ] || { echo "usage: swap-guard login <slot|alias|email> | --new" >&2; exit 2; }
     case "$raw" in
@@ -1324,19 +1336,29 @@ cmd_login() {
   # cswap asks "Overwrite slot N? [y/N]" when the stored org differs; with no terminal
   # it prints "Cancelled" and still exits 0 — so success is proven by sequence.json
   # changing, not by the exit code.
-  local before after addout
+  local before after addout keys_before retry
   before="$(jq -r '.lastUpdated // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
-  if [ -n "$slot" ]; then
-    addout="$(CLAUDE_CONFIG_DIR="$tmp" cswap add --slot "$slot" </dev/null 2>&1)" || { jq -cn --arg d "$addout" '{error:"cswap-add-failed", detail:$d}'; exit 1; }
+  keys_before="$(jq -c '.accounts | keys' "$STATE_ROOT/sequence.json" 2>/dev/null)"
+  local add_args=(add); [ -n "$slot" ] && add_args+=(--slot "$slot")
+  if [ -t 0 ]; then
+    # A terminal: cswap's own y/N (e.g. an organization change) reaches the user.
+    # Its output is not captured here, so the prompt is visible.
+    CLAUDE_CONFIG_DIR="$tmp" cswap "${add_args[@]}" >&2 || { jq -cn '{error:"cswap-add-failed"}'; exit 1; }
+    addout=""
   else
-    addout="$(CLAUDE_CONFIG_DIR="$tmp" cswap add </dev/null 2>&1)" || { jq -cn --arg d "$addout" '{error:"cswap-add-failed", detail:$d}'; exit 1; }
+    addout="$(CLAUDE_CONFIG_DIR="$tmp" cswap "${add_args[@]}" </dev/null 2>&1)" || { jq -cn --arg d "$addout" '{error:"cswap-add-failed", detail:$d}'; exit 1; }
+    printf '%s\n' "$addout" >&2
   fi
-  printf '%s\n' "$addout" >&2
   after="$(jq -r '.lastUpdated // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
   if printf '%s' "$addout" | grep -qi 'cancelled' || [ "$before" = "$after" ]; then
-    jq -cn --arg s "${slot:-new}" --arg d "$(printf '%s' "$addout" | tail -c 300)" '{error:"cswap-add-cancelled", slot:$s,
-      detail:("cswap did not register the account (it may need to confirm an organization change). Run in a terminal: swap-guard login " + $s + "  — " + $d)}'
+    retry="swap-guard login ${slot:---new}"
+    jq -cn --arg s "${slot:-new}" --arg r "$retry" --arg d "$(printf '%s' "$addout" | tail -c 300)" '{error:"cswap-add-cancelled", slot:$s,
+      detail:("cswap did not register the account — it needs a y/N confirmation (usually an organization change) that only a terminal can answer. Run in a terminal: " + $r + "  — " + $d)}'
     exit 1
+  fi
+  # --new: report the slot cswap actually assigned (the one key that appeared).
+  if [ -z "$slot" ]; then
+    slot="$(jq -r --argjson b "${keys_before:-[]}" '(.accounts | keys) - $b | first // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
   fi
   echo "4/4 re-anchoring cswap on the live account and cleaning up…" >&2
   local reanchored=true

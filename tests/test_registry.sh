@@ -37,6 +37,12 @@ printf '{"ts":1,"kind":"publ' >> "$IDX"; printf '\n' >> "$IDX"
 assert_eq "$("$SG" artifacts find villa | jq length)" "1" "a torn index line does not hide the other records"
 "$SG" artifacts link https://claude.ai/artifact/BBB222 https://claude.ai/artifact/DDD444 >/dev/null
 assert_eq "$("$SG" artifacts find office | jq -r '.[0].republishedAs')" "DDD444" "link records the republished copy"
+# Real ids: tool responses carry a UUID artifact_id while URLs end in a short slug.
+post '{"tool_name":"Artifact","tool_input":{},"tool_response":{"url":"https://claude.ai/artifact/27gabQxAM3","artifact_id":"0907fe29-d3c2-4ba4-b2f5-1a0594497cb9","title":"Office rack"}}'
+post '{"tool_name":"Artifact","tool_input":{},"tool_response":{"url":"https://claude.ai/artifact/9zzNewSlug","artifact_id":"11111111-2222-3333-4444-555555555555","title":"Office rack copy"}}'
+"$SG" artifacts link https://claude.ai/artifact/27gabQxAM3 https://claude.ai/artifact/9zzNewSlug >/dev/null
+assert_eq "$("$SG" artifacts find rack | jq -r '.[] | select(.title == "Office rack") | .republishedAs')" "https://claude.ai/artifact/9zzNewSlug" "linking by URL works when ids are UUIDs (reported as the new URL)"
+assert_eq "$("$SG" artifacts find rack | jq -r '.[] | select(.title == "Office rack copy") | .republishOf')" "https://claude.ai/artifact/27gabQxAM3" "and the copy points back to the original"
 "$SG" artifacts link onlyone >/dev/null 2>&1
 assert_eq "$?" "1" "link needs two different ids"
 

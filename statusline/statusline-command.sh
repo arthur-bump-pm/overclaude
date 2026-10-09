@@ -431,7 +431,11 @@ update_line() {
   latest=$(jq -r '.version // empty' "$cache" 2>/dev/null)
   [ -n "$latest" ] && [ "$latest" != "$kit" ] || return 0
   [ "$(printf '%s\n%s\n' "$kit" "$latest" | sort -V | tail -1)" = "$latest" ] || return 0
-  printf '%s⬆ overclaude %s available · overclaude update%s\n' "$DIM" "$latest" "$RESET"
+  if command -v overclaude >/dev/null 2>&1; then
+    printf '%s⬆ overclaude %s available · overclaude update%s\n' "$DIM" "$latest" "$RESET"
+  else   # a git checkout install has no CLI
+    printf '%s⬆ overclaude %s available · git pull && ./install.sh%s\n' "$DIM" "$latest" "$RESET"
+  fi
 }
 upd=$(update_line 2>/dev/null) || upd=""
 [ -n "$upd" ] && printf "%s\n" "$upd"

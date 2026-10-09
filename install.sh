@@ -256,6 +256,13 @@ MERGED=$(jq -n \
      | (if (.statusLine == null) then .statusLine = $frag.statusLine else . end))
   ') || die "jq merge failed for settings.json"
 
+# New in 1.3: automatic account switching on a usage cap. Say so the first time
+# the hook lands, so an upgrade never turns it on silently.
+if ! printf '%s' "$CUR_JSON" | jq -e '[.hooks.StopFailure[]?.hooks[]?.command // ""] | any(contains("swap-guard ratelimit"))' >/dev/null 2>&1; then
+  note_warn "Instant swap is ON: when a usage cap stops a session, overclaude switches to the account"
+  note_warn "  with the most room (this flips all live sessions). Turn it off: swap-guard auto instant off"
+fi
+
 # statusLine notice: we never overwrite an existing one (but stay quiet when
 # the existing one already points at the kit's script).
 CUR_SL=$(printf '%s' "$CUR_JSON" | jq -r '.statusLine.command // ""' 2>/dev/null)

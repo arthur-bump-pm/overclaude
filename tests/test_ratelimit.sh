@@ -47,6 +47,7 @@ hit s1 "$CAP"
 assert_eq "$(switches)" "switch 1;" "usage cap → switched to the account with room"
 assert_eq "$rc" "2" "exit 2 wakes the stopped session (asyncRewake)"
 assert_contains "$(cat "$HOME/stderr")" "switched from personal to work" "wake text names both accounts"
+assert_contains "$(cat "$HOME/stderr")" "Fable 5%" "wake text includes the limit that triggered"
 assert_eq "$(lastlog .model)" "Fable" "the capped model is parsed from the message"
 assert_eq "$(jq -r .to "$HOME/.claude-swap-backup/ratelimit-last.json")" "1" "last swap recorded"
 

@@ -132,18 +132,20 @@ if [ -n "$CSWAP_BIN" ] && command -v jq >/dev/null 2>&1; then
     if [ "$n" -eq 0 ]; then
       _warn "no accounts registered" "cswap add   (while logged in), then cswap alias 1 work"
     fi
-    printf '%s' "$list" | jq -r '.accounts[] | [(.number|tostring), (.alias // ""), (.email // ""), (.usageStatus // "")] | @tsv' |
-    while IFS=$'\t' read -r num alias email us; do
+    # \x1f, not tab: read collapses consecutive tabs, so an account without an alias
+    # would shift every field left and hide its status.
+    printf '%s' "$list" | jq -r '.accounts[] | [(.number|tostring), (.alias // ""), (.email // ""), (.usageStatus // "")] | join("\u001f")' |
+    while IFS=$'\x1f' read -r num alias email us; do
       label="${alias:-${email%%@*}}"
       case "$(printf '%s' "$us" | tr '[:upper:]' '[:lower:]')" in
-        *login*|*quarantin*|*expired*|*invalid*|*revoked*)
+        *relogin*|*quarantin*|*invalid*|*revoked*|no_credentials)
           echo "  [warn] account $num ($label): token dead ($us)"
           echo "         fix: swap-guard login $num   (a plain /login would kill the live account's token)" ;;
         *) echo "  [ok]   account $num ($label): ${us:-ok}" ;;
       esac
     done
     # The pipe ran in a subshell; recount dead tokens for the summary.
-    dead=$(printf '%s' "$list" | jq '[.accounts[] | (.usageStatus // "" | ascii_downcase) | select(test("login|quarantin|expired|invalid|revoked"))] | length')
+    dead=$(printf '%s' "$list" | jq '[.accounts[] | (.usageStatus // "" | ascii_downcase) | select(test("relogin|quarantin|invalid|revoked|no_credentials"))] | length')
     WARNS=$((WARNS + dead))
     # token_expired is transient (cswap retries the refresh itself) — never a re-login.
     DEAD_SLOTS=$(printf '%s' "$list" | jq -r '[.accounts[] | select((.usageStatus // "" | ascii_downcase) | test("relogin|quarantin|invalid|revoked|no_credentials")) | .number | tostring] | join(" ")')
@@ -223,7 +225,7 @@ fi
 if [ -f "$STATE_ROOT/instant-swap.off" ]; then
   _warn "instant swap on rate limit is OFF" "swap-guard auto instant on"
 else
-  last=$(grep '"source":"ratelimit"' "$STATE_ROOT/auto.log" 2>/dev/null | tail -n 1 | jq -r '"\(.ts | todate) \(.action)\(if .reason then " (" + .reason + ")" else "" end)"' 2>/dev/null)
+  last=$(grep '"source":"ratelimit"' "$STATE_ROOT/auto.log" 2>/dev/null | tail -n 1 | jq -r '"\(.ts | if type == "number" then todate else . end) \(.action)\(if .reason then " (" + .reason + ")" else "" end)"' 2>/dev/null)
   ok "instant swap on rate limit is on${last:+ — last: $last}"
 fi
 

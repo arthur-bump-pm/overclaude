@@ -1,10 +1,11 @@
 ---
 name: swap
-description: "Switch between Claude accounts from inside Claude Code: hot-swap the live session (default), show the accounts + live-sessions dashboard, or carry work onto the new account via handoff/restart modes; also guides adding a new account."
-argument-hint: "[account] [handoff|restart|now|force] | add | relogin <account> | auto [on|off|status|instant on|off] | artifacts [words] | doctor [fix]"
-disable-model-invocation: true
+description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, kit health check. Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
+argument-hint: "[account] [handoff|restart|now|force] | add | relogin <account> | auto [on|off|status|instant on|off] [threshold N] [model X] | artifacts [words] [account X] | doctor [fix]"
 allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(overclaude doctor *), Bash(bash *doctor.sh*)
 ---
+
+GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, doctor). Never invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task. If explicit consent is missing, STOP and ask. A dead account token is ALWAYS fixed with `swap-guard login <N>` (the relogin section) — never a plain `/login`, which kills the live account's token.
 
 # /swap — Claude account switcher
 
@@ -41,7 +42,8 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 Edge rulings:
 - `/swap <target> now` without `handoff`/`restart` → error: `now` only modifies handoff/restart.
 - `/swap handoff` (no target) → error: "did you mean /handoff? For an account aliased 'handoff' use slot number/email."
-- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`, `threshold <50-99>`, `model <names>`), never a target.
+- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`, `threshold <50-99.9>`, `model <names>`), never a target.
+- `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
 - `relogin` takes the target account as its argument; it never switches.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
@@ -86,7 +88,7 @@ The blast-radius line is mandatory in every hot-swap confirmation.
 ## `/swap auto [on|off|status] [threshold N] [model X]`
 
 Opt-in background auto-switching: a LaunchAgent runs `swap-guard auto tick` every 3 min. Each tick asks `cswap auto` for a dry-run decision; a PROACTIVE switch (nearing the threshold) is deferred while any live session is busy, an AT-LIMIT switch proceeds (the account is stalled anyway), dead-token targets are skipped, and cswap's cooldown applies. (cswap's "failover" for unreadable usage needs 3 consecutive failures inside one long-running process, so the per-tick agent does not fail over.) Install validates the arguments and runs a probe tick that never switches; a bad value is refused up front. A macOS notification announces each switch.
-- `on` → confirm the blast radius first ("switches flip ALL live sessions"), then run `swap-guard auto install` with `--threshold N` (default 90) and `--model X` if given (suggest `--model Fable` when the scoped bucket is the usual wall). Report the JSON.
+- `on` → confirm the blast radius first ("switches flip ALL live sessions"), then run `swap-guard auto install` with `--threshold N` (if omitted, cswap's own threshold applies — 90 unless changed in cswap's settings) and `--model X` if given (suggest `--model Fable` when the scoped bucket is the usual wall). Report the JSON.
 - `off` → `swap-guard auto uninstall`.
 - `status` (default) → `swap-guard auto status`; render loaded yes/no and the recent ticks (ts, action, reason) as a table.
 Note: a session paused at a usage limit does NOT resume by itself after a background switch — the user sends any message and it goes through on the new account.
@@ -106,13 +108,13 @@ Why this exists: refresh tokens rotate and are single-use. A plain `/login` whil
 
 1. Tell the user a browser window will open and they must sign in as `<target>`'s email (from the accounts context).
 2. Run `swap-guard login <target>` with a 10-minute Bash timeout. It saves the live account's token (`cswap add`), signs in inside a throwaway `CLAUDE_CONFIG_DIR` (the live login is never touched), checks the signed-in email, registers the slot, re-anchors cswap on the live account, and deletes the throwaway profile and its keychain item.
-3. Report the JSON. Errors (nothing about the live account changed in any of them): `wrong-account` → the user signed in with a different email; `target-is-live` → the dead account IS the live one: `/login` inside Claude Code, then `cswap add`; `cswap-add-cancelled` → cswap wanted a y/N confirmation (usually an organization change) that cannot be answered from here — tell the user to run `swap-guard login <target>` in a terminal; `cswap-list-failed` → relay the detail; `ambiguous-target` → ask for the slot number. On success with `reanchored: false`, relay `.detail` (cswap may show the wrong active account until `cswap add` runs). If the command cannot open a browser from here, tell the user to run `swap-guard login <target>` in any terminal.
+3. Report the JSON. Errors (nothing about the live account changed in any of them): `wrong-account` → the user signed in with a different email; `target-is-live` → the dead account IS the live one: `/login` inside Claude Code, then `cswap add`; `cswap-add-cancelled` → cswap wanted a y/N confirmation (usually an organization change) that only a terminal can answer — relay `.detail`, which names the exact command to run in a terminal (there the prompt reaches the user); `cswap-list-failed` → relay the detail; `ambiguous-target` → ask for the slot number; `unknown-target` → show the accounts table; `capture-failed` → the LIVE account's own token could not be saved, so nothing else was attempted — run `cswap list` to see why (often the live account itself needs `/login` + `cswap add`); `login-failed` → the browser sign-in did not complete, retry; `cswap-add-failed` → relay `.detail`; `cswap-not-found` / `claude-not-found` → run `overclaude doctor`. On success with `reanchored: false`, relay `.detail` (cswap may show the wrong active account until `cswap add` runs). If the command cannot open a browser from here, tell the user to run `swap-guard login <target>` in any terminal.
 
 ## `/swap add` — register a new account
 
 1. Tell the user a browser window will open for the NEW account's sign-in. No `/logout` is needed and live sessions are unaffected.
-2. Run `swap-guard login --new` with a 10-minute Bash timeout (same throwaway-profile flow as relogin; registers the next free slot).
-3. `cswap alias <N> <name>` — optional; do not use a reserved word (`add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`).
+2. Run `swap-guard login --new` with a 10-minute Bash timeout (same throwaway-profile flow as relogin; registers the next free slot and returns it as `.slot`). Errors as in relogin step 3.
+3. `cswap alias <.slot> <name>` — optional; do not use a reserved word (`add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`).
 
 ## `/swap artifacts [words] [account X]`
 

@@ -14,8 +14,13 @@ case "$1" in
         [ -z "${CLAUDE_CONFIG_DIR:-}" ] && exit "${STUB_CAPTURE_RC:-0}"
         # Like real cswap: an org change asks y/N; with no terminal it prints Cancelled, exits 0.
         if [ -n "${STUB_CANCEL:-}" ]; then echo "Overwrite slot? [y/N] Cancelled"; exit 0; fi
+        if [ -n "${STUB_ASK:-}" ]; then   # like cswap: ask, cancel unless a terminal answers y
+          printf 'Overwrite slot? [y/N] '; read -r ans 2>/dev/null || ans=""
+          [ "$ans" = y ] || { echo Cancelled; exit 0; }
+        fi
         S="$HOME/.claude-swap-backup/sequence.json"
-        jq --arg t "$(date +%s)$RANDOM" '.lastUpdated = $t' "$S" > "$S.t" && mv "$S.t" "$S"
+        case " $* " in *" --slot "*) f='.' ;; *) f='.accounts["3"] = {"email":"new@example.com"}' ;; esac
+        jq --arg t "$(date +%s)$RANDOM" "$f | .lastUpdated = \$t" "$S" > "$S.t" && mv "$S.t" "$S"
         exit 0 ;;
 esac
 EOF
@@ -74,6 +79,22 @@ write_seq 2
 out="$("$SG" login personal 2>/dev/null)"
 assert_eq "$(printf '%s' "$out" | jq -r .error)" "target-is-live" "re-logging the live account itself is redirected"
 assert_eq "$("$SG" login nobody 2>/dev/null | jq -r .error)" "unknown-target" "unknown account refused"
+
+: > "$LOG"
+out="$(STUB_AS=new@example.com "$SG" login --new 2>/dev/null)"
+assert_eq "$(printf '%s' "$out" | jq -r .slot)" "3" "--new reports the slot cswap assigned"
+out="$(STUB_CANCEL=1 "$SG" login --new 2>/dev/null)"
+assert_contains "$(printf '%s' "$out" | jq -r .detail)" "swap-guard login --new" "a cancelled --new names the right retry command"
+write_seq 2
+
+# In a real terminal cswap's y/N reaches the user (QA H2): answering y registers the slot.
+if command -v expect >/dev/null 2>&1; then
+  out="$(STUB_ASK=1 expect -c "set timeout 20; spawn -noecho $SG login work; expect {\[y/N\]} { send \"y\\r\" }; expect eof" 2>/dev/null |
+         tr -d '\r' | sed $'s/\x1b\\[[0-9;]*m//g' | grep '^{' | tail -n 1)"
+  assert_eq "$(printf '%s' "$out" | jq -r '.loggedIn // .error')" "work@example.com" "terminal run: the y/N confirmation is answerable"
+  out="$(STUB_ASK=1 "$SG" login work 2>/dev/null < /dev/null)"
+  assert_eq "$(printf '%s' "$out" | jq -r .error)" "cswap-add-cancelled" "no terminal: the confirmation cancels and says so"
+fi
 
 : > "$LOG"
 "$SG" login --new >/dev/null 2>&1
