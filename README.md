@@ -19,6 +19,17 @@ ctx [████░░░░░░] 42% | 5h [███████░░░] 7
 bars and percentages turn yellow at 50% · red at 80%
 ```
 
+## What's new in 1.3
+
+- **Instant swap on a usage cap** — the moment "You've reached your Fable limit" stops a session, a hook switches to the account with the most room on that limit and wakes the session to carry on. Sessions that hit the cap together share one swap; a short-lived 429 slowdown never swaps; dead, disabled and API-key accounts are never targets. On by default (`/swap auto instant off` to disable), independent of the opt-in background auto-swap.
+- **Re-login that doesn't kill your other account** — refresh tokens are single-use, so a plain `/login` over the live account overwrote its newest token and that account died next: re-logging one account killed the other, in turn. `/swap relogin <account>` (or `swap-guard login <account>` in a terminal) saves the live account's token first and signs in inside a throwaway profile, so the live login is never touched. `/swap add` uses the same flow and no longer needs `/logout`.
+- **The model sees your usage** — when the active account crosses 75/90/100% of a model limit (or 85/95/100% weekly, 90/100% 5-hour), one line tells Claude, so ULTRACODE's budget rules (cut fan-out, keep the top tier for the final synthesis) actually kick in — with a pointer to an account that has room. One more line when the pressure clears; silent otherwise.
+- **One list of every artifact** — every publish is recorded with the account that owns it and a durable copy of its source. `/swap artifacts villa` finds it from any account; `swap-guard artifacts index` backfills artifacts published before 1.3 (owner inferred from cswap's switch history).
+- **Same link across accounts** — handoffs now say which account owns each artifact and suggest sharing it to the next account with edit access, so the new session updates it in place instead of republishing a copy at a new URL.
+- **`overclaude update`** — upgrades however you installed it (pipx, uv or pip) and reinstalls the kit. The statusline shows `⬆ overclaude X available` when a release is out (checked in the background once a day; `OVERCLAUDE_NO_UPDATE_CHECK=1` hides it).
+- **`overclaude doctor --fix`** (or `/swap doctor fix`) — reinstalls drifted or missing files and hooks, reloads a stopped auto-swap agent, offers the safe re-login for dead tokens, then checks again.
+- **Safer releases** — the release script runs shellcheck and the full test suite before anything is committed or tagged, and the publish job reuses the push's test run instead of queueing a second macOS job.
+
 ## What's new in 1.2
 
 - **Busy-aware auto-swap (opt-in)** — `/swap auto on` installs a background agent that switches accounts *before* you hit a wall. It never flips credentials while a session is mid-task (proactive switches wait); at-limit switches go through, dead tokens are skipped, bad settings are refused at install, and a macOS notification tells you what happened.
@@ -121,14 +132,18 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap <target> force` | Same, bypassing the busy-session guard |
 | `/swap <target> handoff` | Package this session (+ its artifacts), switch account, resume fresh |
 | `/swap <target> restart` | Switch + restart this session in place (auth edge cases) |
-| `/swap add` | Guided registration of a new account |
+| `/swap add` | Register a new account (browser sign-in; live sessions untouched) |
+| `/swap relogin <account>` | Revive a dead token without killing the live account's |
 | `/handoff` | Package this session and continue fresh, same account |
 | `/handoff status` | Context %, thresholds fired, pending package state |
 | `/handoff cancel` | Cancel a pending handoff |
 | `/handoff history` | List archived handoff packages for this folder |
 | `/handoff restore [n]` | Re-arm an archived package (default: newest), then Ctrl+D |
 | `/swap auto on\|off\|status` | Busy-aware background auto-swap (`threshold N`, `model Fable`) |
-| `/swap doctor` *(or `overclaude doctor`)* | Health check with fixes |
+| `/swap auto instant on\|off` | Instant swap the moment a usage cap stops a session (default on) |
+| `/swap artifacts [words]` | Search every artifact you published, with its owning account |
+| `/swap doctor [fix]` *(or `overclaude doctor [--fix]`)* | Health check with fixes; `fix` applies the safe ones |
+| `overclaude update` *(shell)* | Upgrade from PyPI and reinstall the kit |
 | `swap-guard artifacts` *(shell)* | Snapshot this session's claude.ai artifacts (sources + manifest) |
 | `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |
 
@@ -142,9 +157,11 @@ Or skip memorizing and **paste a prompt**:
 | "What's my context and account usage right now?" | `/handoff status` + `/swap` dashboard |
 | "Switch accounts automatically before I hit my Fable limit" | `/swap auto on model Fable` |
 | "Something's off with my setup — check it" | `/swap doctor` |
+| "My work account says relogin — fix it" | `/swap relogin work` |
+| "Where's that villa comparison artifact?" | `/swap artifacts villa` |
 | "My handoff expired — bring it back" | `/handoff restore` |
 | "Install overclaude on this machine" | the whole install flow (works before the kit exists) |
-| "Upgrade overclaude and refresh the hooks" | `pipx upgrade overclaude && overclaude install` |
+| "Upgrade overclaude and refresh the hooks" | `overclaude update` |
 
 ## How it fits together
 
@@ -168,6 +185,8 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 - Usage meters read cswap's cache for the active account (correct the moment a swap lands) and are refreshed in the background every ~5 min while any statusline renders; past 10 min a dim `(usage Nm old)` marker appears. The ctx meter is real-time.
 - An inactive account whose reset time has passed is shown at 0% — nothing on this machine has used it since. Usage from elsewhere (claude.ai web, another machine) appears on the next refresh.
 - claude.ai artifacts are owned by the account that published them. After a cross-account handoff the old URLs stay viewable from the owner account but aren't editable from the new one — the next session re-homes them from the saved source (new URL), unless you share the original with edit access.
+- Instant swap wakes the stopped session through Claude Code's `asyncRewake` hook mechanism; if your Claude Code version doesn't resume it, the notification tells you to send any message. Each session is woken at most once per 10 minutes, so an account that is still capped can't loop.
+- Never re-login a dead account with a plain `/login` while another account is live — use `/swap relogin` (see 1.3 notes). `cswap run` profiles hold a second copy of an account's token chain and can fork it the same way.
 - Legacy clients that don't report status (older VS Code extension builds) are judged busy/idle by transcript mtime during swap preflight.
 - claude.ai connectors (Gmail/Drive/…) are per-account server-side and don't follow a swap.
 - Context thresholds re-arm 10 points below a fired threshold; Claude Code's auto-compact stays as the backstop.
@@ -180,7 +199,7 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 
 | File | Installs to | Role |
 |---|---|---|
-| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state, handoff history/restore, artifact snapshots, busy-aware auto-swap |
+| `bin/swap-guard` | `~/.local/bin/` | State/guard engine: whoami, live-session table, busy preflight, per-directory handoff state, handoff history/restore, artifact snapshots + registry, busy-aware auto-swap, instant swap on a usage cap, usage-band notes for the model, safe re-login |
 | `skills/swap/SKILL.md` | `~/.claude/skills/swap/` | The `/swap` skill |
 | `skills/handoff/SKILL.md` | `~/.claude/skills/handoff/` | The `/handoff` skill |
 | `hooks/handoff-inject.sh` | `~/.claude/hooks/` | SessionStart: auto-loads a pending handoff package (10-min TTL, per-directory) |
@@ -188,7 +207,7 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 | `hooks/ctx-notify.sh` | `~/.claude/hooks/` | Stop: threshold banners |
 | `statusline/statusline-command.sh` | `~/.claude/statusline-command.sh` | Renders the statusline; publishes the ctx relay |
 | `claude/ULTRACODE.md` | `~/.claude/` + `CLAUDE.md` import | Model/effort routing policy |
-| `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | 3 hook groups, statusLine, 2 permission allows |
+| `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | hooks (SessionStart handoff inject; UserPromptSubmit ctx-watch + usage bands; Stop banners; StopFailure `rate_limit` instant swap; PostToolUse `Artifact` registry), statusLine, 2 permission allows |
 | `shell/zshrc-snippet.sh` | `~/.zshrc` (markers) | `claude()` relaunch wrapper, `swap` alias, PATH guard |
 | `vendor/claude-swap/` | pipx/uv-installed if absent or older | The bundled credential engine (0.26.0) |
 | `doctor.sh` | run by `overclaude doctor` | Read-only health check |
@@ -213,14 +232,16 @@ A plain `git push` updates git installs only — **PyPI users get changes only v
 
 ## Roadmap
 
-Prioritized by value for effort; each item was feasibility-checked against the Claude Code docs and cswap source.
+Picked for 1.4, each feasibility-checked against the Claude Code docs, cswap source and Codex CLI:
 
-1. **Instant swap on rate limit** — a `StopFailure` hook (`error: rate_limit`, which Claude Code also reports for "You've reached your Fable limit") runs the same busy-aware `swap-guard auto tick` the moment a turn dies, instead of waiting for the next 3-minute tick. Observe-only hook, so you still send one message to continue.
-2. **Handoff relaunch that starts by itself** — the shell wrapper relaunches with `claude -n "↪ <goal>" "Continue from the handoff"`, so the fresh session is titled and already working.
-3. **Notifications** — dead-token and weekly-reset alerts via macOS notifications (Terminal.app ignores the escape-code notifications hooks can emit).
-4. **Compaction awareness** — re-inject what compaction drops (artifact URLs, handoff state) via the `SessionStart` `compact` matcher; optionally offer a handoff before the first proactive auto-compact.
-5. **Per-directory accounts** — wire cswap's `map`/`run` into the wrapper so a folder always opens as one account without flipping other terminals. Needs every component to honor `CLAUDE_CONFIG_DIR`; upstream marks `run` experimental.
-6. **Claude Code plugin packaging** — skills and hooks via `/plugin install`; deferred because plugins can't set the main statusline or install the shell wrapper and cswap, so it would add a second install path.
+1. **`/handoff codex`** — when every Claude account is exhausted, write the handoff where overcodex's SessionStart hook picks it up and continue in Codex (and back).
+2. **Codex as an independent reviewer** — a read-only `codex exec` verify stage in ULTRACODE workflows: a different model family catches different mistakes.
+3. **Codex limits on the statusline** — `↳ codex week 18%`, read from Codex's own session logs.
+4. **Enforce model routing** — a PreToolUse hook rejects subagent launches without an explicit model (ULTRACODE rule 1), instead of silently spending the top tier.
+5. **Spend report** — per-model usage per workflow, and what that usage would cost at API prices, to show how much value the subscription is returning.
+6. **Smaller artifact snapshots, model-aware account choice, small overcodex fixes.**
+
+Later: weekly pace forecast on the statusline (cswap 0.26 already computes the projection), titled relaunch after handoff, compaction awareness, per-directory accounts.
 
 ## License
 

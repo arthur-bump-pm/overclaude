@@ -177,6 +177,15 @@ install_file "$SCRIPT_DIR/hooks/ctx-watch.sh"             "$CLAUDE_DIR/hooks/ctx
 install_file "$SCRIPT_DIR/hooks/ctx-notify.sh"            "$CLAUDE_DIR/hooks/ctx-notify.sh"      755
 install_file "$SCRIPT_DIR/statusline/statusline-command.sh" "$CLAUDE_DIR/statusline-command.sh" 755
 install_file "$SCRIPT_DIR/claude/ULTRACODE.md"            "$CLAUDE_DIR/ULTRACODE.md"             -
+# Record the installed kit version (doctor + the statusline's update badge read it).
+# `overclaude install` passes OVERCLAUDE_VERSION; a git checkout has pyproject.toml.
+KIT_VER="${OVERCLAUDE_VERSION:-}"
+[ -n "$KIT_VER" ] || KIT_VER=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SCRIPT_DIR/pyproject.toml" 2>/dev/null | head -1)
+# A wheel payload run directly (no pyproject.toml, no env): ask the installed CLI.
+[ -n "$KIT_VER" ] || KIT_VER=$(overclaude version 2>/dev/null | head -1)
+if [ -n "$KIT_VER" ] && mkdir -p "$HOME/.claude-swap-backup" 2>/dev/null; then
+  printf '%s\n' "$KIT_VER" > "$HOME/.claude-swap-backup/kit-version"
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -232,24 +241,18 @@ MERGED=$(jq -n \
   ($fragarr[0]) as $frag
   | ($cur.permissions.allow // []) as $ca
   | ($frag.permissions.allow // []) as $fa
-  | def hasscript($evt; $name):
-      (($cur.hooks[$evt]) // []) | any(.[].hooks[]?; (.command // "") | contains($name));
+  # Each fragment hook group is added to its event unless a hook with the same
+  # script (last path component of the command) is already registered there.
+  | def marker: (.command // "") | sub("^bash +"; "") | split("/") | last;
+    def has($evt; $m): (($cur.hooks[$evt]) // []) | any(.[].hooks[]?; (.command // "") | contains($m));
     ($cur
      | .permissions = (.permissions // {})
      | .permissions.allow = ($ca + ($fa - $ca))
      | .hooks = (.hooks // {})
-     | .hooks.SessionStart =
-         (if hasscript("SessionStart"; "handoff-inject.sh")
-          then (.hooks.SessionStart // [])
-          else ((.hooks.SessionStart // []) + $frag.hooks.SessionStart) end)
-     | .hooks.UserPromptSubmit =
-         (if hasscript("UserPromptSubmit"; "ctx-watch.sh")
-          then (.hooks.UserPromptSubmit // [])
-          else ((.hooks.UserPromptSubmit // []) + $frag.hooks.UserPromptSubmit) end)
-     | .hooks.Stop =
-         (if hasscript("Stop"; "ctx-notify.sh")
-          then (.hooks.Stop // [])
-          else ((.hooks.Stop // []) + $frag.hooks.Stop) end)
+     | reduce ($frag.hooks | to_entries[]) as $e (.;
+         reduce $e.value[] as $g (.;
+           if has($e.key; ($g.hooks[0] | marker)) then .
+           else .hooks[$e.key] = ((.hooks[$e.key] // []) + [$g]) end))
      | (if (.statusLine == null) then .statusLine = $frag.statusLine else . end))
   ') || die "jq merge failed for settings.json"
 

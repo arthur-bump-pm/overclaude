@@ -409,3 +409,30 @@ if [ -z "${SWAP_HIDE_OTHERS:-}" ]; then
   others=$(other_accounts_lines 2>/dev/null) || others=""
   [ -n "$others" ] && printf "%s\n" "$others"
 fi
+
+# Update badge: a newer overclaude is on PyPI. The check itself runs in the
+# background at most once a day (swap-guard version-check); a render only reads
+# its cache, so the statusline never waits on the network.
+update_line() {
+  local st="$HOME/.claude-swap-backup" cache kit latest checked now lock sg="$HOME/.local/bin/swap-guard"
+  [ -z "${OVERCLAUDE_NO_UPDATE_CHECK:-}" ] && command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/latest-version.json"
+  kit=$(cat "$st/kit-version" 2>/dev/null); [ -n "$kit" ] || return 0
+  now=$(date +%s)
+  checked=$(jq -r '.checkedAt // 0' "$cache" 2>/dev/null)
+  case "$checked" in ''|*[!0-9]*) checked=0 ;; esac
+  if [ $(( now - checked )) -ge 86400 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/version-check.lock"
+    # One background check per 5 minutes at most, however many sessions render.
+    if [ -z "$(find "$lock" -mmin -5 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" version-check >/dev/null 2>&1 & )
+    fi
+  fi
+  latest=$(jq -r '.version // empty' "$cache" 2>/dev/null)
+  [ -n "$latest" ] && [ "$latest" != "$kit" ] || return 0
+  [ "$(printf '%s\n%s\n' "$kit" "$latest" | sort -V | tail -1)" = "$latest" ] || return 0
+  printf '%s⬆ overclaude %s available · overclaude update%s\n' "$DIM" "$latest" "$RESET"
+}
+upd=$(update_line 2>/dev/null) || upd=""
+[ -n "$upd" ] && printf "%s\n" "$upd"
+exit 0

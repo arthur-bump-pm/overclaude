@@ -76,6 +76,32 @@ else
   rm -f .zshrc-snippet.tmp 2>/dev/null
 fi
 
+# ---------------------------------------------------------------------------
+# Release gate: shellcheck + the full suite must pass BEFORE anything is
+# committed, pushed, or released. CI re-checks, but by then a GitHub release
+# already exists — a red CI run would leave a release with no PyPI package.
+# Runs under /bin/bash 3.2, the strictest shell users' `env bash` resolves to.
+# ---------------------------------------------------------------------------
+if [ "$RELEASE" = yes ]; then
+  echo
+  echo "== release gate (tests before anything ships) =="
+  command -v shellcheck >/dev/null 2>&1 || {
+    echo "release: shellcheck not found — brew install shellcheck" >&2; exit 1; }
+  shellcheck -S error bin/swap-guard hooks/*.sh statusline/statusline-command.sh \
+    install.sh uninstall.sh doctor.sh sync.sh scrub.sh tests/*.sh || {
+    echo "release: ABORTED — shellcheck errors (nothing committed or released)." >&2; exit 1; }
+  echo "  [ok] shellcheck"
+  GATE_LOG=$(mktemp "${TMPDIR:-/tmp}/overclaude-gate.XXXXXX")
+  if PATH=/bin:/usr/bin:$PATH /bin/bash tests/run.sh >"$GATE_LOG" 2>&1; then
+    echo "  [ok] test suite ($(awk '/ passed, /{n+=$2} END{print n+0}' "$GATE_LOG") checks, /bin/bash 3.2)"
+    rm -f "$GATE_LOG"
+  else
+    grep -E 'FAIL|failed' "$GATE_LOG" | tail -25 >&2
+    echo "release: ABORTED — tests failed (nothing committed or released). Full log: $GATE_LOG" >&2
+    exit 1
+  fi
+fi
+
 NOTHING_TO_COMMIT=no
 if [ "$CHANGED" -eq 0 ] && git diff --quiet && git diff --cached --quiet \
    && [ -z "$(git status --porcelain 2>/dev/null)" ]; then

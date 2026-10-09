@@ -6,7 +6,7 @@ This repo is the **published** overclaude kit: GitHub (arthur-bump-pm/overclaude
 
 1. **Changes made to the live setup** (`~/.claude/...`, `~/.local/bin/swap-guard`, the `~/.zshrc` block): run `./sync.sh` to pull them into the repo. Never hand-copy — sync.sh has the personal-data scrub gate.
 2. **Test it**: `bash tests/run.sh` (throwaway `$HOME`, safe to run anytime) and `shellcheck -S error` on changed scripts. CI runs both on every push and the publish job is gated on them — add a test with any behavior change.
-3. **Ship it**: `./sync.sh --release` — syncs, patch-bumps `version` in pyproject.toml, commits, pushes, and cuts a GitHub release. The `publish.yml` workflow (PyPI trusted publishing) takes it from there. Use `--dry-run` first when unsure.
+3. **Ship it**: `./sync.sh --release` — runs the release gate first (shellcheck + full suite under `/bin/bash` 3.2; any failure aborts before anything is committed), then syncs, patch-bumps `version` in pyproject.toml, commits, pushes, and cuts a GitHub release. The `publish.yml` workflow (PyPI trusted publishing) takes it from there — it reuses the push-triggered Tests run's verdict for the release commit (re-running the suite only if that run is missing or was cancelled). Use `--dry-run` first when unsure.
 4. **`git push` alone does NOT update PyPI.** Only a release does. If a change matters to other machines, it needs a release.
 
 ## Rules

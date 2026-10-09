@@ -49,7 +49,7 @@ assert_eq "$n" "2" "SWAP_HIDE_OTHERS=1 hides other-account lines"
 # No cache: stdin resets_at (epoch seconds) is the fallback for line 1
 rm -f "$HOME/.claude-swap-backup/cache/usage.json"
 write_seq 2
-out=$(echo "{\"rate_limits\":{\"seven_day\":{\"used_percentage\":40,\"resets_at\":$(( $(date +%s) + 90000 ))}}}" | bash "$SL" | strip_ansi)
+out=$(echo "{\"rate_limits\":{\"seven_day\":{\"used_percentage\":40,\"resets_at\":$(( $(date +%s) + 91800 ))}}}" | bash "$SL" | strip_ansi)
 assert_contains "$(printf '%s\n' "$out" | sed -n 1p)" "(1d 1h)" "stdin resets_at fallback"
 assert_contains "$(printf '%s\n' "$out" | sed -n 3p)" "(no usage data)" "other account without cache"
 

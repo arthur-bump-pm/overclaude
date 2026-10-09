@@ -5,14 +5,72 @@ on:
     types: [published]
   workflow_dispatch: {}
 
+# One publish at a time; never cancel a publish midway.
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
 jobs:
+  # sync.sh pushes the release commit, then cuts the release seconds later, so
+  # the push-triggered Tests run on the SAME commit is already queued. Reuse its
+  # verdict instead of queueing a second macOS job (macOS runner queues were
+  # what cancelled the v1.2.0 publish). This job is a cheap Linux poller.
+  ci-gate:
+    name: Reuse the push run's test result
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verdict: ${{ steps.wait.outputs.verdict }}
+    steps:
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # passed -> build; failed -> stop; missing -> run the suite here instead
+          verdict=missing
+          for i in $(seq 1 80); do   # 80 x 30 s = 40 min
+            run=$(gh run list --workflow test.yml --commit "$SHA" --event push --limit 1 \
+                    --json status,conclusion,url --jq '.[0] // empty') || run=""   # API hiccup: poll again
+            if [ -z "$run" ]; then
+              # No push run registered after ~3 min: this commit was never pushed to main.
+              [ "$i" -ge 6 ] && break
+            else
+              status=$(jq -r .status <<<"$run"); concl=$(jq -r .conclusion <<<"$run")
+              echo "push run for $SHA: $status ${concl:-} $(jq -r .url <<<"$run")"
+              if [ "$status" = completed ]; then
+                case "$concl" in
+                  success) verdict=passed ;;
+                  failure) verdict=failed ;;
+                  *)       verdict=missing ;;   # cancelled / timed out: re-run below
+                esac
+                break
+              fi
+            fi
+            sleep 30
+          done
+          echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
+          if [ "$verdict" = failed ]; then
+            echo "::error::Tests failed on $SHA — not publishing."
+            exit 1
+          fi
+
   test:
+    needs: ci-gate
+    if: needs.ci-gate.outputs.verdict == 'missing'
     uses: ./.github/workflows/test.yml
 
   build:
     name: Build distributions
-    needs: test
+    needs: [ci-gate, test]
+    # test is skipped when the push run already passed; build either way, never on failure.
+    if: ${{ !cancelled() && needs.ci-gate.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,7 +98,11 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
+    # Without this, GitHub skips publish whenever `test` was skipped (the normal path:
+    # the push run already passed) — a skip propagates down the whole needs chain.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi
     permissions:
       id-token: write

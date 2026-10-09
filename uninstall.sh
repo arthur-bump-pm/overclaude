@@ -5,6 +5,9 @@
 
 set -u
 
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+FRAG="$SCRIPT_DIR/settings/settings-fragment.json"
+[ -f "$FRAG" ] || FRAG=/dev/null
 CLAUDE_DIR="$HOME/.claude"
 LOCALBIN="$HOME/.local/bin"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -40,9 +43,12 @@ echo
 # 0. Auto-swap LaunchAgent (opt-in; must go before swap-guard is removed).
 # ---------------------------------------------------------------------------
 AUTO_PLIST="$HOME/Library/LaunchAgents/com.overclaude.autoswap.plist"
-if [ -f "$AUTO_PLIST" ] || launchctl print "gui/$(id -u)/com.overclaude.autoswap" >/dev/null 2>&1; then
+# SWAP_GUARD_NO_LAUNCHCTL (tests): a throwaway $HOME must never touch the real
+# user's launchd domain, which is keyed by uid, not by $HOME.
+LCTL=launchctl; [ -n "${SWAP_GUARD_NO_LAUNCHCTL:-}" ] && LCTL=false
+if [ -f "$AUTO_PLIST" ] || $LCTL print "gui/$(id -u)/com.overclaude.autoswap" >/dev/null 2>&1; then
   echo "-- auto-swap agent --"
-  launchctl bootout "gui/$(id -u)/com.overclaude.autoswap" >/dev/null 2>&1
+  $LCTL bootout "gui/$(id -u)/com.overclaude.autoswap" >/dev/null 2>&1
   rm -f "$AUTO_PLIST" && note_did "removed auto-swap LaunchAgent" || note_warn "could not remove $AUTO_PLIST"
 fi
 
@@ -126,26 +132,27 @@ if [ ! -f "$SETTINGS" ]; then
 elif ! jq empty "$SETTINGS" >/dev/null 2>&1; then
   note_warn "$SETTINGS is not valid JSON; leaving it untouched."
 else
-  CLEANED=$(jq '
-    def dropgroups($evt; $cmd):
-      if (.hooks[$evt]? | type) == "array"
-      then .hooks[$evt] |= map(select((any(.hooks[]?; (.command // "") == $cmd)) | not))
-      else . end;
-    .
+  # Every hook command the kit's fragment registers is removed (exact match),
+  # plus the commands of older kit versions; emptied structures are pruned.
+  CLEANED=$(jq --slurpfile frag "$FRAG" '
+    ([$frag[0].hooks[]?[]?.hooks[]?.command]
+     + ["bash ~/.claude/hooks/handoff-inject.sh", "bash ~/.claude/hooks/ctx-watch.sh",
+        "bash ~/.claude/hooks/ctx-notify.sh", "~/.local/bin/swap-guard budget --hook",
+        "~/.local/bin/swap-guard ratelimit", "~/.local/bin/swap-guard artifact-log"]) as $ours
     | (if (.permissions.allow) != null then
          .permissions.allow |= map(select(. != "Bash(cswap *)" and . != "Bash(swap-guard *)"))
        else . end)
-    | dropgroups("SessionStart";    "bash ~/.claude/hooks/handoff-inject.sh")
-    | dropgroups("UserPromptSubmit"; "bash ~/.claude/hooks/ctx-watch.sh")
-    | dropgroups("Stop";            "bash ~/.claude/hooks/ctx-notify.sh")
+    | (if (.hooks | type) == "object" then
+         .hooks |= with_entries(.value |= (if type == "array"
+           then map(select((any(.hooks[]?; (.command // "") as $c | $ours | index($c))) | not))
+           else . end))
+         | .hooks |= with_entries(select(.value != []))
+       else . end)
     | (if (.statusLine.command // "") == "bash ~/.claude/statusline-command.sh"
          then del(.statusLine) else . end)
     # Prune structures that we emptied (never delete non-empty user content).
     | (if (.permissions.allow?) == [] then del(.permissions.allow) else . end)
     | (if (.permissions?) == {} then del(.permissions) else . end)
-    | (if (.hooks.SessionStart?) == [] then del(.hooks.SessionStart) else . end)
-    | (if (.hooks.UserPromptSubmit?) == [] then del(.hooks.UserPromptSubmit) else . end)
-    | (if (.hooks.Stop?) == [] then del(.hooks.Stop) else . end)
     | (if (.hooks?) == {} then del(.hooks) else . end)
   ' "$SETTINGS") || die "jq cleanup failed for settings.json"
 

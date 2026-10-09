@@ -17,6 +17,13 @@
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
 #                                   $STATE_ROOT/handoff-artifacts/<sid>/ + manifest.json; prints manifest
+#   artifacts find|list [words] [--account X] | link <old> <new> | index
+#                                   the artifact registry (every publish, with its owning account)
+#   artifact-log                    PostToolUse hook (Artifact): append one publish to the registry
+#   ratelimit [--dry-run]           StopFailure hook (rate_limit): instant swap on a usage cap
+#   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
+#   login <slot|alias|email> | --new
+#                                   safe re-login / add that never overwrites the live account's token
 #   schedule-kill <pid>             v1 stub (exit 1)
 set -u
 
@@ -45,6 +52,15 @@ usage: swap-guard <subcommand> [args]
   auto uninstall | auto status    manage the LaunchAgent that runs `auto tick` periodically
   artifacts [--session <id>] [--cwd <dir>]
                                   snapshot this session's artifacts (sources + manifest) for handoff
+  artifacts find|list [words] [--account X]   search every artifact you have published
+  artifacts link <old> <new>      record that <new> is a republished copy of <old>
+  artifacts index                 backfill the registry from past transcripts
+  ratelimit [--dry-run] [--print] StopFailure hook: switch accounts the moment a usage cap hits
+  auto instant on|off|status      enable/disable that instant swap (default: on)
+  budget [--hook]                 usage bands the model should know about (hook: inject on change)
+  login <slot|alias|email>        re-login a dead account WITHOUT killing the live one's token
+  login --new                     add a new account the same safe way
+  version-check [--force]         newest overclaude on PyPI (cached for a day)
   schedule-kill <pid>             phase-2 stub
 EOF
   exit 2
@@ -211,7 +227,7 @@ cmd_preflight() {
   case "$us" in
     *login*|*quarantin*|*expired*|*invalid*|*revoked*)
       verdict="relogin-required"
-      detail="account $number ($email) requires re-login (usageStatus: $us) - recover with /login then: cswap add --slot $number"
+      detail="account $number ($email) requires re-login (usageStatus: $us) - recover with: swap-guard login $number (never a plain /login: it kills the live account's token)"
       ;;
     *)
       if [ "$busy_n" -gt 0 ] 2>/dev/null; then
@@ -669,7 +685,15 @@ cmd_auto() {
     install)   _auto_install "$@"; exit $?;;
     uninstall) _auto_uninstall; exit 0;;
     status)    _auto_status; exit 0;;
-    *) echo "usage: swap-guard auto tick|install|uninstall|status" >&2; exit 1;;
+    instant)
+      case "${1:-status}" in
+        on)  rm -f "$INSTANT_OFF";;
+        off) mkdir -p "$STATE_ROOT" && touch "$INSTANT_OFF";;
+        status) :;;
+        *) echo "usage: swap-guard auto instant on|off|status" >&2; exit 1;;
+      esac
+      jq -cn --argjson on "$([ -f "$INSTANT_OFF" ] && echo false || echo true)" '{instantSwap:$on}'; exit 0;;
+    *) echo "usage: swap-guard auto tick|install|uninstall|status|instant" >&2; exit 1;;
   esac
 }
 
@@ -716,7 +740,7 @@ cmd_artifacts() {
         (.message.content[]? | select(.type == "tool_use" and .name == "Artifact")
          | {k: "use", id, files: (.input.files // null), file_path: (.input.file_path // null)})
       elif .type == "user" and (.toolUseResult | type) == "object"
-           and (.toolUseResult.artifact_id // .toolUseResult.url // null) != null then
+           and ((.toolUseResult.url // "") | test("^https://claude\\.ai/(code/)?artifact/")) then
         {k: "res", id: (.message.content[0].tool_use_id // null), ts: (.timestamp // ""),
          r: (.toolUseResult | {url, artifact_id, title, path, audience, capabilities})}
       else empty end' "$f" 2>/dev/null
@@ -734,6 +758,13 @@ cmd_artifacts() {
     | map(reduce .[] as $e ({}; . + ($e | with_entries(select(.value != null)))))
     | sort_by(.ts)' "$tmp" > "$tmp.recs" 2>/dev/null || printf '[]' > "$tmp.recs"
   rm -f "$tmp"
+  # Per-artifact owner from the registry (the account active when it was published);
+  # null when the artifact predates the registry hook.
+  _art_catalog > "$tmp.cat"
+  jq --slurpfile catf "$tmp.cat" '$catf[0] as $cat | map(. as $r | (first($cat[] | select(.artifact_id == $r.artifact_id)) // {}) as $c
+      | . + {owner: ($c.account // null), ownerAlias: ($c.alias // null)})' "$tmp.recs" > "$tmp.recs2" 2>/dev/null &&
+    mv "$tmp.recs2" "$tmp.recs"
+  rm -f "$tmp.cat"
 
   # Copy sources: page -> <id>/<basename>; supporting files -> <id>/<published path>.
   local n i rec aid src dst saved files_saved pub fsrc
@@ -780,6 +811,568 @@ cmd_artifacts() {
   exit 0
 }
 
+# --- shared: usage windows --------------------------------------------------------
+# jq helpers over cswap's ISO timestamps ("...+00:00" with microseconds).
+JQ_EPOCH='def ep: if type == "string" and test("(Z|\\+00:00)$")
+  then (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | try (fromdateiso8601 | floor) catch null)
+  else null end;'
+
+# --- ratelimit: instant swap when a usage cap stops a session ---------------------
+# Wired as a StopFailure hook (matcher rate_limit, asyncRewake). StopFailure itself
+# is observe-only, so this hook does the switch; exiting 2 under asyncRewake wakes
+# the stopped session with the stderr text so it can carry on.
+# Only usage CAPS swap ("You've reached your Fable limit…"); a transient 429
+# throttle ("Rate limit reached") is logged and ignored.
+RL_COOLDOWN=90      # sessions that hit the cap within this window reuse one swap
+RL_WAKE_GAP=600     # wake a given session at most once per this many seconds (loop guard)
+RL_LAST="$STATE_ROOT/ratelimit-last.json"
+INSTANT_OFF="$STATE_ROOT/instant-swap.off"
+
+_rl_is_cap() {
+  case "$1" in
+    *"reached your"*|*"usage limit"*|*"/usage-credits"*|*"/upgrade"*|*"/extra-usage"*|*"resets "*) return 0;;
+  esac
+  return 1
+}
+
+_rl_model() { # the model a cap message names ("reached your Fable limit" -> Fable), else ""
+  local m lc
+  m="$(printf '%s' "$1" | sed -n "s/.*reached your \([A-Za-z0-9][A-Za-z0-9._-]*\) limit.*/\1/p" | head -n 1)"
+  lc="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"
+  case "$lc" in usage|weekly|session|daily|5-hour|five-hour|hourly) m="";; esac
+  printf '%s\n' "$m"
+}
+
+# _rl_pick <cswap-list-json> <model> <now> — best OTHER account with room, as JSON.
+# Room = every relevant window under 100% (a window whose reset passed counts as 0).
+# Skips disabled accounts, dead tokens and API-key accounts (those bill per use).
+RL_CAPPED="$STATE_ROOT/ratelimit-capped.json"   # [{slot, model, until}] — accounts that hit a cap
+_rl_pick() {
+  local capped; capped="$(jq -c 'if type == "array" then . else [] end' "$RL_CAPPED" 2>/dev/null)" || capped="[]"
+  [ -n "$capped" ] || capped="[]"
+  printf '%s' "$1" | jq -c --arg model "$2" --argjson now "$3" --argjson capped "$capped" "$JQ_EPOCH"'
+    def pct($w): if $w == null then 0
+      elif (($w.resetsAt // "") | ep) as $r | ($r != null and $r <= $now) then 0
+      else ($w.pct // 0) end;
+    (.activeAccountNumber // null) as $act
+    | [.accounts[]?
+       | select(.number != $act and ((.disabled // false) | not))
+       | (.number | tostring) as $n
+       | select([$capped[] | select(.slot == $n and .until > $now
+                 and (.model == "" or (.model | ascii_downcase) == ($model | ascii_downcase)))] | length == 0)
+       | select(.usageStatus as $s | ["ok", "token_expired", "unavailable"] | index($s))
+       | (.usage // .lastGoodUsage) as $u | select($u != null)
+       | {number, email, alias, h5: pct($u.fiveHour), d7: pct($u.sevenDay),
+          m: (if $model == "" then 0
+              else pct([$u.scoped[]? | select((.name | ascii_downcase) == ($model | ascii_downcase))] | first)
+              end)}
+       | .score = ([.h5, .d7, .m] | max) | select(.score < 100)]
+    | sort_by(.score) | first // empty' 2>/dev/null
+}
+
+_label_for() { # _label_for <slot> — alias, else the email's local part, else "account N"
+  local l
+  l="$(jq -r --arg n "$1" '.accounts[$n] | (.alias // ((.email // "") | split("@")[0])) // empty' \
+    "$STATE_ROOT/sequence.json" 2>/dev/null)"
+  printf '%s\n' "${l:-account $1}"
+}
+
+_rl_wake() { # _rl_wake <sid> <text> — print text for Claude and return 0 if this session may be woken
+  local sid="$1" f last now
+  [ -n "$sid" ] || return 1
+  now="$(date +%s)"; f="$CTX_DIR/$sid.rlwake"
+  last="$(cat "$f" 2>/dev/null)"
+  case "$last" in ''|*[!0-9]*) last=0;; esac
+  [ $(( now - last )) -ge "$RL_WAKE_GAP" ] || return 1
+  mkdir -p "$CTX_DIR" 2>/dev/null && printf '%s\n' "$now" > "$f"
+  printf '%s\n' "$2" >&2
+  return 0
+}
+
+cmd_ratelimit() {
+  local notify=1 print=0 dry=0 input sid err msg model now out list pick to from to_l from_l lock i sw rc wake_txt
+  while [ $# -gt 0 ]; do
+    case "$1" in --no-notify) notify=0;; --print) print=1;; --dry-run) dry=1;; esac
+    shift
+  done
+  input="$(cat 2>/dev/null)" || input=""
+  command -v jq >/dev/null 2>&1 || exit 0
+  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-')"
+  err="$(printf '%s' "$input" | jq -r '.error // empty' 2>/dev/null)"
+  msg="$(printf '%s' "$input" | jq -r '[.last_assistant_message // empty, .error_details // empty] | join(" ")' 2>/dev/null)"
+  now="$(date +%s)"
+  _rl_out() { # _rl_out <json> — log; echo only with --print (hook stdout must stay empty)
+    [ "$dry" -eq 1 ] || _auto_log "$1"; [ "$print" -eq 1 ] && printf '%s\n' "$1"; return 0
+  }
+  [ "$err" = rate_limit ] || exit 0
+  if [ -f "$INSTANT_OFF" ]; then
+    _rl_out "$(jq -cn --argjson ts "$now" '{ts:$ts, source:"ratelimit", action:"skipped", reason:"instant-swap-off"}')"; exit 0
+  fi
+  if ! _rl_is_cap "$msg"; then
+    _rl_out "$(jq -cn --argjson ts "$now" --arg m "$(printf '%s' "$msg" | cut -c1-160)" \
+      '{ts:$ts, source:"ratelimit", action:"ignored", reason:"transient-429", message:$m}')"; exit 0
+  fi
+  model="$(_rl_model "$msg")"
+  command -v cswap >/dev/null 2>&1 || {
+    _rl_out "$(jq -cn --argjson ts "$now" '{ts:$ts, source:"ratelimit", action:"error", detail:"cswap not found"}')"; exit 0; }
+
+  # One swap for a burst: several sessions on the capped account fail together.
+  mkdir -p "$STATE_ROOT" "$CTX_DIR" 2>/dev/null
+  lock="$STATE_ROOT/ratelimit.lock"
+  i=0
+  until mkdir "$lock" 2>/dev/null; do
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null; continue; fi
+    i=$((i + 1))
+    if [ "$i" -ge 60 ]; then
+      # Another hook held the lock the whole time (slow cswap): if it switched, wake onto that.
+      local lt; lt="$(jq -r '.ts // 0' "$RL_LAST" 2>/dev/null)"; case "$lt" in ''|*[!0-9]*) lt=0;; esac
+      [ $(( $(date +%s) - lt )) -lt "$RL_COOLDOWN" ] && [ "$dry" -eq 0 ] &&
+        _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was just switched to $(_label_for "$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)"). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying." && exit 2
+      exit 0
+    fi
+    sleep 1
+  done
+  trap 'rmdir "$lock" 2>/dev/null' EXIT
+
+  local last_ts last_to
+  last_ts="$(jq -r '.ts // 0' "$RL_LAST" 2>/dev/null)"; case "$last_ts" in ''|*[!0-9]*) last_ts=0;; esac
+  if [ $(( now - last_ts )) -lt "$RL_COOLDOWN" ]; then
+    last_to="$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)"
+    _rl_out "$(jq -cn --argjson ts "$now" --arg to "$last_to" --arg s "$sid" \
+      '{ts:$ts, source:"ratelimit", action:"reused", to:$to, session:$s}')"
+    rmdir "$lock" 2>/dev/null; trap - EXIT
+    [ "$dry" -eq 1 ] && exit 0
+    _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was already switched to $(_label_for "$last_to") moments ago. Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying." && exit 2
+    exit 0
+  fi
+
+  list="$(cswap list --json 2>/dev/null)"
+  from="$(printf '%s' "$list" | jq -r '.activeAccountNumber // empty' 2>/dev/null)"
+  from_l="$(_label_for "$from")"
+  pick="$(_rl_pick "$list" "$model" "$now")"
+  if [ -z "$pick" ]; then
+    _rl_out "$(jq -cn --argjson ts "$now" --arg m "$model" --arg f "$from" \
+      '{ts:$ts, source:"ratelimit", action:"none", reason:"no-account-with-room", model:$m, from:$f}')"
+    [ "$notify" -eq 1 ] && [ "$dry" -eq 0 ] &&
+      _auto_notify "${model:-Usage} limit on $from_l, and no other account has room (or they need: swap-guard login)."
+    exit 0
+  fi
+  to="$(printf '%s' "$pick" | jq -r '.number')"
+  to_l="$(_label_for "$to")"
+  if [ "$dry" -eq 1 ]; then
+    _rl_out "$(printf '%s' "$pick" | jq -c --argjson ts "$now" --arg m "$model" --arg f "$from" \
+      '{ts:$ts, source:"ratelimit", action:"would-switch", model:$m, from:$f, to:(.number|tostring), score}')"
+    exit 0
+  fi
+  sw="$(cswap switch "$to" --json 2>/dev/null)"; rc=$?
+  # cswap exits 0 for a no-op too ({"switched": false, "reason": "already-active"}),
+  # e.g. when its idea of the active account is stale — that is not a switch.
+  if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$sw" | jq -r 'if .switched == false then "no" else "yes" end' 2>/dev/null)" = no ]; then
+    rc=4; sw="no switch: $(printf '%s' "$sw" | jq -r '.reason // "unknown"' 2>/dev/null)"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    _rl_out "$(jq -cn --argjson ts "$now" --arg to "$to" --argjson rc "$rc" --arg d "$(printf '%s' "$sw" | tail -c 300)" \
+      '{ts:$ts, source:"ratelimit", action:"error", to:$to, rc:$rc, detail:$d}')"
+    [ "$notify" -eq 1 ] && _auto_notify "${model:-Usage} limit on $from_l — switching to $to_l failed (see auto.log)."
+    exit 0
+  fi
+  jq -cn --argjson ts "$now" --arg f "$from" --arg to "$to" --arg m "$model" \
+    '{ts:$ts, from:$f, to:$to, model:$m}' > "$RL_LAST.tmp.$$" && mv "$RL_LAST.tmp.$$" "$RL_LAST"
+  # Remember that <from> is capped on <model> until its window resets (5 h if unknown),
+  # so a later cap elsewhere never hops back onto it on stale cached numbers.
+  printf '%s' "$list" | jq -c --arg f "$from" --arg m "$model" --argjson now "$now" \
+      --argjson prev "$(jq -c 'if type == "array" then . else [] end' "$RL_CAPPED" 2>/dev/null || echo '[]')" "$JQ_EPOCH"'
+    (first(.accounts[]? | select((.number | tostring) == $f)) // {}) as $a | ($a.usage // $a.lastGoodUsage // {}) as $u
+    | (if $m == "" then ([$u.fiveHour, $u.sevenDay] | map(select(. != null and (.pct // 0) >= 100))[0])
+       else ([$u.scoped[]? | select((.name | ascii_downcase) == ($m | ascii_downcase))] | first) end) as $w
+    | ((($w // {}).resetsAt // "") | ep) as $r
+    | [$prev[] | select(.until > $now and (.slot != $f or .model != $m))]
+      + [{slot: $f, model: $m, until: (if $r != null and $r > $now then $r else $now + 18000 end)}]' \
+    > "$RL_CAPPED.tmp.$$" 2>/dev/null && mv "$RL_CAPPED.tmp.$$" "$RL_CAPPED"
+  _rl_out "$(printf '%s' "$pick" | jq -c --argjson ts "$now" --arg m "$model" --arg f "$from" --arg s "$sid" \
+    '{ts:$ts, source:"ratelimit", action:"switched", model:$m, from:$f, to:(.number|tostring), score, session:$s}')"
+  rmdir "$lock" 2>/dev/null; trap - EXIT
+  [ "$notify" -eq 1 ] &&
+    _auto_notify "${model:-Usage} limit on $from_l → switched to $to_l. If the session does not resume by itself, send any message."
+  wake_txt="overclaude: the ${model:-usage} limit stopped this session, so the account was switched from $from_l to $to_l (now $(printf '%s' "$pick" | jq -r '"5h \(.h5)% · week \(.d7)%"')). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying."
+  _rl_wake "$sid" "$wake_txt" && exit 2
+  exit 0
+}
+
+# --- budget: tell the model when usage crosses a band (UserPromptSubmit hook) ------
+# ULTRACODE's budget-pressure rules key off "Fable ~75%+", a number the model cannot
+# see. `budget --hook` injects one line when the active account crosses a band
+# (scoped/Fable 75/90/100, week 85/95/100, 5h 90/100) and one when pressure clears.
+# Silent otherwise — at most one note per band change per session.
+_budget_eval() { # prints: key<US>pressure-message<US>cleared-message
+  local seq="$STATE_ROOT/sequence.json" cache="$STATE_ROOT/cache/usage.json"
+  [ -r "$seq" ] || return 1
+  [ -r "$cache" ] || cache=/dev/null
+  jq -rn --slurpfile s "$seq" --slurpfile c "$cache" --argjson now "$(date +%s)" "$JQ_EPOCH"'
+    def band($p; $ts): ([$ts[] | select($p >= .)] | max) // 0;
+    def eff($w): if $w == null then null
+      elif (($w.resets_at // "") | ep) as $r | ($r != null and $r <= $now) then 0
+      else ($w.pct // null) end;
+    def when($w): (($w.resets_at // "") | ep) as $r
+      | if $r == null or $r <= $now then "" else " (resets \($r | strflocaltime("%a %H:%M")))" end;
+    def p0: if . == null then "n/a" else "\(. | floor)%" end;
+    ($s[0] // {}) as $seq | (($c[0] // {}).accounts // {}) as $acc
+    | (($seq.activeAccountNumber // "") | tostring) as $n
+    | def lbl($k): ($seq.accounts[$k] // {}) | (.alias // ((.email // "?") | split("@")[0]));
+      def wins($k): (($acc[$k].lastGood) // {}) as $g
+        | [{name: "5h", w: $g.five_hour, t: [90, 100]},
+           {name: "week", w: $g.seven_day, t: [85, 95, 100]}]
+          + [$g.scoped[]? | {name, w: ., t: [75, 90, 100]}]
+        | map(. + {p: eff(.w)} | . + {b: (if .p == null then 0 else band(.p; .t) end)});
+    if $n == "" then empty else
+    wins($n) as $ws
+    | ($ws | map(select(.b > 0))) as $hot
+    | ($n + "|" + ($ws | map("\(.name)=\(.b)") | join(","))) as $key
+    | ([$seq.accounts | keys[] | select(. != $n)
+        | select(((($acc[.].lastError // "") == "invalid_grant") or (($acc[.].authDeadStrikes // 0) > 0)) | not)
+        | select((($seq.accounts[.].disabled // false) or (($seq.accounts[.].kind // "") == "api_key")) | not)
+        | select($acc[.].lastGood != null)
+        | . as $k | {k: $k, ws: wins($k)}
+        | [.ws[] | select(.name == "5h" or .name == "week" or (.name as $nm | $hot | any(.name == $nm)))] as $rel
+        | select(($rel | length) > 0 and ($rel | all(.p != null)))
+        | . + {worst: ($rel | map(.p) | max)}]
+       | sort_by(.worst) | first) as $alt
+    | (if ($hot | length) == 0 then "" else
+        "[overclaude budget] Account \(lbl($n)): "
+        + ($hot | map("\(.name) \(.p | p0) used\(when(.w))") | join(", ")) + ". "
+        + (if ($hot | any(.b >= 100 and (.name == "5h" or .name == "week")))
+           then "This account is out of quota until the reset: every call will fail. "
+           elif ($hot | any(.b >= 100))
+           then "\($hot | map(select(.b >= 100) | .name) | join("/")) is exhausted: calls on it will fail, so route agents to opus/sonnet. "
+           else "" end)
+        + "ULTRACODE budget pressure applies: cut fan-out width and batch more per agent first, keep the scarce tier as a read-only reserve for the final synthesis, and keep verifier floors."
+        + (if $alt != null and $alt.worst < 75
+           then " Account \(lbl($alt.k)) has room (\($alt.ws | map(select(.name == "week" or (.name as $nm | $hot | any(.name == $nm))) | "\(.name) \(.p | p0)") | join(", "))): the user can /swap \(lbl($alt.k))."
+           else "" end)
+      end) as $msg
+    | ("[overclaude budget] Budget pressure cleared: account \(lbl($n)) is at "
+       + ($ws | map("\(.name) \(.p | p0)") | join(", ")) + ". Normal ULTRACODE routing applies.") as $clr
+    | [$key, $msg, $clr] | join("\u001f") end' 2>/dev/null
+}
+
+cmd_budget() {
+  local hook=0 input sid line key msg clr f prev
+  for a in "$@"; do [ "$a" = "--hook" ] && hook=1; done
+  command -v jq >/dev/null 2>&1 || exit 0
+  if [ "$hook" -eq 0 ]; then
+    line="$(_budget_eval)" || { printf '%s\n' '{"error":"no-sequence"}'; exit 1; }
+    IFS=$'\x1f' read -r key msg clr <<EOF
+$line
+EOF
+    jq -cn --arg k "$key" --arg m "$msg" '{key:$k, pressure:($m != ""), message:(if $m == "" then null else $m end)}'
+    exit 0
+  fi
+  exec 2>/dev/null
+  input="$(cat)" || input=""
+  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' | tr -cd 'A-Za-z0-9_-')"
+  [ -n "$sid" ] || exit 0
+  line="$(_budget_eval)" || exit 0
+  [ -n "$line" ] || exit 0
+  IFS=$'\x1f' read -r key msg clr <<EOF
+$line
+EOF
+  f="$CTX_DIR/$sid.budget"
+  # Per-session state for sessions long gone is pruned as we go.
+  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' \) -mtime +7 -delete 2>/dev/null
+  prev="$(cat "$f" 2>/dev/null)"
+  [ "$key" = "$prev" ] && exit 0
+  if [ -n "$msg" ]; then
+    printf '%s\n' "$msg"
+  elif [ -n "$prev" ] && printf '%s' "$prev" | grep -q '=[1-9]'; then
+    printf '%s\n' "$clr"
+  fi
+  mkdir -p "$CTX_DIR" && printf '%s\n' "$key" > "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
+  exit 0
+}
+
+# --- artifact registry: one list of every artifact, across sessions and accounts ---
+# A PostToolUse hook on the Artifact tool (`artifact-log`) appends one record per
+# publish: url, title, source path, and the account that owns it (the account active
+# at publish time — artifacts are owned server-side by the publishing account). The
+# latest page source is copied to a durable dir, since sources usually live in a
+# session scratchpad that disappears.
+ART_INDEX_DIR="$STATE_ROOT/artifacts"
+ART_INDEX="$ART_INDEX_DIR/index.jsonl"
+ART_SRC_MAX=5242880   # copy page sources up to 5 MB
+
+_active_account_json() { # {slot, email, alias} of the active account (sequence.json, ~/.claude.json fallback)
+  local slot
+  slot="$(jq -r '(.activeAccountNumber // empty) | tostring' "$STATE_ROOT/sequence.json" 2>/dev/null)"
+  if [ -n "$slot" ]; then
+    jq -c --arg n "$slot" '{slot: $n, email: (.accounts[$n].email // null), alias: (.accounts[$n].alias // null)}' \
+      "$STATE_ROOT/sequence.json" 2>/dev/null && return 0
+  fi
+  jq -c '{slot: null, email: (.oauthAccount.emailAddress // null), alias: null}' "$HOME/.claude.json" 2>/dev/null ||
+    printf '%s\n' '{"slot":null,"email":null,"alias":null}'
+}
+
+cmd_artifact_log() {
+  local input rec aid src dst size
+  exec 2>/dev/null
+  command -v jq >/dev/null 2>&1 || exit 0
+  input="$(cat)" || exit 0
+  rec="$(printf '%s' "$input" | jq -c --argjson acct "$(_active_account_json)" --argjson now "$(date +%s)" '
+    select((.tool_name // "") == "Artifact")
+    | (.tool_input // {}) as $in
+    | select(($in.action // "publish") == "publish" and (($in.asset // false) | not))
+    | (.tool_response // {}) as $r
+    | (if ($r | type) == "object" then $r
+       elif ($r | type) == "string" then
+         {url: ($r | try (capture("(?<u>https://claude\\.ai/(code/)?artifact/[A-Za-z0-9_-]+)").u) catch null)}
+       else {} end) as $o
+    | select(($o.url // "") != "")
+    | {ts: $now, kind: "publish",
+       artifact_id: ($o.artifact_id // ($o.url | sub(".*/artifact/"; ""))),
+       url: $o.url, title: ($o.title // $in.title // null),
+       path: ($in.file_path // $o.path // null),
+       account: $acct.email, slot: $acct.slot, alias: $acct.alias,
+       sessionId: (.session_id // null), cwd: (.cwd // null)}' 2>/dev/null)" || exit 0
+  [ -n "$rec" ] || exit 0
+  mkdir -p "$ART_INDEX_DIR" || exit 0
+  aid="$(printf '%s' "$rec" | jq -r '.artifact_id' | tr -cd 'A-Za-z0-9_-')"
+  src="$(printf '%s' "$rec" | jq -r '.path // empty')"
+  if [ -n "$aid" ] && [ -n "$src" ] && [ -f "$src" ] && [ ! -L "$src" ]; then
+    size="$(stat -f %z "$src" 2>/dev/null || echo 0)"
+    if [ "$size" -le "$ART_SRC_MAX" ] 2>/dev/null; then
+      mkdir -p "$ART_INDEX_DIR/src/$aid" && dst="$ART_INDEX_DIR/src/$aid/${src##*/}" &&
+        cp -p "$src" "$dst" && rec="$(printf '%s' "$rec" | jq -c --arg d "$dst" '. + {saved: $d}')"
+    fi
+  fi
+  printf '%s\n' "$rec" >> "$ART_INDEX"
+  exit 0
+}
+
+# _art_catalog — the index folded to one entry per artifact (latest publish wins),
+# with first-seen time, owner, saved source, and republish links in both directions.
+_art_catalog() {
+  [ -s "$ART_INDEX" ] || { printf '[]\n'; return 0; }
+  # A torn line (hook killed mid-write) must not hide every other record.
+  jq -R 'fromjson? // empty' "$ART_INDEX" 2>/dev/null | jq -sc '
+    (map(select(.kind == "link"))) as $links
+    | map(select(.kind == "publish" and (.artifact_id // "") != ""))
+    | group_by(.artifact_id)
+    | map((sort_by(.ts)) as $g | ($g | first) as $c
+          | ($g | last) + {firstSeen: $c.ts, publishes: ($g | length),
+              account: $c.account, slot: $c.slot, alias: $c.alias, inferred: ($c.inferred // false),
+              lastPublishedBy: (($g | last) | .alias // .account),
+              saved: ([$g[] | .saved // empty] | last // null)})
+    | map(.artifact_id as $id
+          | . + {republishedAs: ([$links[] | select(.from == $id) | .to] | last // null),
+                 republishOf: ([$links[] | select(.to == $id) | .from] | last // null)})
+    | sort_by(-.ts)' 2>/dev/null || printf '[]\n'
+}
+
+_art_id() { printf '%s' "$1" | sed 's|.*/artifact/||; s|[?#].*||' | tr -cd 'A-Za-z0-9_-'; }
+
+_art_find() { # _art_find [--account X] [words...]
+  local acct="" words=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --account) acct="${2:-}"; shift;; *) words+=("$1");; esac
+    shift
+  done
+  _art_catalog | jq -c --arg acct "$acct" --arg q "${words[*]+${words[*]}}" '
+    ($q | ascii_downcase | split(" ") | map(select(. != ""))) as $ws
+    | map(select($acct == "" or ((.alias // "") == $acct) or ((.account // "") == $acct) or ((.slot // "") == $acct)))
+    | map(select(([.title, .url, ((.path // "") | split("/") | last), .artifact_id] | map(. // "") | join(" ") | ascii_downcase) as $h
+                 | all($ws[]; . as $w | $h | contains($w))))
+    | .[:20]
+    | map({artifact_id, url, title, owner: (.alias // .account), ownerEmail: .account,
+           updated: (.ts | todate), firstSeen: (.firstSeen | todate), publishes,
+           lastPublishedBy, saved, inferredOwner: (.inferred // false), republishedAs, republishOf})'
+}
+
+_art_link() { # _art_link <old url|id> <new url|id> — record that <new> republished <old>
+  local from to
+  from="$(_art_id "${1:-}")"; to="$(_art_id "${2:-}")"
+  if [ -z "$from" ] || [ -z "$to" ] || [ "$from" = "$to" ]; then
+    echo "usage: swap-guard artifacts link <old-url|id> <new-url|id>" >&2; return 1
+  fi
+  mkdir -p "$ART_INDEX_DIR" || return 1
+  jq -cn --argjson ts "$(date +%s)" --arg f "$from" --arg t "$to" '{ts:$ts, kind:"link", from:$f, to:$t}' >> "$ART_INDEX"
+  jq -cn --arg f "$from" --arg t "$to" '{linked:{from:$f, to:$t}}'
+}
+
+# _art_backfill — add artifacts published before the hook existed, from every
+# transcript. The owner is inferred from cswap's switch log (the account active at
+# publish time) and marked inferred:true; entries already indexed are skipped.
+_art_backfill() {
+  local tmp sw added f
+  tmp="$(mktemp)"; sw="$(mktemp)"
+  # cswap log lines: "2026-07-19 20:18:40,385 - INFO - Switched from account 2 to 1" (local time)
+  grep -E ' - INFO - (Switched from account [0-9]+ to [0-9]+|Added account [0-9]+)' "$STATE_ROOT/claude-swap.log" 2>/dev/null |
+    while IFS= read -r l; do
+      local d to e
+      d="$(printf '%s' "$l" | cut -c1-19)"
+      to="$(printf '%s' "$l" | sed -nE 's/.*(Switched from account [0-9]+ to |Added account )([0-9]+).*/\2/p')"
+      e="$(date -j -f '%Y-%m-%d %H:%M:%S' "$d" +%s 2>/dev/null)" || continue
+      printf '{"t":%s,"to":"%s"}\n' "$e" "$to"
+    done > "$sw"
+  find "$HOME/.claude/projects" -name '*.jsonl' -type f 2>/dev/null | while IFS= read -r f; do
+    grep -q '"artifact_id"' "$f" 2>/dev/null || continue
+    jq -c '
+      if .type == "assistant" then
+        (.message.content[]? | select(.type == "tool_use" and .name == "Artifact")
+         | {k: "use", id, action: (.input.action // "publish"), asset: (.input.asset // false), file_path: (.input.file_path // null)})
+      elif .type == "user" and (.toolUseResult | type) == "object"
+           and ((.toolUseResult.url // "") | test("^https://claude\\.ai/(code/)?artifact/")) then
+        {k: "res", id: (.message.content[0].tool_use_id // null), ts: (.timestamp // ""),
+         sid: (.sessionId // null), cwd: (.cwd // null),
+         r: (.toolUseResult | {url, artifact_id, title, path})}
+      else empty end' "$f" 2>/dev/null
+  done > "$tmp"
+  mkdir -p "$ART_INDEX_DIR" || { rm -f "$tmp" "$sw"; return 1; }
+  touch "$ART_INDEX"
+  local seqf="$STATE_ROOT/sequence.json"; [ -r "$seqf" ] || seqf=/dev/null
+  added="$(jq -sc --slurpfile sw "$sw" --slurpfile seq "$seqf" --slurpfile have <(jq -R 'fromjson? // empty | select(.kind == "publish") | .artifact_id' "$ART_INDEX" 2>/dev/null) '
+    ($have) as $known | ($sw | sort_by(.t)) as $switches | (($seq[0] // {}).accounts // {}) as $accts
+    | (map(select(.k == "use")) | map({key: (.id // ""), value: .}) | from_entries) as $uses
+    | map(select(.k == "res") | . as $x | ($uses[$x.id // ""] // {}) as $u
+          | select(($u.action // "publish") == "publish" and (($u.asset // false) | not))
+          | ($x.ts | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) as $t
+          | select($t != null)
+          | ([$switches[] | select(.t <= $t)] | last | .to // null) as $slot
+          | {ts: $t, kind: "publish",
+             artifact_id: ($x.r.artifact_id // ($x.r.url | sub(".*/artifact/"; ""))),
+             url: $x.r.url, title: $x.r.title, path: ($x.r.path // $u.file_path),
+             account: (if $slot then $accts[$slot].email else null end), slot: $slot,
+             alias: (if $slot then $accts[$slot].alias else null end),
+             sessionId: $x.sid, cwd: $x.cwd, inferred: true})
+    | map(select(.artifact_id as $id | ($known | index($id)) | not))
+    | unique_by([.artifact_id, .ts]) | .[]' "$tmp" 2>/dev/null)"
+  [ -n "$added" ] && printf '%s\n' "$added" >> "$ART_INDEX"
+  rm -f "$tmp" "$sw"
+  jq -cn --argjson n "$(printf '%s' "$added" | grep -c . || true)" --arg i "$ART_INDEX" '{backfilled:$n, index:$i}'
+}
+
+# --- login: safe re-login / add, without killing the live account's token --------
+# Refresh tokens rotate on every use and are single-use. A plain `/login` while
+# account A is live overwrites A's newest token before cswap has copied it, so A's
+# stored copy is already spent and A dies the first time it is polled as an idle
+# account — re-logging B kills A, and the accounts die in turn. So:
+#   1. `cswap add` (no slot) re-captures the LIVE account's newest token first;
+#   2. the sign-in happens in a throwaway CLAUDE_CONFIG_DIR, whose keychain item is
+#      keyed to that dir, so the live login is never touched;
+#   3. that profile is registered into the slot, `cswap add` re-anchors cswap on the
+#      live account, and the throwaway dir + its keychain item are deleted.
+cmd_login() {
+  local raw="" new=0 slot="" email="" tmp svc st got live a
+  for a in "$@"; do
+    case "$a" in --new) new=1;; -*) :;; *) [ -z "$raw" ] && raw="$a";; esac
+  done
+  command -v cswap >/dev/null 2>&1 || { echo '{"error":"cswap not found"}'; exit 1; }
+  command -v claude >/dev/null 2>&1 || { echo '{"error":"claude not found"}'; exit 1; }
+  if [ "$new" -eq 0 ]; then
+    [ -n "$raw" ] || { echo "usage: swap-guard login <slot|alias|email> | --new" >&2; exit 2; }
+    case "$raw" in
+      *[!0-9]*) slot="$(jq -r --arg a "$raw" '[.accounts | to_entries[]
+                  | select((.value.alias // "") == $a or ((.value.email // "") | ascii_downcase) == ($a | ascii_downcase))
+                  | .key] | if length == 1 then .[0] elif length > 1 then "AMBIGUOUS" else empty end' \
+                  "$STATE_ROOT/sequence.json" 2>/dev/null)"
+                if [ "$slot" = AMBIGUOUS ]; then
+                  jq -cn --arg t "$raw" '{error:"ambiguous-target", target:$t, detail:"several slots match (same email in two orgs?) — pass the slot number"}'
+                  exit 1
+                fi;;
+      *) slot="$raw";;
+    esac
+    email="$(jq -r --arg n "$slot" '.accounts[$n].email // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
+    [ -n "$slot" ] && [ -n "$email" ] || { jq -cn --arg t "$raw" '{error:"unknown-target", target:$t}'; exit 1; }
+  fi
+  local list_json
+  list_json="$(cswap list --json 2>/dev/null)"
+  if ! printf '%s' "$list_json" | jq -e '.accounts' >/dev/null 2>&1; then
+    # Without it we cannot tell which account is live, so we could neither protect
+    # nor re-anchor it. Stop before anything changes.
+    jq -cn '{error:"cswap-list-failed", detail:"cswap list --json failed — run: cswap list (to see why), then retry"}'; exit 1
+  fi
+  live="$(printf '%s' "$list_json" | jq -r '[.accounts[]? | select(.active == true) | .number] | first // empty' 2>/dev/null)"
+  if [ "$new" -eq 0 ] && [ "$slot" = "$live" ]; then
+    # Re-logging the live account itself: the live keychain item IS the target.
+    echo "Account $slot is the live account: sign in with /login inside Claude Code, then run: cswap add" >&2
+    jq -cn --arg s "$slot" '{error:"target-is-live", slot:$s}'; exit 1
+  fi
+  echo "1/4 saving the live account's newest token (cswap add)…" >&2
+  if [ -n "$live" ] && ! cswap add >/dev/null 2>&1; then
+    echo "    could not re-capture the live account; stopping so nothing gets overwritten." >&2
+    jq -cn '{error:"capture-failed"}'; exit 1
+  fi
+  mkdir -p "$STATE_ROOT" || exit 1
+  tmp="$(mktemp -d "$STATE_ROOT/login.XXXXXX")" || exit 1
+  # Claude Code keys the profile's keychain item by sha256 of the NFC-normalized dir
+  # string; macOS paths can arrive decomposed (NFD), so normalize before hashing.
+  svc="Claude Code-credentials-$( { printf '%s' "$tmp" | iconv -f UTF-8-MAC -t UTF-8 2>/dev/null || printf '%s' "$tmp"; } |
+    /usr/bin/shasum -a 256 | cut -c1-8)"
+  trap 'rm -rf "$tmp"; security delete-generic-password -s "$svc" >/dev/null 2>&1' EXIT
+  echo "2/4 a browser window opens — sign in as ${email:-the new account}…" >&2
+  if [ -n "$email" ]; then
+    CLAUDE_CONFIG_DIR="$tmp" claude auth login --email "$email" >&2 || { jq -cn '{error:"login-failed"}'; exit 1; }
+  else
+    CLAUDE_CONFIG_DIR="$tmp" claude auth login >&2 || { jq -cn '{error:"login-failed"}'; exit 1; }
+  fi
+  st="$(CLAUDE_CONFIG_DIR="$tmp" claude auth status 2>/dev/null)"
+  got="$(printf '%s' "$st" | jq -r '.email // .account.email // empty' 2>/dev/null)"
+  if [ -n "$email" ] && [ "$(printf '%s' "$got" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')" ]; then
+    jq -cn --arg want "$email" --arg got "$got" '{error:"wrong-account", expected:$want, signedInAs:$got,
+      detail:"nothing was changed; run it again and sign in with the expected account"}'
+    exit 1
+  fi
+  echo "3/4 registering ${email:-$got} in cswap…" >&2
+  # cswap asks "Overwrite slot N? [y/N]" when the stored org differs; with no terminal
+  # it prints "Cancelled" and still exits 0 — so success is proven by sequence.json
+  # changing, not by the exit code.
+  local before after addout
+  before="$(jq -r '.lastUpdated // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
+  if [ -n "$slot" ]; then
+    addout="$(CLAUDE_CONFIG_DIR="$tmp" cswap add --slot "$slot" </dev/null 2>&1)" || { jq -cn --arg d "$addout" '{error:"cswap-add-failed", detail:$d}'; exit 1; }
+  else
+    addout="$(CLAUDE_CONFIG_DIR="$tmp" cswap add </dev/null 2>&1)" || { jq -cn --arg d "$addout" '{error:"cswap-add-failed", detail:$d}'; exit 1; }
+  fi
+  printf '%s\n' "$addout" >&2
+  after="$(jq -r '.lastUpdated // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)"
+  if printf '%s' "$addout" | grep -qi 'cancelled' || [ "$before" = "$after" ]; then
+    jq -cn --arg s "${slot:-new}" --arg d "$(printf '%s' "$addout" | tail -c 300)" '{error:"cswap-add-cancelled", slot:$s,
+      detail:("cswap did not register the account (it may need to confirm an organization change). Run in a terminal: swap-guard login " + $s + "  — " + $d)}'
+    exit 1
+  fi
+  echo "4/4 re-anchoring cswap on the live account and cleaning up…" >&2
+  local reanchored=true
+  if [ -n "$live" ] && ! cswap add </dev/null >/dev/null 2>&1; then reanchored=false; fi
+  [ -z "$live" ] && reanchored=false
+  jq -cn --arg s "${slot:-new}" --arg e "${email:-$got}" --arg l "${live:-}" --argjson r "$reanchored" \
+    '{loggedIn:$e, slot:$s, live:(if $l == "" then null else $l end), liveUntouched:true, reanchored:$r}
+     + (if $r then {} else {detail:"cswap may now think the re-logged account is active — run: cswap add   (while the live account is logged in)"} end)'
+  exit 0
+}
+
+# --- version-check: is a newer overclaude on PyPI? (at most one request a day) -----
+# The statusline only ever READS the cache this writes, and starts this in the
+# background when the cache is a day old — it never waits on the network. The
+# request is an anonymous GET of PyPI's public JSON; nothing about the user is sent.
+cmd_version_check() {
+  local force=0 cache="$STATE_ROOT/cache/latest-version.json" checked now latest a
+  for a in "$@"; do [ "$a" = "--force" ] && force=1; done
+  now="$(date +%s)"
+  checked="$(jq -r '.checkedAt // 0' "$cache" 2>/dev/null)"; case "$checked" in ''|*[!0-9]*) checked=0;; esac
+  if [ "$force" -eq 0 ] && [ $(( now - checked )) -lt 86400 ]; then
+    jq -c --arg k "$(cat "$STATE_ROOT/kit-version" 2>/dev/null)" '. + {installed: $k, cached: true}' "$cache"; exit 0
+  fi
+  mkdir -p "$STATE_ROOT/cache" || exit 1
+  latest="$(curl -fsS --max-time 5 https://pypi.org/pypi/overclaude/json 2>/dev/null | jq -r '.info.version // empty' 2>/dev/null)"
+  if [ -z "$latest" ]; then
+    # Record the attempt anyway so an offline machine retries tomorrow, not every render.
+    jq -cn --argjson now "$now" --arg v "$(jq -r '.version // empty' "$cache" 2>/dev/null)" \
+      '{version: (if $v == "" then null else $v end), checkedAt: $now, error: "unreachable"}' > "$cache.tmp.$$" &&
+      mv "$cache.tmp.$$" "$cache"
+  else
+    jq -cn --argjson now "$now" --arg v "$latest" '{version: $v, checkedAt: $now}' > "$cache.tmp.$$" && mv "$cache.tmp.$$" "$cache"
+  fi
+  jq -c --arg k "$(cat "$STATE_ROOT/kit-version" 2>/dev/null)" '. + {installed: $k, cached: false}' "$cache"
+}
+
 cmd_schedule_kill() {
   echo "phase-2 feature not enabled" >&2
   exit 1
@@ -799,7 +1392,18 @@ main() {
     history)       cmd_history "$@";;
     restore)       cmd_restore "$@";;
     auto)          cmd_auto "$@";;
-    artifacts)     cmd_artifacts "$@";;
+    artifacts)
+      case "${1:-}" in
+        find|list) shift; _art_find "$@"; exit $?;;
+        link)      shift; _art_link "$@"; exit $?;;
+        index)     _art_backfill; exit $?;;
+        *)         cmd_artifacts "$@";;
+      esac;;
+    artifact-log)  cmd_artifact_log "$@";;
+    ratelimit)     cmd_ratelimit "$@";;
+    budget)        cmd_budget "$@";;
+    login)         cmd_login "$@";;
+    version-check) cmd_version_check "$@";;
     schedule-kill) cmd_schedule_kill "$@";;
     *) usage;;
   esac

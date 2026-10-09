@@ -10,6 +10,8 @@ jobs:
   test:
     name: shellcheck + test suite + payload check (macOS)
     runs-on: macos-latest
+    # A stuck/queued macOS job fails cleanly instead of hanging the publish.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,7 +29,7 @@ jobs:
       - name: shellcheck (errors)
         run: |
           shellcheck -S error bin/swap-guard hooks/*.sh statusline/statusline-command.sh \
-            install.sh uninstall.sh doctor.sh sync.sh tests/*.sh
+            install.sh uninstall.sh doctor.sh sync.sh scrub.sh tests/*.sh
 
       - name: Test suite (macOS /bin/bash 3.2 — what users' `env bash` usually resolves to)
         run: PATH=/bin:/usr/bin:$PATH /bin/bash tests/run.sh
