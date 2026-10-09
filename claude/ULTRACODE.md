@@ -18,6 +18,7 @@ Route each agent by one question: "if this agent is quietly wrong, who catches i
 | Implementation edits (cross-cutting / tricky) | opus | high | judgment |
 | Adversarial verification / refutation | opus | high | precision |
 | Judge panel voters (2–3, distinct lenses) | opus | high | decorrelate |
+| Cross-family second opinion (one panel voter / verifier) | codex via `swap-guard codex-review` | low–high | different model family |
 | Judge chair / tie-break adjudicator | fable | xhigh | terminal |
 | Completeness critics | opus | high | gaps |
 | Final synthesis | fable (omit `model`) | xhigh | unrecoverable |
@@ -46,6 +47,7 @@ Escalation rule (what makes cheap-first safe):
 - Re-run once at a HIGHER tier on: confidence < 0.7, UNSURE, empty/malformed output, or contradiction between parallel agents. The escalation target — and any verifier — must be ≥ the generator's tier: a weaker model cannot validate a stronger one's output.
 - Escalation has a CEILING as well as floors: if more than ~1 in 4 downgraded stages escalates, the routing was miscalibrated — stop and re-author the script instead of silently running everything at the top tier.
 - Panels are 2–3 voters with DISTINCT lenses (correctness / security / does-it-reproduce), never N identical voters — same-model repetition just re-votes the same error. Unanimous → accept; any split → one fable adjudicator; never majority-vote or average a split.
+- Cross-family voter: when a verdict matters and the Codex CLI is installed, make ONE panel voter a Codex run — `swap-guard codex-review --timeout 540 --schema <verdict-schema> --stdin "<claim>" < <artifact>`, run with a 600000 ms Bash timeout (read-only sandbox, ephemeral; a timeout kills the whole Codex run). The schema must be strict JSON Schema (`"additionalProperties": false`, every property in `required`), e.g. `{"type":"object","additionalProperties":false,"required":["verdict","confidence","evidence"],"properties":{"verdict":{"type":"string","enum":["CONFIRM","REFUTE","UNSURE"]},"confidence":{"type":"number"},"evidence":{"type":"string"}}}`; the verdict arrives in `.json`. In a Workflow, the voter is an `agent()` with its own model (e.g. sonnet) that runs this command. A different model family decorrelates errors that same-family voters re-vote. It is one vote with its own lens, never the only gate, and it never replaces the opus floor on Claude-side verifiers. Pass it the artifact plus a bare claim, not the generator's reasoning. Skip it if `swap-guard codex-ready` reports the Codex account exhausted.
 - Still UNSURE at the top tier? Surface it to the user. An honest "unresolved" is correct output; a manufactured verdict is a defect.
 
 Budget pressure (`budget.remaining()` thin, or fable bucket ~75%+ consumed):
@@ -76,7 +78,7 @@ const report = await agent(`Synthesize the final review, ranked by severity`,
 A workflow that never touches fable is a valid — often good — outcome. Omission of `opts.model` should be rare, counted, and load-bearing.
 
 ## 5. Routing lint (pre-flight — fix before dispatch, don't launch and patch)
-1. Every `agent()` call has an explicit `model`, or its omission is a deliberate apex spend. More than 2 omissions in one script = under-routing, not an apex-heavy task.
+1. Every `agent()` call has an explicit `model`, or its omission is a deliberate apex spend. More than 2 omissions in one script = under-routing, not an apex-heavy task. (overclaude's route-guard hook enforces this on Fable sessions: an un-routed Workflow `agent()` or Agent-tool call is denied. Deliberate top tier: in a Workflow, keep model omitted and put fable in the stage's `label`; on the Agent tool, pass `model: "fable"` — a description does not count.)
 2. No wide/parallel stage runs on opus or inherits fable; bulk stages sit at haiku/sonnet regardless of how the rest is routed.
 3. Verifiers, judges, and synthesis are at their floors — even under budget pressure — and no parallel stage contains two writers to the same files.
 4. Every downgraded trusted-adjacent stage has a wired escalation trigger (confidence / UNSURE / contradiction → higher-tier re-run), and an objective check gates before any LLM verifier where one exists.

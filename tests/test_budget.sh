@@ -31,7 +31,11 @@ cache 10 50 93
 assert_contains "$(hook)" "Fable 93%" "next band (90) → a new note"
 
 cache 10 50 100
-assert_contains "$(hook)" "Fable is exhausted" "100% → exhausted wording"
+STUBB="$HOME/stubb"; mkdir -p "$STUBB" "$HOME/.codex/hooks"; printf '#!/bin/bash\nexit 0\n' > "$STUBB/codex"; chmod +x "$STUBB/codex"
+touch "$HOME/.codex/hooks/overcodex-handoff-inject.sh"
+out="$(PATH="$STUBB:$PATH" hook)"
+assert_contains "$out" "Fable is exhausted" "100% → exhausted wording"
+assert_absent "$out" "/handoff codex" "one model bucket exhausted → no Codex suggestion (other models still work)"
 
 cache 10 50 100 "$PAST"
 out="$(hook)"
@@ -39,7 +43,12 @@ assert_contains "$out" "Budget pressure cleared" "reset passed → pressure clea
 assert_eq "$(hook)" "" "after clearing → silent"
 
 cache 100 70 20
-assert_contains "$(hook)" "out of quota until the reset" "5h at 100% → account out of quota"
+out="$(PATH="$STUBB:$PATH" hook)"
+assert_contains "$out" "out of quota until the reset" "5h at 100% → account out of quota"
+assert_absent "$out" "/handoff codex" "another Claude account has room → swap there, not Codex"
+cache 100 70 20 "" '"lastError":"invalid_grant","authDeadStrikes":1,'
+rm -f "$HOME/.claude-swap-backup/ctx/s1.budget"
+assert_contains "$(PATH="$STUBB:$PATH" hook)" "/handoff codex" "whole account out and no Claude account usable → suggest Codex"
 
 cache 10 50 82 "" '"lastError":"invalid_grant","authDeadStrikes":1,'
 rm -f "$HOME/.claude-swap-backup/ctx/s9.budget"

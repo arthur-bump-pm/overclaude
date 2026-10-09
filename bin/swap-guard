@@ -5,7 +5,8 @@
 #   whoami                          own session registry JSON (compact); exit 1 if not in a session
 #   sessions                        JSON array of OTHER live claude sessions (always exit 0)
 #   preflight <target>              switch-safety verdict JSON for slot number / alias / email (always exit 0)
-#   path flag|handoff [--cwd <dir>] print per-cwd state-file path
+#   path flag|handoff|codex-handoff [--cwd <dir>]
+#                                   print per-cwd state-file path (codex-handoff: overcodex's pending file)
 #   flag <json>                     validate + fill + atomic-write relaunch flag; prints path (exit 1 on bad input)
 #   status                          own-session status JSON (always exit 0)
 #   cancel [--cwd <dir>]            remove pending handoff + flag for cwd (always exit 0)
@@ -39,7 +40,8 @@ usage: swap-guard <subcommand> [args]
   whoami                          own session registry JSON (compact)
   sessions                        JSON array of other live claude sessions
   preflight <target>              switch-safety verdict for slot / alias / email
-  path flag|handoff [--cwd <dir>] print per-cwd state-file path
+  path flag|handoff|codex-handoff [--cwd <dir>]
+                                  print per-cwd state-file path (codex-handoff: where overcodex picks it up)
   flag <json>                     write relaunch flag ({"mode":"handoff"|"restart",...}); prints path
   status                          own-session status JSON
   cancel [--cwd <dir>]            remove pending handoff + flag for cwd
@@ -61,6 +63,12 @@ usage: swap-guard <subcommand> [args]
   login <slot|alias|email>        re-login a dead account WITHOUT killing the live one's token
   login --new                     add a new account the same safe way
   version-check [--force]         newest overclaude on PyPI (cached for a day)
+  codex-usage [--refresh]         Codex CLI rate limits per Codex home, from its session logs
+  codex-ready                     can /handoff codex work here? (CLI, overcodex hook, limits)
+  route-guard [on|off|status]     PreToolUse hook (Agent|Workflow): deny un-routed subagents on Fable
+  spend [--days N]                API-price value of your usage (by model/account/session/day) vs plan cost
+  codex-review [--dir D] [--model M] [--effort E] [--schema F] [--timeout S] [--raw] <prompt> [--stdin < input]
+                                  cross-family second opinion: read-only, ephemeral `codex exec`
   schedule-kill <pid>             phase-2 stub
 EOF
   exit 2
@@ -256,6 +264,12 @@ cmd_path() {
   case "$kind" in
     flag)    flag_path_for "$cwd";;
     handoff) pending_path_for "$cwd";;
+    # Where overcodex's SessionStart hook looks for a package in this cwd: same
+    # header and hash convention, under the Codex home a new `codex` will use.
+    codex-handoff)
+      local ch; ch="$(_codex_active_home)"
+      mkdir -p "$ch/overcodex" 2>/dev/null
+      printf '%s/overcodex/handoff-pending-%s.md\n' "$ch" "$(hash_cwd "$cwd")";;
     *) usage;;
   esac
   exit 0
@@ -781,14 +795,13 @@ cmd_artifacts() {
     if [ -n "$aid" ] && [ -n "$src" ] && [ -f "$src" ]; then
       mkdir -p "$out_dir/$aid"
       dst="$out_dir/$aid/${src##*/}"
-      cp -p "$src" "$dst" 2>/dev/null && saved="$(jq -Rn --arg d "$dst" '$d')"
+      _store_copy "$src" "$dst" && saved="$(jq -Rn --arg d "$dst" '$d')"
       while IFS=$'\t' read -r pub fsrc; do
         [ -n "$pub" ] && [ -n "$fsrc" ] || continue
         case "$pub" in /*|*..*) continue;; esac
         case "$fsrc" in /*) :;; *) fsrc="$cwd/$fsrc";; esac
         [ -f "$fsrc" ] || continue
-        mkdir -p "$(dirname "$out_dir/$aid/$pub")" &&
-          cp -p "$fsrc" "$out_dir/$aid/$pub" 2>/dev/null &&
+        _store_copy "$fsrc" "$out_dir/$aid/$pub" &&
           files_saved="$(printf '%s' "$files_saved" | jq -c --arg k "$pub" --arg v "$out_dir/$aid/$pub" '. + {($k): $v}')"
       done < <(printf '%s' "$rec" | jq -r '
         (.files // {}) | if type == "object" then to_entries[]
@@ -869,7 +882,9 @@ _rl_pick() {
               else pct([$u.scoped[]? | select((.name | ascii_downcase) == ($model | ascii_downcase))] | first)
               end)}
        | .score = ([.h5, .d7, .m] | max) | select(.score < 100)]
-    | sort_by(.score) | first // empty' 2>/dev/null
+    # Ties (same binding window) go to the account with more of the capped model left,
+    # then more of its week.
+    | sort_by([.score, .m, .d7, .h5]) | first // empty' 2>/dev/null
 }
 
 _label_for() { # _label_for <slot> — alias, else the email's local part, else "account N"
@@ -956,7 +971,7 @@ cmd_ratelimit() {
     _rl_out "$(jq -cn --argjson ts "$now" --arg m "$model" --arg f "$from" \
       '{ts:($ts|todate), source:"ratelimit", action:"none", reason:"no-account-with-room", model:$m, from:$f}')"
     [ "$notify" -eq 1 ] && [ "$dry" -eq 0 ] &&
-      _auto_notify "${model:-Usage} limit on $from_l, and no other account has room (or they need: swap-guard login)."
+      _auto_notify "${model:-Usage} limit on $from_l, and no other account has room$(command -v codex >/dev/null 2>&1 && echo ' — /handoff codex continues in Codex' || echo ' (or they need: swap-guard login)')."
     exit 0
   fi
   to="$(printf '%s' "$pick" | jq -r '.number')"
@@ -1084,12 +1099,28 @@ EOF
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
+    # Out of quota with no Claude account to swap to: Codex is the next place to work.
+    # Only when the whole account is out (5h/week at 100%, not one model bucket) and no
+    # other Claude account was suggested — and Codex can actually take the work.
+    case "$msg" in *"/swap "*) : ;; *"until the reset"*)
+      [ "$(cmd_codex_ready 2>/dev/null | jq -r '.ready // false' 2>/dev/null)" = true ] &&
+        msg="$msg No Claude account has room; if the user wants to keep going now, /handoff codex continues this work in the Codex CLI.";; esac
     printf '%s\n' "$msg"
   elif [ -n "$prev" ] && printf '%s' "$prev" | grep -q '=[1-9]'; then
     printf '%s\n' "$clr"
   fi
   mkdir -p "$CTX_DIR" && printf '%s\n' "$key" > "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
   exit 0
+}
+
+# --- artifact copies: copy-on-write clones (B3) ----------------------------------
+# On APFS `cp -c` makes a clone: identical content shares disk blocks, but each copy is
+# its own file, so editing one (e.g. before republishing) never changes another. Other
+# filesystems fall back to a plain copy. No size cap here — a handoff snapshot must keep
+# every file the next session needs to republish (artifacts go up to ~16 MB).
+_store_copy() { # _store_copy <src> <dst>
+  mkdir -p "$(dirname "$2")" || return 1
+  cp -c -p "$1" "$2" 2>/dev/null || cp -p "$1" "$2"
 }
 
 # --- artifact registry: one list of every artifact, across sessions and accounts ---
@@ -1100,7 +1131,7 @@ EOF
 # session scratchpad that disappears.
 ART_INDEX_DIR="$STATE_ROOT/artifacts"
 ART_INDEX="$ART_INDEX_DIR/index.jsonl"
-ART_SRC_MAX=5242880   # copy page sources up to 5 MB
+ART_SRC_MAX=16777216  # registry keeps page sources up to 16 MB (the artifact page limit)
 
 _active_account_json() { # {slot, email, alias} of the active account (sequence.json, ~/.claude.json fallback)
   local slot
@@ -1142,7 +1173,7 @@ cmd_artifact_log() {
     size="$(stat -f %z "$src" 2>/dev/null || echo 0)"
     if [ "$size" -le "$ART_SRC_MAX" ] 2>/dev/null; then
       mkdir -p "$ART_INDEX_DIR/src/$aid" && dst="$ART_INDEX_DIR/src/$aid/${src##*/}" &&
-        cp -p "$src" "$dst" && touch "$ART_INDEX_DIR/src/$aid" &&
+        _store_copy "$src" "$dst" && touch "$ART_INDEX_DIR/src/$aid" &&
         rec="$(printf '%s' "$rec" | jq -c --arg d "$dst" '. + {saved: $d}')"
       # Sources of artifacts not published again for 180 days are pruned.
       find "$ART_INDEX_DIR/src" -mindepth 1 -maxdepth 1 -type d -mtime +180 -exec rm -rf {} + 2>/dev/null
@@ -1375,10 +1406,14 @@ cmd_login() {
 # background when the cache is a day old — it never waits on the network. The
 # request is an anonymous GET of PyPI's public JSON; nothing about the user is sent.
 cmd_version_check() {
-  local force=0 cache="$STATE_ROOT/cache/latest-version.json" checked now latest a
+  local force=0 cache="$STATE_ROOT/cache/latest-version.json" checked now latest a k
   for a in "$@"; do [ "$a" = "--force" ] && force=1; done
   now="$(date +%s)"
   checked="$(jq -r '.checkedAt // 0' "$cache" 2>/dev/null)"; case "$checked" in ''|*[!0-9]*) checked=0;; esac
+  # A check from before the last install/upgrade is stale: the release that was just
+  # installed may postdate it.
+  k="$(stat -f %m "$STATE_ROOT/kit-version" 2>/dev/null)"
+  case "$k" in ''|*[!0-9]*) ;; *) [ "$k" -gt "$checked" ] && checked=0;; esac
   if [ "$force" -eq 0 ] && [ $(( now - checked )) -lt 86400 ]; then
     jq -c --arg k "$(cat "$STATE_ROOT/kit-version" 2>/dev/null)" '. + {installed: $k, cached: true}' "$cache"; exit 0
   fi
@@ -1393,6 +1428,526 @@ cmd_version_check() {
     jq -cn --argjson now "$now" --arg v "$latest" '{version: $v, checkedAt: $now}' > "$cache.tmp.$$" && mv "$cache.tmp.$$" "$cache"
   fi
   jq -c --arg k "$(cat "$STATE_ROOT/kit-version" 2>/dev/null)" '. + {installed: $k, cached: false}' "$cache"
+}
+
+# --- codex: the sibling CLI (overcodex) as another place to keep working -----------
+# Codex accounts are separate CODEX_HOMEs: ~/.codex (primary) and, with overcodex's
+# codex-swap, ~/.codex-accounts/<name>; ~/.codex-accounts/.active names the one new
+# `codex` runs use. Codex records its own rate limits in every session log
+# (event_msg/token_count .payload.rate_limits), so usage is read from there — as
+# fresh as that home's last Codex turn.
+CODEX_ACCOUNTS="$HOME/.codex-accounts"
+
+_codex_active_home() { # the CODEX_HOME a new `codex` would use
+  # Resolved from codex-swap's marker exactly as overcodex's codex() wrapper does. An
+  # inherited $CODEX_HOME is ignored: overcodex <0.3 exported it into the shell, so after
+  # a `codex-swap use` it can name the previous account. OVERCLAUDE_CODEX_HOME overrides.
+  local a
+  if [ -n "${OVERCLAUDE_CODEX_HOME:-}" ]; then printf '%s\n' "$OVERCLAUDE_CODEX_HOME"; return 0; fi
+  a="$(head -n 1 "$CODEX_ACCOUNTS/.active" 2>/dev/null | tr -d '[:space:]')"
+  case "$a" in *[!A-Za-z0-9_-]*) a="";; esac
+  if [ -n "$a" ] && [ "$a" != primary ] && [ -d "$CODEX_ACCOUNTS/$a" ]; then
+    printf '%s\n' "$CODEX_ACCOUNTS/$a"
+  else
+    printf '%s\n' "$HOME/.codex"
+  fi
+}
+
+_codex_homes() { # name<TAB>home for every Codex home on this machine
+  [ -d "$HOME/.codex" ] && printf 'primary\t%s\n' "$HOME/.codex"
+  local d
+  for d in "$CODEX_ACCOUNTS"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; printf '%s\t%s\n' "${d##*/}" "$d"
+  done
+}
+
+# _codex_usage_one <name> <home> — JSON for one home's latest rate limits, or nothing.
+_codex_usage_one() {
+  local name="$1" home="$2" f line mt
+  [ -d "$home/sessions" ] || return 0
+  # Newest session log that actually carries rate limits: a just-started session has
+  # none yet, and one that hit the limit early may log rate_limits: null.
+  line=""
+  while IFS= read -r f; do
+    line="$(tail -n 400 "$f" 2>/dev/null | /usr/bin/grep '"rate_limits":{' | tail -n 1)"
+    [ -n "$line" ] && break
+  done <<EOF
+$(find "$home/sessions" -name 'rollout-*.jsonl' -type f -mtime -8 -exec stat -f '%m %N' {} + 2>/dev/null |
+    sort -rn | head -n 20 | cut -d' ' -f2-)
+EOF
+  [ -n "$line" ] || return 0
+  mt="$(stat -f %m "$f" 2>/dev/null || echo 0)"
+  printf '%s' "$line" | jq -c --arg n "$name" --arg h "$home" --argjson mt "$mt" \
+    --arg active "$(_codex_active_home)" '
+    (.payload.rate_limits // .rate_limits // empty) as $rl
+    | def win($w): if $w == null then null
+        else {pct: ($w.used_percent // null), windowMinutes: ($w.window_minutes // null), resetsAt: ($w.resets_at // null),
+              label: (($w.window_minutes // 0) as $m | if $m == 300 then "5h" elif $m == 10080 then "week"
+                      elif $m >= 1440 then "\($m / 1440 | floor)d" elif $m > 0 then "\($m / 60 | floor)h" else "?" end)} end;
+    {name: $n, home: $h, active: ($h == $active), plan: ($rl.plan_type // null), asOf: $mt,
+     limitReached: ($rl.rate_limit_reached_type // null),
+     windows: ([win($rl.primary), win($rl.secondary)] | map(select(. != null)))}' 2>/dev/null
+}
+
+cmd_codex_ready() { # can a Codex session pick work up here? JSON verdict for /handoff codex
+  local home cli=false hook=false limit=null u
+  home="$(_codex_active_home)"
+  command -v codex >/dev/null 2>&1 && cli=true
+  [ -f "$home/hooks/overcodex-handoff-inject.sh" ] && hook=true
+  u="$(_codex_usage_one "x" "$home")"
+  local known=false; [ -n "$u" ] && known=true
+  [ -n "$u" ] && limit="$(printf '%s' "$u" | jq -c --argjson now "$(date +%s)" \
+    '[.windows[] | select((.resetsAt // 0) > $now and (.pct // 0) >= 100)] | if length > 0 then .[0] else null end')"
+  local pend pf; pf="$(cmd_path codex-handoff 2>/dev/null)"; pend=null
+  [ -f "$pf" ] && pend="$(jq -cn --arg p "$pf" --argjson age "$(( $(date +%s) - $(stat -f %m "$pf") ))" '{path:$p, ageSec:$age}')"
+  jq -cn --arg home "$home" --argjson cli "$cli" --argjson hook "$hook" --argjson limit "${limit:-null}" \
+    --argjson known "$known" --argjson pend "$pend" '
+    {home: $home, codexCli: $cli, overcodexHook: $hook, exhausted: $limit, limitsKnown: $known, pending: $pend,
+     ready: ($cli and $hook and $limit == null),
+     detail: (if ($cli | not) then "Codex CLI not installed (npm i -g @openai/codex)"
+              elif ($hook | not) then "overcodex is not installed in this Codex home, so nothing would load the package: pipx install overcodex && overcodex install"
+              elif $limit != null then "this Codex account is at its \($limit.label) limit"
+              else "ok" end)}'
+}
+
+# cmd_codex_review — a cross-family second opinion for ULTRACODE verify stages:
+# `codex exec` in a READ-ONLY sandbox, ephemeral (no session file), on the active
+# Codex account, with a hard timeout. Prompt = args, plus stdin with --stdin (e.g. a
+# diff). Prints JSON {ok, message, json?, ...}; --raw prints only the message.
+cmd_codex_review() {
+  local dir="$PWD" model="" effort="" schema="" timeout=600 raw=0 words=() home out err rc t0 t1 msg stdin_f="" use_stdin=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) dir="${2:-}"; shift;;
+      --model) model="${2:-}"; shift;;
+      --effort) effort="${2:-}"; shift;;
+      --schema) schema="${2:-}"; shift;;
+      --timeout) timeout="${2:-600}"; shift;;
+      --raw) raw=1;;
+      --stdin) use_stdin=1;;
+      *) words+=("$1");;
+    esac
+    shift
+  done
+  case "$timeout" in ''|*[!0-9]*) timeout=600;; esac
+  [ "$timeout" -ge 1 ] || { jq -cn '{ok:false, error:"bad-timeout", detail:"--timeout must be at least 1 second"}'; exit 1; }
+  case "$effort" in ''|none|minimal|low|medium|high|xhigh|max) :;; *) jq -cn --arg e "$effort" '{ok:false, error:"bad-effort", effort:$e}'; exit 1;; esac
+  case "$model" in *[!A-Za-z0-9._:-]*) jq -cn '{ok:false, error:"bad-model"}'; exit 1;; esac
+  command -v codex >/dev/null 2>&1 || { jq -cn '{ok:false, error:"codex-not-installed", detail:"npm i -g @openai/codex"}'; exit 1; }
+  [ -d "$dir" ] || { jq -cn --arg d "$dir" '{ok:false, error:"no-such-dir", dir:$d}'; exit 1; }
+  if [ -n "$schema" ] && [ ! -f "$schema" ]; then jq -cn --arg s "$schema" '{ok:false, error:"no-such-schema", schema:$s}'; exit 1; fi
+  # Only with --stdin: agent and hook shells often hold an open stdin that never
+  # closes, so reading it unasked would hang.
+  if [ "$use_stdin" -eq 1 ]; then stdin_f="$(mktemp)"; cat > "$stdin_f"; [ -s "$stdin_f" ] || { rm -f "$stdin_f"; stdin_f=""; }; fi
+  if [ "${#words[@]}" -eq 0 ] && [ -z "$stdin_f" ]; then
+    echo "usage: swap-guard codex-review [--dir D] [--model M] [--effort E] [--schema F] [--timeout S] [--raw] <prompt> [--stdin < input]" >&2; exit 2
+  fi
+  home="$(_codex_active_home)"
+  out="$(mktemp)"; err="$(mktemp)"
+  local args=(exec -s read-only --ephemeral --skip-git-repo-check --color never -C "$dir" -o "$out")
+  [ -n "$model" ] && args+=(-m "$model")
+  [ -n "$effort" ] && args+=(-c "model_reasoning_effort=\"$effort\"")
+  [ -n "$schema" ] && args+=(--output-schema "$schema")
+  # `--` ends the options: a prompt starting with "-" can never become a Codex flag
+  # (e.g. one that loosens the read-only sandbox). With --stdin and no words, the
+  # prompt is omitted and Codex reads it from stdin.
+  [ "${#words[@]}" -gt 0 ] && args+=(-- "${words[*]}")
+  t0="$(date +%s)"
+  # perl's alarm is the portable timeout on macOS (no coreutils `timeout`).
+  # The subshell keeps bash's "Alarm clock" job notice (on timeout) off the terminal.
+  # Timeout kills the whole process group: the npm `codex` wrapper spawns a native
+  # binary and forwards only TERM/INT/HUP, so killing the wrapper alone would leave
+  # Codex running (and spending quota). exit 142 = timed out.
+  CODEX_HOME="$home" perl -e '
+    my $t = shift; my $pid = fork; exit 127 unless defined $pid;
+    if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid($pid, 0); exit 142 };
+    alarm $t; waitpid($pid, 0); alarm 0;
+    my $st = $?; exit(($st & 127) ? 128 + ($st & 127) : $st >> 8)' "$timeout" codex "${args[@]}" \
+      < "${stdin_f:-/dev/null}" >/dev/null 2>"$err"; rc=$?
+  t1="$(date +%s)"
+  msg="$(cat "$out" 2>/dev/null)"
+  [ -n "$stdin_f" ] && rm -f "$stdin_f"
+  if [ "$raw" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    rm -f "$out" "$err"; [ -n "$msg" ] || exit 1; printf '%s\n' "$msg"; exit 0
+  fi
+  jq -cn --argjson ok "$([ "$rc" -eq 0 ] && [ -n "$msg" ] && echo true || echo false)" --argjson rc "$rc" \
+    --arg msg "$msg" --arg home "$home" --arg model "$model" --argjson secs "$(( t1 - t0 ))" \
+    --arg err "$(tail -c 600 "$err" 2>/dev/null)" --argjson timeout "$timeout" '
+    {ok: $ok, exitCode: $rc, codexHome: $home, model: (if $model == "" then "default" else $model end),
+     durationSec: $secs, message: $msg}
+    + (($msg | try fromjson catch null) as $j | if $j != null then {json: $j} else {} end)
+    + (if $rc == 142 then {error: "timeout", detail: "no answer within \($timeout)s"}
+       elif $rc != 0 then {error: "codex-failed", detail: $err} else {} end)'
+  rm -f "$out" "$err"
+  [ "$rc" -eq 0 ]
+}
+
+cmd_codex_usage() { # [--refresh] — cached for 2 minutes (the statusline reads the cache)
+  local cache="$STATE_ROOT/cache/codex-usage.json" refresh=0 a now m name home out
+  for a in "$@"; do [ "$a" = "--refresh" ] && refresh=1; done
+  command -v jq >/dev/null 2>&1 || { printf '[]\n'; exit 0; }
+  now="$(date +%s)"; m="$(stat -f %m "$cache" 2>/dev/null || echo 0)"
+  if [ "$refresh" -eq 0 ] && [ $(( now - m )) -lt 120 ] && [ -s "$cache" ]; then cat "$cache"; exit 0; fi
+  out="$(_codex_homes | while IFS=$'\t' read -r name home; do _codex_usage_one "$name" "$home"; done | jq -sc '.')"
+  [ -n "$out" ] || out="[]"
+  mkdir -p "$STATE_ROOT/cache" && printf '%s\n' "$out" > "$cache.tmp.$$" && mv "$cache.tmp.$$" "$cache"
+  printf '%s\n' "$out"
+}
+
+# --- route-guard: ULTRACODE rule 1 as a gate (PreToolUse on Agent|Workflow) --------
+# An un-annotated subagent silently inherits the session's model; on Fable that is a
+# spend from the small Fable bucket nobody chose. When the session runs on a Fable/
+# Mythos-tier model (read from the statusline relay — hooks get no model field):
+#   Agent    — no `model`, subagent_type general-purpose/claude/Plan/default → deny.
+#              Forks and agent types whose own definition sets a model are allowed.
+#   Workflow — every agent() call needs `model:`; a call whose text names fable/apex
+#              (e.g. label 'synthesize (fable/xhigh)') is a deliberate inherit.
+# Deny = hookSpecificOutput permissionDecision "deny" with a reason Claude reads and
+# fixes. Off switch: `swap-guard route-guard off` (or OVERCLAUDE_ROUTE_GUARD=off).
+ROUTE_OFF="$STATE_ROOT/route-guard.off"
+
+_route_deny() { # _route_deny <reason>
+  jq -cn --arg r "$1" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
+  exit 0
+}
+
+_agent_def_file() { # _agent_def_file <type> <cwd> — path of a custom agent definition, if any
+  local t="$1" d="${2:-}" f
+  case "$t" in ''|*/*|*..*) return 1;; esac
+  # Project agents may sit in any parent of the cwd (Claude Code walks up to the repo root).
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    [ -f "$d/.claude/agents/$t.md" ] && { printf '%s\n' "$d/.claude/agents/$t.md"; return 0; }
+    d="$(dirname "$d")"
+  done
+  f="$HOME/.claude/agents/$t.md"; [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  return 1
+}
+
+_agent_def_has_model() { # _agent_def_has_model <type> <cwd> — does its definition pin a model?
+  local t="$1" cwd="$2" f
+  case "$t" in ''|*/*|*..*) return 1;; esac
+  f="$(_agent_def_file "$t" "$cwd")" || return 1
+  awk '{ sub(/\r$/, "") } NR == 1 && $0 != "---" { exit 1 } NR > 1 && $0 == "---" { exit 1 }
+       NR > 1 && /^model:[[:space:]]*[^[:space:]]/ && $0 !~ /inherit/ { found = 1; exit 0 }
+       END { exit !found }' "$f"
+}
+
+# _workflow_unrouted — read a JS script on stdin; print each agent(...) call that is
+# not routed (first 100 chars, one per line). Pass 1 builds a same-length copy with
+# comments blanked and string / template / regex-literal CONTENTS masked, so text in
+# prompts can neither create a call nor satisfy the check. A call is routed when its
+# last argument is an object literal with a depth-1 `model` key (also shorthand
+# `{ model }`) whose value is not ''/undefined/null — or whose `label` names
+# fable/apex (a deliberate top-tier stage). Options passed by variable, or with a
+# spread, cannot be seen into and are allowed; so is a call whose parens do not
+# close within 20 KB (parse failure fails open, it never blocks).
+_workflow_unrouted() {
+  perl -e '
+    local $/; my $src = <STDIN>; my $n = length $src;
+    my ($code, $i, $prev) = ("", 0, "");
+    while ($i < $n) {
+      my $c = substr($src, $i, 1); my $d = substr($src, $i + 1, 1);
+      if ($c eq "/" && $d eq "/") { my $e = index($src, "\n", $i); $e = $n if $e < 0; $code .= " " x ($e - $i); $i = $e; next }
+      if ($c eq "/" && $d eq "*") { my $e = index($src, "*/", $i + 2); $e = $e < 0 ? $n : $e + 2;
+        (my $seg = substr($src, $i, $e - $i)) =~ s/[^\n]/ /g; $code .= $seg; $i = $e; next }
+      if ($c eq "\"" || $c eq "\x27" || $c eq "`") {
+        my ($j, $out) = ($i + 1, $c);
+        while ($j < $n) { my $x = substr($src, $j, 1);
+          if ($x eq "\\") { $out .= "xx"; $j += 2; next }
+          last if $x eq $c;
+          $out .= ($x eq "\n" ? "\n" : "x"); $j++ }
+        if ($j < $n) { $out .= $c; $j++ }
+        $code .= $out; $i = $j; $prev = $c; next }
+      if ($c eq "/" && ($prev eq "" || $prev =~ /[(,=:\[!&|?{};]/)) {
+        my ($j, $out, $cls) = ($i + 1, "/", 0);
+        while ($j < $n) { my $x = substr($src, $j, 1);
+          if ($x eq "\\") { $out .= "xx"; $j += 2; next }
+          last if $x eq "\n";
+          if ($cls) { $cls = 0 if $x eq "]" } elsif ($x eq "[") { $cls = 1 } elsif ($x eq "/") { last }
+          $out .= "x"; $j++ }
+        if ($j < $n && substr($src, $j, 1) eq "/") { $out .= "/"; $j++ }
+        $code .= $out; $i = $j; $prev = "/"; next }
+      $code .= $c; $prev = $c unless $c =~ /\s/; $i++;
+    }
+    my @bad;
+    while ($code =~ /(?<![\w.\$])agent\s*\(/g) {
+      my ($start, $p) = ($-[0], $+[0]); my $depth = 1; my @arg = ($p);
+      my $lim = $p + 20000; $lim = $n if $lim > $n;
+      while ($p < $lim && $depth > 0) { my $c = substr($code, $p, 1);
+        if ($c =~ /[(\[{]/) { $depth++ } elsif ($c =~ /[)\]}]/) { $depth-- }
+        elsif ($c eq "," && $depth == 1) { push @arg, $p + 1 }
+        $p++ }
+      next if $depth > 0;
+      my $close = $p - 1;
+      my @ends = (map({ $_ - 1 } @arg[1 .. $#arg]), $close);
+      my @a = map { [$arg[$_], $ends[$_]] } 0 .. $#arg;
+      pop @a if @a > 1 && substr($code, $a[-1][0], $a[-1][1] - $a[-1][0]) =~ /^\s*$/;   # trailing comma
+      my $routed = 0;
+      if (@a >= 2) {
+        my ($s0, $e0) = @{$a[-1]};
+        my $t = substr($code, $s0, $e0 - $s0);
+        (my $lead) = $t =~ /^(\s*)/; my $b = $s0 + length($lead);
+        if (substr($code, $b, 1) ne "{") { $routed = 1 }          # opts by variable or expression
+        else {
+          my ($flat, $dd) = ("", 0);
+          for my $k ($b + 1 .. $e0 - 1) { my $ch = substr($code, $k, 1);
+            if ($ch =~ /[\[{(]/) { $dd++; $flat .= " "; next }
+            if ($ch =~ /[\]})]/) { last if $dd == 0; $dd--; $flat .= " "; next }
+            $flat .= $dd ? " " : $ch }
+          if ($flat =~ /\.\.\./) { $routed = 1 }                   # spread: cannot see inside
+          elsif ($flat =~ /(?:^|[,\s])model\s*(:|,|$)/g) {
+            if ($1 eq ":") { my $v = substr($src, $b + 1 + pos($flat), 40);
+              $routed = ($v =~ /^\s*(\x27\x27|""|``|undefined|null)\s*(,|\}|$)/) ? 0 : 1 }
+            else { $routed = 1 }                                   # shorthand { model }
+          }
+          if (!$routed && $flat =~ /(?:^|[,\s])label\s*:/g) {
+            my $vs = $b + 1 + pos($flat); my $rest = substr($flat, pos($flat));
+            my $len = index($rest, ","); $len = length($rest) if $len < 0;
+            $routed = 1 if substr($src, $vs, $len) =~ /fable|apex/i }
+        }
+      }
+      next if $routed;
+      (my $one = substr($src, $start, $close - $start + 1)) =~ s/\s+/ /g;
+      push @bad, substr($one, 0, 100);
+    }
+    print "$_\n" for @bad;'
+}
+
+cmd_route_guard() {
+  local input tool sid cwd model ti st m bad n script sp
+  case "${1:-}" in
+    on)  rm -f "$ROUTE_OFF"; jq -cn '{routeGuard: true}'; exit 0;;
+    off) mkdir -p "$STATE_ROOT" && touch "$ROUTE_OFF"; jq -cn '{routeGuard: false}'; exit 0;;
+    status) jq -cn --argjson on "$([ -f "$ROUTE_OFF" ] && echo false || echo true)" '{routeGuard: $on}'; exit 0;;
+  esac
+  # Run by hand (a terminal, no hook JSON coming): report status instead of waiting.
+  if [ -t 0 ]; then jq -cn --argjson on "$([ -f "$ROUTE_OFF" ] && echo false || echo true)" '{routeGuard: $on}'; exit 0; fi
+  exec 2>/dev/null
+  command -v jq >/dev/null 2>&1 || exit 0
+  [ "${OVERCLAUDE_ROUTE_GUARD:-}" = off ] && exit 0
+  [ -f "$ROUTE_OFF" ] && exit 0
+  input="$(cat)" || exit 0
+  tool="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
+  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' | tr -cd 'A-Za-z0-9_-')"
+  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+  # The session's model: its last assistant entry in the transcript (authoritative and
+  # follows /model), else the statusline relay. Unknown → never guess, allow.
+  local tp; tp="$(printf '%s' "$input" | jq -r '.transcript_path // empty')"
+  model=""
+  [ -n "$tp" ] && [ -f "$tp" ] && model="$(tail -n 300 "$tp" 2>/dev/null | /usr/bin/grep '"type":"assistant"' | tail -n 1 |
+    jq -r '.message.model // empty' 2>/dev/null)"
+  [ -n "$model" ] || model="$(jq -r '.model // empty' "$CTX_DIR/$sid.json" 2>/dev/null)"
+  # Only the top tier is guarded: inheriting Sonnet/Opus/Haiku is not a hidden Fable spend.
+  case "$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')" in *fable*|*mythos*) :;; *) exit 0;; esac
+  case "$tool" in
+    Agent|Task)
+      m="$(printf '%s' "$input" | jq -r '.tool_input.model // empty')"
+      st="$(printf '%s' "$input" | jq -r '.tool_input.subagent_type // empty')"
+      [ -n "$m" ] && exit 0
+      case "$st" in
+        fork) exit 0;;                              # forks always inherit, by design
+        ''|general-purpose|claude|Plan) :;;         # inherit the session model → guarded
+        *) # A custom agent file without a model inherits too; other built-in types
+           # (Explore, …) carry their own defaults and are left alone.
+           _agent_def_file "$st" "$cwd" >/dev/null || exit 0
+           _agent_def_has_model "$st" "$cwd" && exit 0;;
+      esac
+      _route_deny "ULTRACODE rule 1 (overclaude route-guard): this session runs on $model, so an Agent call without \`model\` silently spends the Fable bucket. Set model explicitly — haiku (scouting, extraction), sonnet (finders, scoped edits), opus (verifiers, tricky edits) — or pass model \"fable\" when the top tier is the deliberate choice." ;;
+    Workflow)
+      script="$(printf '%s' "$input" | jq -r '.tool_input.script // empty')"
+      if [ -z "$script" ]; then
+        sp="$(printf '%s' "$input" | jq -r '.tool_input.scriptPath // empty')"
+        [ -n "$sp" ] && [ -f "$sp" ] && script="$(cat "$sp")"
+      fi
+      [ -n "$script" ] || exit 0   # a saved workflow by name: its author owns the routing
+      bad="$(printf '%s' "$script" | _workflow_unrouted)"
+      [ -n "$bad" ] || exit 0
+      n="$(printf '%s\n' "$bad" | grep -c .)"
+      _route_deny "ULTRACODE rule 1 (overclaude route-guard): this session runs on $model and $n agent() call(s) have no \`model:\` — each would silently spend the Fable bucket. Add model: 'haiku'|'sonnet'|'opus' per the routing table; for a deliberate top-tier stage keep model omitted but put fable in its label (e.g. label: 'synthesize (fable/xhigh)'). Unrouted: $(printf '%s\n' "$bad" | head -n 5 | sed 's/^/• /' | tr '\n' ' ')" ;;
+  esac
+  exit 0
+}
+
+# --- spend: what this usage would have cost at API prices ---------------------------
+# Every assistant entry in a transcript carries message.usage (input, cache writes by
+# TTL, cache reads, output) and message.model. Rows are extracted per transcript into
+# a cache keyed by path and re-extracted only when the file changes (a week of logs
+# is hundreds of MB). Streaming writes repeat one message.id per content block, so
+# rows are de-duplicated by id. Prices: Anthropic API list prices per million tokens,
+# retrieved 2026-10-09 from platform.claude.com/docs/en/about-claude/pricing.
+# Accounts: each row is attributed to the account active at its timestamp (cswap's
+# switch log); plan cost comes from the account's rate-limit tier (Max 20x $200,
+# Max 5x $100, Pro $20 a month), overridable in ~/.claude-swap-backup/plans.json
+# as {"<slot>": <usd-per-month>}.
+SPEND_DIR="$STATE_ROOT/cache/spend"
+SPEND_PRICES_AS_OF="2026-10-09"
+
+_spend_extract() { # _spend_extract <transcript> — TSV rows: id ts model in cw5 cw1h cr out speed session
+  # Line by line, so one torn/partial line (a live session mid-write) is skipped
+  # instead of failing the whole transcript.
+  /usr/bin/grep -h '"output_tokens"' "$1" 2>/dev/null | jq -R -r '
+    (fromjson? // empty)
+    | select(.type == "assistant" and (.message.usage | type) == "object")
+    | .message.usage as $u
+    | (($u.cache_creation // null)) as $cc
+    | [ (.message.id // .requestId // ""),
+        ((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch 0),
+        (.message.model // "unknown"),
+        ($u.input_tokens // 0),
+        (if $cc != null then ($cc.ephemeral_5m_input_tokens // 0) else ($u.cache_creation_input_tokens // 0) end),
+        (if $cc != null then ($cc.ephemeral_1h_input_tokens // 0) else 0 end),
+        ($u.cache_read_input_tokens // 0),
+        ($u.output_tokens // 0),
+        ($u.speed // "standard"),
+        (.sessionId // "") ] | @tsv' 2>/dev/null
+}
+
+_spend_plan_usd() { # _spend_plan_usd <slot> — monthly plan price for that account, or 0
+  local slot="$1" tier v
+  v="$(jq -r --arg s "$slot" '.[$s] | tonumber? // empty' "$STATE_ROOT/plans.json" 2>/dev/null)"
+  [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+  tier="$(cat "$STATE_ROOT"/configs/.claude-config-"$slot"-*.json 2>/dev/null |
+    jq -r '.oauthAccount | (.organizationRateLimitTier // .userRateLimitTier // .organizationType // "")' 2>/dev/null | head -n 1)"
+  case "$tier" in
+    *max_20x*) echo 200;; *max_5x*) echo 100;; *claude_max*) echo 100;; *pro*) echo 20;; *) echo 0;;
+  esac
+}
+
+cmd_spend() {
+  local days=7 a now start f key meta cur rows sw out acct_plans slot n
+  while [ $# -gt 0 ]; do
+    case "$1" in --days) days="${2:-7}"; shift;; --days=*) days="${1#--days=}";; esac
+    shift
+  done
+  case "$days" in ''|*[!0-9]*) days=7;; esac
+  [ "$days" -ge 1 ] || days=1
+  now="$(date +%s)"; start=$(( now - days * 86400 ))
+  mkdir -p "$SPEND_DIR" || exit 1
+  rows="$(mktemp)"; sw="$(mktemp)"
+  # 1. Extract (cached per transcript; re-extract only when size/mtime changed).
+  find "$HOME/.claude/projects" -name '*.jsonl' -type f -mtime "-$((days + 1))" 2>/dev/null | while IFS= read -r f; do
+    key="$(printf '%s' "$f" | /usr/bin/shasum | cut -c1-20)"
+    meta="$(stat -f '%m %z' "$f" 2>/dev/null)"
+    cur="$(cat "$SPEND_DIR/$key.meta" 2>/dev/null)"
+    if [ "$meta" != "$cur" ] || [ ! -f "$SPEND_DIR/$key.tsv" ]; then
+      if _spend_extract "$f" > "$SPEND_DIR/$key.tsv.tmp.$$"; then
+        mv "$SPEND_DIR/$key.tsv.tmp.$$" "$SPEND_DIR/$key.tsv" && printf '%s\n' "$meta" > "$SPEND_DIR/$key.meta"
+      else
+        rm -f "$SPEND_DIR/$key.tsv.tmp.$$"
+      fi
+    fi
+    cat "$SPEND_DIR/$key.tsv" 2>/dev/null
+  done > "$rows"
+  # Drop cache entries for transcripts gone or outside every window we would read.
+  find "$SPEND_DIR" -type f -mtime +35 -delete 2>/dev/null
+  # 2. Account timeline from cswap's switch log (local time), as "epoch slot".
+  # "Added account N: email" (a login) activates N; "Added account N from <source>"
+  # (token/import) does not, so only the colon form counts.
+  grep -E ' - INFO - (Switched from account [0-9]+ to [0-9]+|Added account [0-9]+:)' "$STATE_ROOT/claude-swap.log" 2>/dev/null |
+    while IFS= read -r a; do
+      local d to e
+      d="$(printf '%s' "$a" | cut -c1-19)"
+      to="$(printf '%s' "$a" | sed -nE 's/.*(Switched from account [0-9]+ to |Added account )([0-9]+).*/\2/p')"
+      e="$(date -j -f '%Y-%m-%d %H:%M:%S' "$d" +%s 2>/dev/null)" || continue
+      printf '%s %s\n' "$e" "$to"
+    done | sort -n > "$sw"
+  # 3. Price + aggregate (awk: dedupe by id keeping the largest output, then sum).
+  # macOS awk has no strftime: bucket days as local day numbers, name them in jq.
+  local tzoff; tzoff="$(date +%z | awk '{ s = substr($0, 1, 1) == "-" ? -1 : 1; print s * (substr($0, 2, 2) * 3600 + substr($0, 4, 2) * 60) }')"
+  out="$(sort -t "$(printf '\t')" -k2,2n "$rows" | awk -F '\t' -v start="$start" -v swf="$sw" -v tzoff="${tzoff:-0}" '
+    function price(m, sp, tot,   r) {
+      # returns "in out cw5 cw1h cr" USD per MTok
+      if (m ~ /(fable|mythos)-5-1/)        r = "10 50 12.5 20 0.25"
+      else if (m ~ /(fable|mythos)-5/)     r = "10 50 12.5 20 1.00"
+      else if (m ~ /opus-5-5/)             r = (sp == "fast") ? "8 40 10 16 0.40" : "4 20 5 8 0.20"
+      else if (m ~ /opus-5/)               r = (sp == "fast") ? "10 50 12.5 20 1.00" : "5 25 6.25 10 0.50"
+      else if (m ~ /opus-4-(5|6|7|8)/)     r = (sp == "fast") ? "10 50 12.5 20 1.00" : "5 25 6.25 10 0.50"
+      else if (m ~ /opus-4/)               r = "15 75 18.75 30 1.50"
+      else if (m ~ /sonnet-5-5/)           r = "2 10 2.5 4 0.10"
+      else if (m ~ /sonnet-5/)             r = "2 10 2.5 4 0.20"
+      else if (m ~ /sonnet-4/)             r = "3 15 3.75 6 0.30"
+      else if (m ~ /haiku-5-5/)            r = (tot > 100000) ? "0.50 2.50 0.625 1.00 0.05" : "0.10 0.50 0.125 0.20 0.01"
+      else if (m ~ /haiku-4-5/)            r = "1 5 1.25 2 0.10"
+      else if (m ~ /haiku-3-5|3-5-haiku/)  r = "0.80 4 1 1.6 0.08"
+      else r = ""
+      return r
+    }
+    BEGIN { ns = 0; while ((getline l < swf) > 0) { split(l, p, " "); st[ns] = p[1]; ss[ns] = p[2]; ns++ } }
+    $2 >= start && $1 != "" {
+      id = $1
+      if (!(id in seen) || $8 > o[id]) {
+        if (!(id in seen)) { order[++nid] = id; seen[id] = 1 }
+        if (!(id in ts)) ts[id] = $2    # first-seen time keeps the sorted account sweep valid
+        mdl[id] = $3; i[id] = $4; c5[id] = $5; c1[id] = $6; cr[id] = $7; o[id] = $8; spd[id] = $9; ses[id] = $10
+      }
+    }
+    END {
+      k = 0
+      for (n = 1; n <= nid; n++) {
+        id = order[n]; m = mdl[id]
+        if (m == "<synthetic>") continue
+        r = price(m, spd[id], i[id] + c5[id] + c1[id] + cr[id])
+        if (r == "") { unk[m] += i[id] + o[id]; continue }
+        split(r, pr, " ")
+        usd = (i[id] * pr[1] + o[id] * pr[2] + c5[id] * pr[3] + c1[id] * pr[4] + cr[id] * pr[5]) / 1e6
+        # account active at ts (switch timeline is sorted)
+        while (k < ns && st[k] <= ts[id]) { cura = ss[k]; k++ }
+        a = (cura == "") ? "?" : cura
+        tot += usd; bym[m] += usd; bya[a] += usd; bys[ses[id]] += usd
+        if (m ~ /fable|mythos/) fs[ses[id]] += usd
+        day = int((ts[id] + tzoff) / 86400); byd[day] += usd
+        tin += i[id]; tout += o[id]; tcw += c5[id] + c1[id]; tcr += cr[id]; msgs++
+      }
+      printf "T\t%.4f\t%d\t%d\t%d\t%d\t%d\n", tot, msgs, tin, tout, tcw, tcr
+      for (m in bym) printf "M\t%s\t%.4f\n", m, bym[m]
+      for (a in bya) printf "A\t%s\t%.4f\n", a, bya[a]
+      for (s in bys) printf "S\t%s\t%.4f\t%.4f\n", s, bys[s], fs[s] + 0
+      for (d in byd) printf "D\t%s\t%.4f\n", d, byd[d]
+      for (m in unk) printf "U\t%s\t%d\n", m, unk[m]
+    }')"
+  rm -f "$rows" "$sw"
+  # 4. Plans per account, then JSON.
+  acct_plans="{}"
+  for slot in $(jq -r '.accounts | to_entries[] | select(((.value.disabled // false) or ((.value.kind // "") == "api_key")) | not) | .key' "$STATE_ROOT/sequence.json" 2>/dev/null); do
+    acct_plans="$(printf '%s' "$acct_plans" | jq -c --arg s "$slot" --argjson p "$(_spend_plan_usd "$slot")" \
+      --arg l "$(_label_for "$slot")" '. + {($s): {plan: $p, label: $l}}')"
+  done
+  printf '%s\n' "$out" | jq -R -s -c --argjson days "$days" --argjson start "$start" --argjson now "$now" \
+    --argjson plans "$acct_plans" --arg asof "$SPEND_PRICES_AS_OF" '
+    split("\n") | map(select(. != "") | split("\t")) as $r
+    | ($r | map(select(.[0] == "T")) | first // ["T","0","0","0","0","0","0"]) as $t
+    | ($t[1] | tonumber) as $usd
+    | ($days * 12 / 52 / 7) as $weeksOfMonth
+    | {days: $days, from: ($start | todate), to: ($now | todate), usd: $usd,
+       messages: ($t[2] | tonumber),
+       tokens: {input: ($t[3] | tonumber), output: ($t[4] | tonumber), cacheWrite: ($t[5] | tonumber), cacheRead: ($t[6] | tonumber)},
+       byModel: ($r | map(select(.[0] == "M") | {model: .[1], usd: (.[2] | tonumber)})
+                 | sort_by(-.usd) | map(. + {share: (if $usd > 0 then (.usd / $usd * 100 | floor) else 0 end)})),
+       byAccount: ($r | map(select(.[0] == "A") | .[1] as $s
+                 | ($plans[$s] // {plan: 0, label: (if $s == "?" then "unknown" else "account " + $s end)}) as $p
+                 | {slot: $s, label: $p.label, usd: (.[2] | tonumber),
+                    planUsd: (($p.plan * $weeksOfMonth * 100 | round) / 100)}
+                 | . + {ratio: (if .planUsd > 0 then ((.usd / .planUsd * 10 | round) / 10) else null end)})
+                 | sort_by(-.usd)),
+       byDay: ($r | map(select(.[0] == "D") | {day: ((.[1] | tonumber) * 86400 | todate | .[0:10]), usd: (.[2] | tonumber)}) | sort_by(.day)),
+       topSessions: ($r | map(select(.[0] == "S") | {sessionId: .[1], usd: (.[2] | tonumber),
+                     fableShare: (if (.[2] | tonumber) > 0 then ((.[3] | tonumber) / (.[2] | tonumber) * 100 | floor) else 0 end)})
+                     | sort_by(-.usd) | .[:5]),
+       unpricedModels: ($r | map(select(.[0] == "U") | {model: .[1], tokens: (.[2] | tonumber)})),
+       pricesAsOf: $asof}
+    # What the user pays: the plan of every registered account, idle ones included.
+    | . + {planUsd: (([$plans | to_entries[] | .value.plan] | add // 0) * $weeksOfMonth * 100 | round / 100)}
+    | . + {ratio: (if .planUsd > 0 then ((.usd / .planUsd * 10 | round) / 10) else null end)}' \
+    > "$STATE_ROOT/cache/spend.json.tmp.$$"
+  # Replace the cache only with a real result, so the statusline never loses the last good value.
+  if jq -e '.usd' "$STATE_ROOT/cache/spend.json.tmp.$$" >/dev/null 2>&1; then
+    cat "$STATE_ROOT/cache/spend.json.tmp.$$"
+    mv "$STATE_ROOT/cache/spend.json.tmp.$$" "$STATE_ROOT/cache/spend.json"
+  else
+    rm -f "$STATE_ROOT/cache/spend.json.tmp.$$"; echo '{"error":"spend-failed"}'; return 1
+  fi
 }
 
 cmd_schedule_kill() {
@@ -1426,6 +1981,11 @@ main() {
     budget)        cmd_budget "$@";;
     login)         cmd_login "$@";;
     version-check) cmd_version_check "$@";;
+    codex-usage)   cmd_codex_usage "$@";;
+    codex-ready)   cmd_codex_ready "$@";;
+    codex-review)  cmd_codex_review "$@";;
+    route-guard)   cmd_route_guard "$@";;
+    spend)         cmd_spend "$@";;
     schedule-kill) cmd_schedule_kill "$@";;
     *) usage;;
   esac

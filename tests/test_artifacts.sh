@@ -29,6 +29,20 @@ css=$(printf '%s' "$m" | jq -r '.artifacts[] | select(.artifact_id=="aaa-1") | .
 [ -f "$css" ] && pass || fail "supporting file copied under its published path" "$css"
 assert_eq "$(printf '%s' "$m" | jq -r '.artifacts[] | select(.artifact_id=="gone-2") | .saved')" "null" "missing source → saved null"
 [ -f "$(printf '%s' "$m" | jq -r .manifest)" ] && pass || fail "manifest written"
+# Copies are independent files (clones where APFS allows): editing one never changes another.
+f1=$(printf '%s' "$m" | jq -r '.artifacts[] | select(.artifact_id=="aaa-1") | .saved')
+m2=$("$SG" artifacts --session sid2 --cwd "$CWD" 2>/dev/null)
+cp "$TD/sid1.jsonl" "$TD/sid2.jsonl"; m2=$("$SG" artifacts --session sid2 --cwd "$CWD")
+f2=$(printf '%s' "$m2" | jq -r '.artifacts[] | select(.artifact_id=="aaa-1") | .saved')
+assert_eq "$(stat -f %l "$f1")" "1" "a snapshot file is its own file (no shared hard link)"
+echo "edited by the next session" > "$f2"
+assert_eq "$(cat "$f1")" "<h1>page</h1>" "editing one snapshot leaves the other untouched"
+dd if=/dev/zero of="$HOME/src/page.html" bs=1048576 count=6 2>/dev/null
+m=$("$SG" artifacts --session sid1 --cwd "$CWD")
+assert_eq "$(stat -f %z "$(printf '%s' "$m" | jq -r '.artifacts[] | select(.artifact_id=="aaa-1") | .saved')")" "6291456" "a 6 MB file is still snapshotted (no size cap)"
+echo '<h1>page</h1>' > "$HOME/src/page.html"
+m=$("$SG" artifacts --session sid1 --cwd "$CWD")
+
 # Owner comes from the artifact registry (account active at publish time).
 mkdir -p "$HOME/.claude-swap-backup/artifacts"
 echo '{"ts":1,"kind":"publish","artifact_id":"aaa-1","url":"https://claude.ai/artifact/aaa-1","account":"work@example.com","alias":"work"}' \

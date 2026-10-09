@@ -1,18 +1,18 @@
 ---
 name: handoff
 description: "Context-threshold session handoff: package this session and continue in a fresh one, optionally switching accounts first. The model may invoke this skill ONLY after explicit user consent in the conversation."
-argument-hint: "[account] [now|force] | status | cancel | history | restore [n] [force]"
+argument-hint: "[account] [now|force] | codex | status | cancel | history | restore [n] [force]"
 allowed-tools: Write, Bash(swap-guard *), Bash(cswap *), Bash(date +%s), Bash(wc -c *)
 ---
 
-GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff or /swap ... handoff themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, STOP — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
+GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff, /swap ... handoff or /swap codex themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, STOP — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
 
 # /handoff — continue in a fresh session
 
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `guard` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Rulings:
@@ -21,7 +21,17 @@ Rulings:
 - `force` with no target → proceed, note "no switch requested — force ignored".
 - Target present → `/handoff <target>` ≡ `/swap <target> handoff`: preflight is MANDATORY (the switch flips ALL live sessions). No target → same-account handoff, no preflight needed.
 - `now` present → phase-2 idle-kill variant (Package step 6).
+- `codex` present → hand off to the Codex CLI instead of a Claude session (section below); never combined with a Claude account target.
 - Flag mode vocabulary is exactly `{"mode":"handoff"}` — never "fresh" or other synonyms.
+
+## `/handoff codex` — continue in Codex
+
+For when every Claude account is out (or the user just wants Codex): the package goes where overcodex's Codex SessionStart hook loads it (same header, same 10-minute window). No account switch, no flag.
+
+1. `swap-guard codex-ready` → if `.ready` is false, report `.detail` and stop (missing Codex CLI, overcodex not installed in that Codex home, or that Codex account at its limit).
+2. Package steps 1 and 2b as usual (the artifact snapshot gives Codex local source files to read). Overwrite guard: if `swap-guard codex-ready` reports `.pending` with `ageSec` under 600, warn "a Codex handoff is already pending here (<N> min ago) — proceeding replaces it" and STOP until the user confirms. If `.limitsKnown` is false, say Codex's limits are unknown (no recent Codex session) and continue.
+3. P = `swap-guard path codex-handoff`. Write the package to P with the same header line and template. Add this as the first line of `## Gotchas`: "Continuing in Codex CLI from a Claude Code session: Claude-only tools (Artifact publishing, Workflow, claude.ai connectors, /swap) are not available here. Artifact sources are the local files listed under Artifacts; republish them from Claude later." Keep the same ~8,000-byte budget.
+4. Tell the user: exit this session, then in the SAME directory within 10 minutes run `codex "Continue from the handoff package."` — overcodex injects the package at startup. To come back to Claude later, type `$handoff-claude` in Codex — it writes a package this kit's SessionStart hook loads (overcodex 0.3+).
 
 ## `/handoff status`
 

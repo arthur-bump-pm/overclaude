@@ -87,6 +87,10 @@ STUB_LIST="$(list_of "$(acct 1 work ok 10 90 5)" "$(acct 3 side ok 10 30 5)" "$(
 assert_eq "$(switches)" "switch 3;" "the account with the most room wins"
 
 reset_state
+STUB_LIST="$(list_of "$(acct 1 work ok 30 50 40)" "$(acct 3 side ok 30 50 10)" "$(acct 2 personal ok 40 60 100)")" hit s1 "$CAP"
+assert_eq "$(switches)" "switch 3;" "tie on the binding window → the account with more of the capped model left (A3)"
+
+reset_state
 STUB_SW_RC=1 hit s1 "$CAP"
 assert_eq "$(lastlog .action)" "error" "a failed switch is logged as an error"
 assert_eq "$rc" "0" "a failed switch never wakes the session"

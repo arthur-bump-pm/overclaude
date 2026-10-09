@@ -49,6 +49,9 @@ for pair in $PAIRS; do
   fi
   if cmp -s "$live" "$repo" 2>/dev/null; then
     echo "  [=] unchanged: $repo"
+  elif [ "$DRY_RUN" = yes ]; then
+    echo "  [~] would update: $repo (live differs — run ./install.sh first if the repo is newer)"
+    CHANGED=1
   else
     cp "$live" "$repo" || { echo "sync: ERROR copying $live" >&2; exit 1; }
     echo "  [+] updated:   $repo"
@@ -66,6 +69,10 @@ if grep -qF "$BEGIN_MARKER" "$HOME/.zshrc" 2>/dev/null; then
   if cmp -s .zshrc-snippet.tmp shell/zshrc-snippet.sh; then
     echo "  [=] unchanged: shell/zshrc-snippet.sh"
     rm -f .zshrc-snippet.tmp
+  elif [ "$DRY_RUN" = yes ]; then
+    rm -f .zshrc-snippet.tmp
+    echo "  [~] would update: shell/zshrc-snippet.sh (live differs — run ./install.sh first if the repo is newer)"
+    CHANGED=1
   else
     mv .zshrc-snippet.tmp shell/zshrc-snippet.sh
     echo "  [+] updated:   shell/zshrc-snippet.sh"

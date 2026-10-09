@@ -1,11 +1,11 @@
 ---
 name: swap
-description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, kit health check. Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
-argument-hint: "[account] [handoff|restart|now|force] | add | relogin <account> | auto [on|off|status|instant on|off] [threshold N] [model X] | artifacts [words] [account X] | doctor [fix]"
+description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, model-routing guard, kit health check, continue in the Codex CLI. Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
+argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | auto [on|off|status|instant on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | guard [on|off|status] | doctor [fix]"
 allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(overclaude doctor *), Bash(bash *doctor.sh*)
 ---
 
-GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, doctor). Never invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task. If explicit consent is missing, STOP and ask. A dead account token is ALWAYS fixed with `swap-guard login <N>` (the relogin section) — never a plain `/login`, which kills the live account's token.
+GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, routing guard, continue in Codex, doctor). Never invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task. If explicit consent is missing, STOP and ask. A dead account token is ALWAYS fixed with `swap-guard login <N>` (the relogin section) — never a plain `/login`, which kills the live account's token.
 
 # /swap — Claude account switcher
 
@@ -17,7 +17,7 @@ GATE — read before acting. If this skill was invoked by you (the model) rather
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `guard` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Example: `/swap work handoff` ≡ `/swap handoff work`.
@@ -35,6 +35,9 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap relogin <target>` | revive a dead token without killing the live account's (`swap-guard login <target>`) | browser sign-in |
 | `/swap auto [on\|off\|status] [threshold N] [model X]` | busy-aware auto-switching LaunchAgent (opt-in) | defers proactive switches while sessions are busy |
 | `/swap auto instant [on\|off]` | instant swap the moment a usage cap stops a session (default on) | dead/disabled/API-key accounts never targeted |
+| `/swap codex` | continue this work in the Codex CLI (delegates to `/handoff codex`) | Codex CLI + overcodex installed, Codex account has room |
+| `/swap spend [days N]` | what your usage would cost at API prices, by model / account / day, vs your plans | — |
+| `/swap guard [on\|off\|status]` | the routing guard that blocks un-routed subagents on Fable (default on) | — |
 | `/swap artifacts [words] [account X]` | search every artifact you published, with its owning account | — |
 | `/swap doctor [fix]` | health check of the whole kit, with fixes; `fix` applies the safe ones | — |
 | `/handoff ...` | same-account handoff, `status`, `cancel`, `history`, `restore` — owned by the handoff skill, never duplicated here | — |
@@ -46,6 +49,8 @@ Edge rulings:
 - `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
 - `relogin` takes the target account as its argument; it never switches.
+- `spend` takes an optional `days N` (default 7); `guard` takes `on`/`off`/`status` (alone → `status`). Neither has a target.
+- `codex` present (e.g. `/swap codex`, `/swap codex handoff`) → INVOKE the handoff skill as `/handoff codex` (continue in the Codex CLI); `codex` is never a Claude account target. This takes precedence over the `/swap handoff` (no target) ruling. An account aliased `codex` stays reachable by slot number or email.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
 - Flag mode vocabulary matches the command names exactly: `{"mode":"handoff"}` and `{"mode":"restart","sessionId":...}` — never "fresh"/"resume" or other synonyms.
 
@@ -114,7 +119,15 @@ Why this exists: refresh tokens rotate and are single-use. A plain `/login` whil
 
 1. Tell the user a browser window will open for the NEW account's sign-in. No `/logout` is needed and live sessions are unaffected.
 2. Run `swap-guard login --new` with a 10-minute Bash timeout (same throwaway-profile flow as relogin; registers the next free slot and returns it as `.slot`). Errors as in relogin step 3.
-3. `cswap alias <.slot> <name>` — optional; do not use a reserved word (`add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`).
+3. `cswap alias <.slot> <name>` — optional; do not use a reserved word (any word in the reserved-keywords list above, e.g. `codex`, `spend`, `guard`).
+
+## `/swap spend [days N]`
+
+Run `swap-guard spend --days N` (default 7; the first run reads up to a week of session logs and can take ~30 s, later runs reuse a per-file cache). Render: total `usd` vs `planUsd` with `ratio` ("$1,774 of API-priced usage over 7 days — 19.2× what your plans cost for those days"), then `byModel` (model, $, share %), `byAccount` (label, $, plan $, ratio), `byDay`, and `topSessions` (first 8 chars of sessionId, $, fableShare %). Say once that it is an estimate at API list prices as of `pricesAsOf` (subscriptions are not billed per token), and list `unpricedModels` if any. Plan prices come from each account's tier; the user can override them in `~/.claude-swap-backup/plans.json` as `{"<slot>": <usd-per-month>}`.
+
+## `/swap guard [on|off|status]`
+
+The routing guard is a PreToolUse hook (`swap-guard route-guard`): when the session runs on Fable, an Agent call without `model` (general-purpose/default/Plan, or a custom agent whose definition sets no model) and a Workflow script with un-routed `agent()` calls are denied with a reason, so the top tier is never spent by accident. A deliberate top-tier subagent passes `model: "fable"`; in a Workflow, a step whose label names fable counts as deliberate. Run `swap-guard route-guard on|off|status` (no argument → `status`) and report the JSON. The guard reads the session model from the transcript, so it also works with a custom statusline; agents defined by plugins cannot be inspected and are allowed.
 
 ## `/swap artifacts [words] [account X]`
 

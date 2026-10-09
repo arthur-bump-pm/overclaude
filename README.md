@@ -23,14 +23,24 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
-| **1.4** | 🚧 in progress | Codex as a fallback and a reviewer (`/handoff codex`, Codex limits on the statusline, `swap-guard codex-review`), model-routing guard for subagents, spend report with API-price value of your usage, overcodex fixes; QA audit before release |
-| **1.3.1** | ✅ released 2026-10-09 | QA fixes for 1.3: `/swap` from plain requests (behind a consent gate), artifact links, terminal y/N during re-login, accurate token status in doctor |
+| **1.4.0** | ✅ released 2026-10-09 | Codex as a fallback and a reviewer (`/handoff codex`, Codex limits on the statusline, `swap-guard codex-review`), model-routing guard for subagents, spend report with API-price value of your usage, works with overcodex 0.3 (Codex skills) |
+| 1.3.1 | released 2026-10-09 | QA fixes for 1.3: `/swap` from plain requests (behind a consent gate), artifact links, terminal y/N during re-login, accurate token status in doctor |
 | 1.3.0 | released 2026-10-09 | Instant swap on usage caps, safe re-login, usage notes for the model, artifact registry, `overclaude update`, `doctor --fix`, release gate |
 | 1.2.0 | released 2026-10-09 | Busy-aware auto-swap, `overclaude doctor`, handoff history/restore, handoff size budget, tests + CI |
 | 1.1.0 | released 2026-10-08 | Weekly reset + other accounts on the statusline, artifacts carried through handoffs |
 | 1.0.x | released 2026-07-17/18 | First release: `/swap`, `/handoff`, statusline, ULTRACODE routing, PyPI package |
 
 Install or upgrade: `pipx install overclaude && overclaude install` (upgrade: `overclaude update`, or `pipx upgrade overclaude && overclaude install` from versions before 1.3).
+
+## What's new in 1.4
+
+- **Codex as the next place to work** — `/handoff codex` (or `/swap codex`) writes the handoff where overcodex's Codex hook loads it, so work continues in the Codex CLI when every Claude account is out; typing `$handoff-claude` in Codex (overcodex 0.3) hands it back. The usage note and the instant-swap notification suggest it when no Claude account has room.
+- **Codex limits on the statusline** — `↳ codex 5h 12% · week 18% ↻ …` (every window that Codex account has), read from Codex's own session logs, one line per Codex account. `SWAP_HIDE_CODEX=1` hides them.
+- **Codex as an independent reviewer** — `swap-guard codex-review` runs a read-only, ephemeral `codex exec` with a timeout (optional JSON verdict schema, `--stdin` for a diff). ULTRACODE now recommends one cross-family voter on verdicts that matter.
+- **Routing guard** — on a Fable session, a subagent launched without a model (or a Workflow `agent()` call without one) is blocked with the fix, so the scarce tier is only spent on purpose. `/swap guard off` (or `OVERCLAUDE_ROUTE_GUARD=off`) disables it; the installer says when it turns on.
+- **Spend report** — `/swap spend`: what your usage would cost at API list prices, by model, account, day and session, against what your plans cost; the statusline shows `💵 $1.8k/7d · 19.2× plan` (refreshed in the background every 15 minutes; `SWAP_HIDE_SPEND=1` hides it). The plan cost counts every registered account; plan prices come from each account's tier and can be overridden in `~/.claude-swap-backup/plans.json`.
+- **Smarter instant swap and leaner snapshots** — ties go to the account with more of the capped model left; artifact snapshots are copy-on-write clones on APFS (identical content shares disk space, every copy stays independently editable).
+- **Fixes** — `uninstall` refuses (instead of deleting everything below it) when the `.zshrc` block's end marker was edited or is missing, and keeps a symlinked `.zshrc`/`CLAUDE.md` and its file mode; the update badge re-checks PyPI right after an upgrade instead of showing a day-old "latest". Maintainers: `sync.sh --dry-run` no longer writes live copies into the repo.
 
 ## What's new in 1.3.1
 
@@ -165,6 +175,9 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap auto instant on\|off` | Instant swap the moment a usage cap stops a session (default on) |
 | `/swap artifacts [words]` | Search every artifact you published, with its owning account |
 | `/swap doctor [fix]` *(or `overclaude doctor [--fix]`)* | Health check with fixes; `fix` applies the safe ones |
+| `/swap codex` *(or `/handoff codex`)* | Continue this work in the Codex CLI *(1.4)* |
+| `/swap spend [days N]` | API-price value of your usage vs your plans *(1.4)* |
+| `/swap guard on\|off\|status` | Routing guard for subagents on Fable *(1.4)* |
 | `overclaude update` *(shell)* | Upgrade from PyPI and reinstall the kit |
 | `swap-guard artifacts find <words>` *(shell)* | Search every artifact published from this machine, with its owner |
 | `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |
@@ -254,16 +267,12 @@ A plain `git push` updates git installs only — **PyPI users get changes only v
 
 ## Roadmap
 
-Picked for 1.4, each feasibility-checked against the Claude Code docs, cswap source and Codex CLI:
+1.4 is being built (see Versions). After it:
 
-1. **`/handoff codex`** — when every Claude account is exhausted, write the handoff where overcodex's SessionStart hook picks it up and continue in Codex (and back).
-2. **Codex as an independent reviewer** — a read-only `codex exec` verify stage in ULTRACODE workflows: a different model family catches different mistakes.
-3. **Codex limits on the statusline** — `↳ codex week 18%`, read from Codex's own session logs.
-4. **Enforce model routing** — a PreToolUse hook rejects subagent launches without an explicit model (ULTRACODE rule 1), instead of silently spending the top tier.
-5. **Spend report** — per-model usage per workflow, and what that usage would cost at API prices, to show how much value the subscription is returning.
-6. **Smaller artifact snapshots, model-aware account choice, small overcodex fixes.**
-
-Later: weekly pace forecast on the statusline (cswap 0.26 already computes the projection), titled relaunch after handoff, compaction awareness, per-directory accounts.
+1. **Weekly pace forecast** on the statusline — cswap 0.26 already computes the projection (`expectedPct`, `projectedExhaustionAt`).
+2. **Titled relaunch after handoff** — `claude -n "↪ <goal>" "Continue from the handoff"`.
+3. **Compaction awareness** — re-inject handoff state and artifact links after `/compact`.
+4. **Per-directory accounts** via cswap `map`/`run` (needs every component to honor `CLAUDE_CONFIG_DIR`).
 
 ## License
 

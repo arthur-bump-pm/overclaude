@@ -263,6 +263,13 @@ if ! printf '%s' "$CUR_JSON" | jq -e '[.hooks.StopFailure[]?.hooks[]?.command //
   note_warn "  with the most room (this flips all live sessions). Turn it off: swap-guard auto instant off"
 fi
 
+# New in 1.4: the routing guard can deny tool calls that used to pass — say so once.
+if ! printf '%s' "$CUR_JSON" | jq -e '[.hooks.PreToolUse[]?.hooks[]?.command // ""] | any(contains("swap-guard route-guard"))' >/dev/null 2>&1; then
+  note_warn "Routing guard is ON: on Fable sessions, a subagent launched without a model is blocked"
+  note_warn "  with the fix (pass a model, or model \"fable\" on purpose). Turn it off: swap-guard route-guard off"
+  note_warn "  The statusline also refreshes a 7-day spend estimate in the background (SWAP_HIDE_SPEND=1 hides it)."
+fi
+
 # statusLine notice: we never overwrite an existing one (but stay quiet when
 # the existing one already points at the kit's script).
 CUR_SL=$(printf '%s' "$CUR_JSON" | jq -r '.statusLine.command // ""' 2>/dev/null)

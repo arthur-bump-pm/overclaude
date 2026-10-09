@@ -22,6 +22,12 @@ assert_eq "$(printf '%s' "$out" | jq -r .version)" "1.3.0" "version-check reads 
 assert_eq "$(printf '%s' "$out" | jq -r .installed)" "1.2.0" "and reports the installed kit version"
 "$SG" version-check >/dev/null
 assert_eq "$(calls)" "1" "a second check within a day uses the cache"
+jq --argjson t $(( $(date +%s) - 3600 )) '.checkedAt = $t' "$ST/cache/latest-version.json" > "$HOME/t" && mv "$HOME/t" "$ST/cache/latest-version.json"; touch "$ST/kit-version"
+STUB_LATEST=1.3.1 "$SG" version-check >/dev/null
+assert_eq "$(jq -r .version "$ST/cache/latest-version.json")" "1.3.1" "a check older than the last install is refreshed"
+"$SG" version-check >/dev/null
+assert_eq "$(calls)" "2" "then cached again"
+STUB_LATEST=1.3.0 "$SG" version-check --force >/dev/null
 
 jq '.checkedAt = 1' "$ST/cache/latest-version.json" > "$HOME/t" && mv "$HOME/t" "$ST/cache/latest-version.json"
 STUB_OFFLINE=1 "$SG" version-check >/dev/null

@@ -86,7 +86,7 @@ if [ -f "$CLAUDE_MD" ] && grep -qxF '@ULTRACODE.md' "$CLAUDE_MD"; then
   b=$(backup_file "$CLAUDE_MD")
   # Delete only exact-match lines "@ULTRACODE.md".
   awk '$0 != "@ULTRACODE.md"' "$CLAUDE_MD" >"$CLAUDE_MD.tmp-$EPOCH" \
-    && mv "$CLAUDE_MD.tmp-$EPOCH" "$CLAUDE_MD" \
+    && cat "$CLAUDE_MD.tmp-$EPOCH" >"$CLAUDE_MD" && rm -f "$CLAUDE_MD.tmp-$EPOCH" \
     && note_did "removed @ULTRACODE.md line from $CLAUDE_MD (backup: $b)" \
     || note_warn "could not edit $CLAUDE_MD"
 else
@@ -98,23 +98,35 @@ echo
 # 3. .zshrc — delete the block between the begin/end markers (inclusive).
 # ---------------------------------------------------------------------------
 echo "-- .zshrc --"
-if [ -f "$ZSHRC" ] && grep -qF "$BEGIN_MARKER" "$ZSHRC"; then
+# Refuse unless exactly one begin line and one end line exist, in that order: a
+# missing or edited end marker would otherwise drop everything below the block.
+zshrc_markers_ok() {
+  awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+    { sub(/\r$/, "") }
+    $0 == b { nb++; if (ne > 0) bad = 1 }
+    $0 == e { ne++; if (nb == 0) bad = 1 }
+    END { exit !(nb == 1 && ne == 1 && !bad) }' "$ZSHRC"
+}
+if [ -f "$ZSHRC" ] && grep -qF "$BEGIN_MARKER" "$ZSHRC" && ! zshrc_markers_ok; then
+  note_warn "claude-swap block in $ZSHRC has a missing, edited or duplicated marker line — left untouched; remove it by hand"
+elif [ -f "$ZSHRC" ] && grep -qF "$BEGIN_MARKER" "$ZSHRC"; then
   b=$(backup_file "$ZSHRC")
   # Buffers runs of blank lines so the single separator blank that install.sh
   # adds before the block is consumed with it (keeps install/uninstall cycles
   # byte-idempotent); at most one blank is dropped, user blank lines survive.
   awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
-    $0 == b { drop = 1
+    { line = $0; sub(/\r$/, "", line) }
+    line == b { drop = 1
               if (pending > 0) pending--
               while (pending > 0) { print ""; pending-- } }
     drop != 1 {
       if ($0 == "") { pending++ }
       else { while (pending > 0) { print ""; pending-- }; print }
     }
-    $0 == e { drop = 0 }
+    line == e { drop = 0 }
     END { while (pending > 0) { print ""; pending-- } }
   ' "$ZSHRC" >"$ZSHRC.tmp-$EPOCH" \
-    && mv "$ZSHRC.tmp-$EPOCH" "$ZSHRC" \
+    && cat "$ZSHRC.tmp-$EPOCH" >"$ZSHRC" && rm -f "$ZSHRC.tmp-$EPOCH" \
     && note_did "removed claude-swap block from $ZSHRC (backup: $b)" \
     || note_warn "could not edit $ZSHRC"
   note_warn "Open a new shell for the change to take effect."
@@ -138,7 +150,8 @@ else
     ([$frag[0].hooks[]?[]?.hooks[]?.command]
      + ["bash ~/.claude/hooks/handoff-inject.sh", "bash ~/.claude/hooks/ctx-watch.sh",
         "bash ~/.claude/hooks/ctx-notify.sh", "~/.local/bin/swap-guard budget --hook",
-        "~/.local/bin/swap-guard ratelimit", "~/.local/bin/swap-guard artifact-log"]) as $ours
+        "~/.local/bin/swap-guard ratelimit", "~/.local/bin/swap-guard artifact-log",
+        "~/.local/bin/swap-guard route-guard"]) as $ours
     | (if (.permissions.allow) != null then
          .permissions.allow |= map(select(. != "Bash(cswap *)" and . != "Bash(swap-guard *)"))
        else . end)

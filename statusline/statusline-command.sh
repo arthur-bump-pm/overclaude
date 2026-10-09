@@ -32,30 +32,36 @@ fi
 # so the ctx-watch/ctx-notify hooks can see it (hooks get no context_window data).
 # Zero stdout/stderr, atomic write, never affects rendering. NEVER calls cswap.
 relay_session_id=$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null) || relay_session_id=""
-if [ -n "$relay_session_id" ] && [ -n "$ctx_used" ] && [ "$ctx_used" != "null" ]; then
+# The session's model id rides along: hooks get no model field, and the routing
+# guard needs to know what an un-annotated subagent would inherit.
+relay_model=$(echo "$input" | jq -r '.model.id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9._-') || relay_model=""
+relay_pct=""
+case "$ctx_used" in
+  '' | null) relay_pct="null" ;;                                  # before the first response
+  *[!0-9.]* | *.*.* | .* | *.) relay_pct="" ;;                     # not a plain JSON number: skip
+  *) relay_pct="$ctx_used" ;;
+esac
+# A null pct is still published when the model is known, so the routing guard knows the
+# session model from the first turn (ctx-watch ignores a null pct).
+if [ -n "$relay_session_id" ] && [ -n "$relay_pct" ] && { [ "$relay_pct" != null ] || [ -n "$relay_model" ]; }; then
   case "$relay_session_id" in
     */* | *..*) : ;; # unsafe as a filename: skip
     *)
-      case "$ctx_used" in
-        '' | *[!0-9.]* | *.*.* | .* | *.) : ;; # not a plain JSON number: skip
-        *)
-          relay_dir="$HOME/.claude-swap-backup/ctx"
-          {
-            mkdir -p "$relay_dir" &&
-              printf '{"pct":%s,"ts":%s}' "$ctx_used" "$(date +%s)" \
-                > "$relay_dir/$relay_session_id.json.tmp.$$" &&
-              mv "$relay_dir/$relay_session_id.json.tmp.$$" "$relay_dir/$relay_session_id.json"
-            # Keep the live session's .state mtime fresh too: it is only written on
-            # threshold transitions, so without this it could age past the prune
-            # window while the session is still alive (resetting hysteresis).
-            [ -f "$relay_dir/$relay_session_id.state" ] && touch "$relay_dir/$relay_session_id.state"
-            # Age-based prune: only when the dir grows past 50 entries, and only
-            # files idle >2 days (live relays are rewritten every ~10s, never hit).
-            [ "$(ls "$relay_dir" 2>/dev/null | wc -l)" -gt 50 ] &&
-              find "$relay_dir" \( -name '*.json' -o -name '*.state' \) -mtime +2 -delete
-          } >/dev/null 2>&1 || true
-          ;;
-      esac
+      relay_dir="$HOME/.claude-swap-backup/ctx"
+      {
+        mkdir -p "$relay_dir" &&
+          printf '{"pct":%s,"ts":%s,"model":"%s"}' "$relay_pct" "$(date +%s)" "$relay_model" \
+            > "$relay_dir/$relay_session_id.json.tmp.$$" &&
+          mv "$relay_dir/$relay_session_id.json.tmp.$$" "$relay_dir/$relay_session_id.json"
+        # Keep the live session's .state mtime fresh too: it is only written on
+        # threshold transitions, so without this it could age past the prune
+        # window while the session is still alive (resetting hysteresis).
+        [ -f "$relay_dir/$relay_session_id.state" ] && touch "$relay_dir/$relay_session_id.state"
+        # Age-based prune: only when the dir grows past 50 entries, and only
+        # files idle >2 days (live relays are rewritten every ~10s, never hit).
+        [ "$(ls "$relay_dir" 2>/dev/null | wc -l)" -gt 50 ] &&
+          find "$relay_dir" \( -name '*.json' -o -name '*.state' \) -mtime +2 -delete
+      } >/dev/null 2>&1 || true
       ;;
   esac
 fi
@@ -402,6 +408,28 @@ if [ -n "$usage_age" ] && [ "$usage_age" -gt 600 ]; then
   line2="$line2 ${DIM}(usage $((usage_age / 60))m old)${RESET}"
 fi
 
+# Spend: what the last 7 days of usage would cost at API prices, and how many times
+# the plan price that is. `swap-guard spend` refreshes the cache in the background
+# at most every 15 minutes; a render only reads it. SWAP_HIDE_SPEND=1 hides it.
+spend_segment() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock
+  [ -z "${SWAP_HIDE_SPEND:-}" ] && command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/spend.json"; now=$(date +%s); m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( now - m )) -ge 900 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/spend.lock"
+    if [ -z "$(find "$lock" -mmin -15 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" spend --days 7 >/dev/null 2>&1 & )
+    fi
+  fi
+  [ -s "$cache" ] || return 0
+  jq -r '
+    def money: if . >= 1000 then "$\((. / 100 | round) / 10)k" else "$\(. | round)" end;
+    select((.usd // 0) > 0)
+    | "💵 \(.usd | money)/\(.days)d" + (if .ratio != null then " · \(.ratio)× plan" else "" end)' "$cache" 2>/dev/null
+}
+spend_seg=$(spend_segment 2>/dev/null) || spend_seg=""
+[ -n "$spend_seg" ] && line2="$line2 | ${DIM}${spend_seg}${RESET}"
+
 printf "%s\n" "$line1"
 printf "%s\n" "$line2"
 # SWAP_HIDE_OTHERS=1 hides the other-accounts line(s).
@@ -409,6 +437,48 @@ if [ -z "${SWAP_HIDE_OTHERS:-}" ]; then
   others=$(other_accounts_lines 2>/dev/null) || others=""
   [ -n "$others" ] && printf "%s\n" "$others"
 fi
+
+# Codex lines: the sibling CLI's own limits (overcodex), one per Codex home with a
+# session in the last 8 days. A background `swap-guard codex-usage` refreshes the
+# cache at most every 2 minutes; a render only reads it. SWAP_HIDE_CODEX=1 hides.
+codex_lines() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock rows
+  [ -z "${SWAP_HIDE_CODEX:-}" ] && command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/codex-usage.json"; now=$(date +%s)
+  m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( now - m )) -ge 120 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ] && { [ -d "$HOME/.codex" ] || [ -d "$HOME/.codex-accounts" ]; }; then
+    lock="$st/cache/codex-usage.lock"
+    if [ -z "$(find "$lock" -mmin -1 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" codex-usage --refresh >/dev/null 2>&1 & )
+    fi
+  fi
+  [ -s "$cache" ] || return 0
+  rows=$(jq -r --argjson now "$now" '
+    .[]? | select((.windows | length) > 0)
+    | . as $h
+    | [ (if .name == "primary" then "codex" else "codex:" + .name end),
+        (.windows | map(.label + " " + (if .resetsAt != null and .resetsAt <= $now then "0"
+                                        else ((.pct // 0) | floor | tostring) end) + "%") | join(" · ")),
+        ((.windows as $w | (($w | map(select(.label == "week")) | first) // $w[0])).resetsAt // "" | tostring),
+        (($now - (.asOf // $now)) | tostring),
+        (if .limitReached != null then "1" else "" end) ]
+    | join("\u001f")' "$cache" 2>/dev/null) || return 0
+  [ -n "$rows" ] || return 0
+  local name wins reset age hit seg
+  while IFS=$'\x1f' read -r name wins reset age hit; do
+    [ -n "$name" ] || continue
+    seg="↳ ${BOLD}${name}${RESET} ${wins}"
+    case "$reset" in ''|*[!0-9]*) : ;; *) [ "$reset" -gt "$now" ] &&
+      seg="$seg ↻ $(date -r "$reset" '+%a %b %-d %H:%M') ${DIM}($(fmt_left $(( reset - now ))))${RESET}" ;; esac
+    [ -n "$hit" ] && seg="$seg ${RED}⚠ limit reached${RESET}"
+    case "$age" in ''|*[!0-9]*) : ;; *) [ "$age" -gt 3600 ] && seg="$seg ${DIM}(as of $(fmt_left "$age") ago)${RESET}" ;; esac
+    printf '%s\n' "$seg"
+  done <<EOF
+$rows
+EOF
+}
+cdx=$(codex_lines 2>/dev/null) || cdx=""
+[ -n "$cdx" ] && printf "%s\n" "$cdx"
 
 # Update badge: a newer overclaude is on PyPI. The check itself runs in the
 # background at most once a day (swap-guard version-check); a render only reads

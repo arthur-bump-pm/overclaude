@@ -70,6 +70,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/swap-guard route-guard",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "statusLine": {

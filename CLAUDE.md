@@ -16,3 +16,4 @@ This repo is the **published** overclaude kit: GitHub (arthur-bump-pm/overclaude
 - `vendor/claude-swap/` is unmodified third-party source (MIT, credited in README). Never edit it in place; version bumps follow `vendor/README.md`.
 - For a minor/major version bump (new feature / breaking change), edit `version` in pyproject.toml manually before `./sync.sh --release` (it only auto-bumps the patch level).
 - After releasing, remind the user that other machines update via `pipx upgrade overclaude && overclaude install`.
+- Keep the README `## Versions` table current at every status change: a 🚧 row when work on a version starts (docs-only push to main), ✅ + date in the release commit itself.

@@ -22,6 +22,7 @@ ORIG="$(jq -S . "$S")"
 bash "$REPO/install.sh" > "$HOME/i1.log" 2>&1
 assert_eq "$?" "0" "install exits 0"
 assert_contains "$(cat "$HOME/i1.log")" "Instant swap is ON" "the installer says when it turns instant swap on"
+assert_contains "$(cat "$HOME/i1.log")" "Routing guard is ON" "and when it turns the routing guard on"
 for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "UserPromptSubmit:swap-guard budget --hook" \
             "Stop:ctx-notify.sh" "StopFailure:swap-guard ratelimit" "PostToolUse:swap-guard artifact-log"; do
   ev="${pair%%:*}"; hk="${pair#*:}"
@@ -43,6 +44,22 @@ assert_eq "$?" "0" "uninstall exits 0"
 assert_eq "$(jq -S . "$S")" "$ORIG" "uninstall restores the original settings exactly"
 assert_eq "$([ -e "$HOME/.local/bin/swap-guard" ] && echo present || echo gone)" "gone" "swap-guard removed"
 assert_absent "$(cat "$HOME/.zshrc" 2>/dev/null)" "claude-swap integration (begin)" "zshrc block removed"
+
+# A damaged end marker must never cost the user the rest of their .zshrc; mode + symlink kept.
+mkdir -p "$HOME/dotfiles"; printf 'export EDITOR=vim\n' > "$HOME/dotfiles/zshrc"; chmod 600 "$HOME/dotfiles/zshrc"
+rm -f "$HOME/.zshrc"; ln -s "$HOME/dotfiles/zshrc" "$HOME/.zshrc"
+bash "$REPO/install.sh" >/dev/null 2>&1
+assert_eq "$([ -L "$HOME/.zshrc" ] && echo link)" "link" "install keeps a symlinked .zshrc a symlink"
+sed -i '' 's/^# --- claude-swap integration (end) ---$/& /' "$HOME/dotfiles/zshrc"
+printf 'alias gs="git status"\n' >> "$HOME/dotfiles/zshrc"
+bash "$REPO/uninstall.sh" > "$HOME/u2.log" 2>&1
+assert_contains "$(cat "$HOME/dotfiles/zshrc")" 'alias gs="git status"' "an edited end marker never truncates the user's .zshrc"
+assert_contains "$(cat "$HOME/u2.log")" "left untouched" "and uninstall says it left the block alone"
+sed -i '' 's/^\(# --- claude-swap integration (end) ---\) $/\1/' "$HOME/dotfiles/zshrc"
+bash "$REPO/uninstall.sh" >/dev/null 2>&1
+assert_eq "$(cat "$HOME/dotfiles/zshrc")" "$(printf 'export EDITOR=vim\nalias gs="git status"')" "with the markers intact only the block goes"
+assert_eq "$([ -L "$HOME/.zshrc" ] && echo link)" "link" "uninstall keeps the symlink"
+assert_eq "$(stat -f %Lp "$HOME/dotfiles/zshrc")" "600" "and the file mode"
 
 rm -rf "$HOME"
 finish
