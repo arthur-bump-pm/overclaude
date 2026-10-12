@@ -87,6 +87,8 @@ def main():
     p_doc.add_argument("--fix", action="store_true", help="apply the safe repairs, then check again")
     p_up = sub.add_parser("update", help="upgrade overclaude from PyPI and reinstall the kit")
     p_up.add_argument("--check", action="store_true", help="only report installed vs latest")
+    p_fl = sub.add_parser("fleet", help="your other Macs over Tailscale SSH: add <host> | rm <host> | list | status")
+    p_fl.add_argument("args", nargs=argparse.REMAINDER)
     sub.add_parser("path", help="print the bundled payload directory")
     sub.add_parser("version", help="print the overclaude version")
     args = ap.parse_args()
@@ -99,6 +101,12 @@ def main():
         sys.exit(_run_script("doctor.sh", *(["--fix"] if args.fix else [])))
     if args.cmd == "update":
         sys.exit(_update(args.check))
+    if args.cmd == "fleet":
+        sg = shutil.which("swap-guard") or os.path.join(_payload_dir(), "bin", "swap-guard")
+        rest = args.args or ["status", "--text"]
+        if rest == ["status"]:
+            rest = ["status", "--text"]
+        sys.exit(subprocess.call(["bash", sg, "fleet", *rest]))
     if args.cmd == "path":
         print(_payload_dir())
         return

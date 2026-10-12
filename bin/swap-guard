@@ -17,6 +17,7 @@
 #                                   busy-aware wrapper around `cswap auto --once` (+ opt-in LaunchAgent)
 #   keepalive tick|on|off|status    keep idle accounts' logins alive (LaunchAgent, on by default)
 #   token add|list|rm|run           one-year setup-tokens for headless jobs (keychain; never shown)
+#   fleet add|rm|list|status        other Macs over Tailscale SSH: sessions, accounts, logins
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
 #                                   $STATE_ROOT/handoff-artifacts/<sid>/ + manifest.json; prints manifest
@@ -58,6 +59,8 @@ usage: swap-guard <subcommand> [args]
                                   keep every account's login alive while no session runs (every 2 h)
   token add <account> | list | rm <account> | run <account> -- <cmd...>
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
+  fleet add <host> | rm <host> | list | status [--text]
+                                  your other Macs (Tailscale SSH): sessions, accounts, dead logins, load
   artifacts [--session <id>] [--cwd <dir>]
                                   snapshot this session's artifacts (sources + manifest) for handoff
   artifacts find|list [words] [--account X]   search every artifact you have published
@@ -1133,6 +1136,168 @@ cmd_token() {
     rm)   _token_rm "$@"; exit $?;;
     run)  _token_run "$@"; exit $?;;
     *) echo "usage: swap-guard token add|list|rm|run" >&2; exit 1;;
+  esac
+}
+
+# --- fleet: other Macs over Tailscale --------------------------------------------
+# The hub (this Mac) keeps a list of worker Macs in $STATE_ROOT/fleet.json (host
+# names only — no secrets) and asks each one over SSH (key-based, BatchMode: never
+# a password prompt) for a status snapshot. Logins are never copied: every Mac logs
+# in to its own accounts; usage limits are per account, so the hub's own cswap
+# numbers already cover the whole fleet.
+FLEET_JSON="$STATE_ROOT/fleet.json"
+FLEET_CACHE="$STATE_ROOT/cache/fleet.json"
+
+_fleet_ssh() { # _fleet_ssh <host> <remote command...>
+  local h="$1"; shift
+  ssh -o BatchMode=yes -o ConnectTimeout="${SWAP_FLEET_TIMEOUT:-5}" -o ServerAliveInterval=2 \
+      -o ServerAliveCountMax=2 -o StrictHostKeyChecking=accept-new -- "$h" "$@"
+}
+
+# The snapshot a Mac reports about itself: tab-separated key/value lines, so the
+# remote side needs nothing beyond bash (jq may be missing there).
+_fleet_probe_script() {
+  cat <<'EOF'
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+printf 'host\t%s\n' "$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+printf 'kit\t%s\n' "$(cat "$HOME/.claude-swap-backup/kit-version" 2>/dev/null)"
+printf 'claude\t%s\n' "$(claude --version 2>/dev/null | awk '{print $1}')"
+printf 'swapguard\t%s\n' "$(command -v swap-guard >/dev/null 2>&1 && echo yes || echo no)"
+printf 'sessions\t%s\n' "$(swap-guard sessions 2>/dev/null | tr -d '\n')"
+printf 'accounts\t%s\n' "$(cswap list --json 2>/dev/null | tr -d '\n')"
+printf 'keepalive\t%s\n' "$(swap-guard keepalive status 2>/dev/null | tr -d '\n')"
+printf 'load\t%s\n' "$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
+printf 'memgb\t%s\n' "$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
+printf 'cpus\t%s\n' "$(sysctl -n hw.ncpu 2>/dev/null)"
+EOF
+}
+
+# _fleet_snapshot_json <name> <probe-output> — one Mac's row as JSON.
+_fleet_snapshot_json() {
+  local name="$1" raw="$2" k v
+  local host="" kit="" cl="" sgp="" ses="[]" acc="{}" ka="{}" load="" mem="" cpus=""
+  while IFS="$(printf '\t')" read -r k v; do
+    case "$k" in
+      host) host="$v";; kit) kit="$v";; claude) cl="$v";; swapguard) sgp="$v";;
+      sessions) printf '%s' "$v" | jq -e 'type == "array"' >/dev/null 2>&1 && ses="$v";;
+      accounts) printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1 && acc="$v";;
+      keepalive) printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1 && ka="$v";;
+      load) load="$v";; memgb) mem="$v";; cpus) cpus="$v";;
+    esac
+  done <<EOF
+$raw
+EOF
+  jq -cn --arg name "$name" --arg host "$host" --arg kit "$kit" --arg cl "$cl" --arg sg "$sgp" \
+    --argjson ses "$ses" --argjson acc "$acc" --argjson ka "$ka" --arg load "$load" --arg mem "$mem" --arg cpus "$cpus" \
+    '{name:$name, online:true, host:$host, kit:(if $kit == "" then null else $kit end), claude:(if $cl == "" then null else $cl end),
+      overclaude:($sg == "yes"),
+      sessions:($ses | length), busy:([$ses[] | select(.status == "busy")] | length),
+      accounts:[($acc.accounts // [])[] | {email, active:(.active // false), status:(.usageStatus // "unknown")}],
+      dead:[($acc.accounts // [])[] | select(.usageStatus == "relogin_required") | .email],
+      keepalive:($ka.loaded // false),
+      load:($load | tonumber? // null), memGB:($mem | tonumber? // null), cpus:($cpus | tonumber? // null)}'
+}
+
+_fleet_hosts() { jq -r '.hosts[]?.name' "$FLEET_JSON" 2>/dev/null; }
+
+_fleet_valid_host() { case "$1" in ''|-*|*[!A-Za-z0-9._@-]*) return 1;; esac; return 0; }
+
+_fleet_add() {
+  local h="${1:-}" raw row tmp
+  _fleet_valid_host "$h" || { echo "usage: swap-guard fleet add <tailscale-name>   (letters, digits, . _ - @ only)" >&2; return 2; }
+  echo "Checking SSH to ${h}…" >&2
+  if ! raw="$(_fleet_ssh "$h" bash -s < <(_fleet_probe_script) 2>/dev/null)" || [ -z "$raw" ]; then
+    cat >&2 <<EOF
+Could not reach $h over SSH without a password. To set it up (once per Mac):
+  1. On $h: System Settings → General → Sharing → turn on Remote Login.
+  2. On this Mac: ssh-copy-id $h   (asks for $h's login password once;
+     no key yet? first run: ssh-keygen -t ed25519)
+  3. Check: ssh $h true   — then run this again.
+(Tailscale SSH also works, but on macOS only with the open-source tailscaled,
+not the App Store or standalone Tailscale app.)
+EOF
+    jq -cn --arg h "$h" '{error:"ssh-failed", host:$h}'; return 1
+  fi
+  row="$(_fleet_snapshot_json "$h" "$raw")"
+  mkdir -p "$STATE_ROOT" || return 1
+  tmp="$(mktemp "$STATE_ROOT/fleet.XXXXXX")" || return 1
+  { [ -f "$FLEET_JSON" ] && cat "$FLEET_JSON" || echo '{"hosts":[]}'; } |
+    jq --arg h "$h" --argjson now "$(date +%s)" '.hosts = ([.hosts[]? | select(.name != $h)] + [{name:$h, addedAt:$now}])' > "$tmp" &&
+    mv "$tmp" "$FLEET_JSON" || { rm -f "$tmp"; return 1; }
+  if [ "$(printf '%s' "$row" | jq -r .overclaude)" != true ]; then
+    echo "Added $h, but overclaude is not installed there. On $h: pipx install overclaude && overclaude install" >&2
+  fi
+  [ "$(printf '%s' "$row" | jq '.accounts | length')" -gt 0 ] ||
+    echo "No accounts are logged in on $h yet. On $h: claude, then /login, then cswap add" >&2
+  printf '%s\n' "$row" | jq -c '{added:.name, overclaude, kit, accounts:(.accounts | length)}'
+}
+
+_fleet_rm() {
+  local h="${1:-}" tmp
+  [ -n "$h" ] || { echo "usage: swap-guard fleet rm <name>" >&2; return 2; }
+  [ -f "$FLEET_JSON" ] || { jq -cn --arg h "$h" '{removed:false, host:$h}'; return 0; }
+  tmp="$(mktemp "$STATE_ROOT/fleet.XXXXXX")" || return 1
+  jq --arg h "$h" '.hosts = [.hosts[]? | select(.name != $h)]' "$FLEET_JSON" > "$tmp" && mv "$tmp" "$FLEET_JSON"
+  jq -cn --arg h "$h" '{removed:true, host:$h}'
+}
+
+# fleet status: every Mac in parallel (this one first), one JSON array; cached for
+# the statusline and doctor. --text prints one line per Mac instead.
+_fleet_status() {
+  local text=0 d h i=0 pids="" out rows
+  [ "${1:-}" = --text ] && text=1
+  d="$(mktemp -d "${TMPDIR:-/tmp}/swap-guard-fleet.XXXXXX")" || return 1
+  bash -s < <(_fleet_probe_script) > "$d/0.raw" 2>/dev/null &
+  pids="$!"
+  for h in $(_fleet_hosts); do
+    _fleet_valid_host "$h" || continue
+    i=$((i + 1)); printf '%s' "$h" > "$d/$i.name"
+    ( _fleet_ssh "$h" bash -s < <(_fleet_probe_script) > "$d/$i.raw" 2>/dev/null || rm -f "$d/$i.raw" ) &
+    pids="$pids $!"
+  done
+  # A hung host never holds the answer: anything not back in 15 s counts as offline.
+  ( sleep "${SWAP_FLEET_DEADLINE:-15}"; for p in $pids; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done ) >/dev/null 2>&1 &
+  local watchdog=$!
+  for p in $pids; do wait "$p" 2>/dev/null; done
+  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+  rows="$(_fleet_snapshot_json "this Mac" "$(cat "$d/0.raw" 2>/dev/null)" | jq -c '.self = true')"
+  local n=1
+  while [ "$n" -le "$i" ]; do
+    h="$(cat "$d/$n.name")"
+    if [ -s "$d/$n.raw" ]; then
+      rows="$rows
+$(_fleet_snapshot_json "$h" "$(cat "$d/$n.raw")")"
+    else
+      rows="$rows
+$(jq -cn --arg h "$h" '{name:$h, online:false}')"
+    fi
+    n=$((n + 1))
+  done
+  rm -rf "$d"
+  out="$(printf '%s\n' "$rows" | jq -sc --argjson now "$(date +%s)" '{checkedAt:$now, macs:.}')"
+  mkdir -p "$STATE_ROOT/cache" && printf '%s\n' "$out" > "$FLEET_CACHE.tmp.$$" && mv "$FLEET_CACHE.tmp.$$" "$FLEET_CACHE"
+  if [ "$text" -eq 1 ]; then
+    printf '%s' "$out" | jq -r '.macs[] |
+      if .online then
+        "\(.name)\(if .self then "" else " (" + .host + ")" end): \(.sessions) session(s)\(if .busy > 0 then ", \(.busy) busy" else "" end)"
+        + " · load \(.load // "?") on \(.cpus // "?") cores · \(.memGB // "?") GB"
+        + " · overclaude \(.kit // "not installed")"
+        + " · accounts: \(if (.accounts | length) == 0 then "none" else ([.accounts[] | (.email | split("@")[0]) + (if .active then "*" else "" end) + (if .status == "relogin_required" then " ⚠ relogin" else "" end)] | join(", ")) end)"
+        + (if .keepalive then "" else " · keepalive off" end)
+      else "\(.name): offline (no SSH answer)" end'
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+cmd_fleet() {
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    add)    _fleet_add "$@"; exit $?;;
+    rm)     _fleet_rm "$@"; exit $?;;
+    list)   { [ -f "$FLEET_JSON" ] && jq -c '[.hosts[]?.name]' "$FLEET_JSON"; } || echo '[]'; exit 0;;
+    status) _fleet_status "$@"; exit $?;;
+    *) echo "usage: swap-guard fleet add <host> | rm <host> | list | status [--text]" >&2; exit 1;;
   esac
 }
 
@@ -2394,6 +2559,7 @@ main() {
     auto)          cmd_auto "$@";;
     keepalive)     cmd_keepalive "$@";;
     token)         cmd_token "$@";;
+    fleet)         cmd_fleet "$@";;
     artifacts)
       case "${1:-}" in
         find|list) shift; _art_find "$@"; exit $?;;

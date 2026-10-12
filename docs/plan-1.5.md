@@ -50,13 +50,13 @@ Two goals:
 
 Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on/off marker, linted plist), `tests/test_token.sh` (35: split, styled, wrapped and repainted tokens never reach the screen and are stored exactly; a token that fails the test request is refused; keychain via stdin only), and lifecycle checks in `tests/test_install.sh`.
 
-## Phase 2: fleet link and status
+## Phase 2: fleet link and status ✅ built (`swap-guard fleet add|rm|list|status`, `overclaude fleet`, statusline line, doctor section; `tests/test_fleet.sh`)
 
 - `overclaude fleet add <tailscale-name>`: checks that SSH works without a password and that overclaude is installed on the worker, and records the overclaude version and the accounts logged in there. The list is saved in `~/.claude/overclaude/fleet.json` (host names only, no secrets).
 - `overclaude fleet status`: one line per Mac showing online or offline, overclaude version, logged-in accounts, running sessions (`claude agents`), and free memory and CPU load. Hosts are queried in parallel with a 5 s timeout.
 - Statusline: an optional `↳ fleet 3 macs · 5 sessions` line, from a cache that a background job refreshes. The statusline never waits on SSH.
 - Doctor: `fleet` section (SSH, versions behind the hub, a worker with a dead login).
-- Setup per worker, done once by you: `sudo tailscale set --ssh` (or Remote Login with a key), `pipx install overclaude && overclaude install`, then log in to the accounts that Mac should use.
+- Setup per worker, done once by you: turn on Remote Login, run `ssh-copy-id <mac>` from the hub (Tailscale SSH works on macOS only with the open-source `tailscaled`), `pipx install overclaude && overclaude install`, then log in to the accounts that Mac should use.
 
 ## Phase 3: accounts across the fleet
 

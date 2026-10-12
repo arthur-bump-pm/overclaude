@@ -39,6 +39,7 @@ Plan and status: [docs/plan-1.5.md](docs/plan-1.5.md). Built so far:
 
 - **Logins that stay alive** — a small background job (`swap-guard keepalive`, on by default) fetches every account's usage every 2 hours, which is what makes cswap refresh a login. Each refresh hands back a fresh refresh token, so an account you don't touch for weeks no longer loses its login. It never switches accounts and never writes a credential itself. When a login does die (revoked, or used on two machines), you get one notification a day with the fix (`swap-guard login N`). Off: `swap-guard keepalive off` (remembered across reinstalls).
 - **Long-lived tokens for headless jobs** — `swap-guard token add <account>` runs `claude setup-token` with its output hidden (you see only the sign-in link), checks that the one-year token works with one tiny `claude -p`, and stores it in the keychain. The token never appears on screen, in a file or in a process list. `swap-guard token run <account> -- claude -p "…"` runs one command with it. These tokens only make model requests (no Remote Control, no usage figures), so they are for scripts and worker Macs; interactive sessions keep their normal logins. `overclaude doctor` warns 30 days before one expires.
+- **Your other Macs, from this one** — `overclaude fleet add <mac>` registers a Mac on your Tailscale network (SSH with a key, never a password prompt). `overclaude fleet` then shows every Mac: sessions (and how many are busy), which accounts are logged in and which is active, dead logins, load and memory, overclaude version. The statusline gets a `↳ fleet 3/3 macs · 7 sessions` line (refreshed in the background every 10 minutes; `SWAP_HIDE_FLEET=1` hides it), and `overclaude doctor` flags offline Macs, outdated kits and dead logins there. Logins are never copied between Macs: each Mac logs in to its own accounts.
 
 ## What's new in 1.4
 
@@ -187,6 +188,7 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap spend [days N]` | API-price value of your usage vs your plans *(1.4)* |
 | `/swap guard on\|off\|status` | Routing guard for subagents on Fable *(1.4)* |
 | `swap-guard keepalive on\|off\|status` *(shell)* | Background refresh that keeps idle accounts' logins alive (default on) *(1.5)* |
+| `overclaude fleet [add <mac>\|rm <mac>\|list]` *(shell)* | Your other Macs over Tailscale: sessions, accounts, dead logins, load *(1.5)* |
 | `swap-guard token add\|list\|rm\|run` *(shell)* | One-year tokens for `claude -p` jobs, kept in the keychain, never shown *(1.5)* |
 | `overclaude update` *(shell)* | Upgrade from PyPI and reinstall the kit |
 | `swap-guard artifacts find <words>` *(shell)* | Search every artifact published from this machine, with its owner |

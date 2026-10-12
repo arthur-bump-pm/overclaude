@@ -252,6 +252,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+if jq -e '(.hosts // []) | length > 0' "$STATE_ROOT/fleet.json" >/dev/null 2>&1; then
+  echo "-- fleet --"
+  FC="$STATE_ROOT/cache/fleet.json"
+  if [ ! -s "$FC" ]; then
+    _warn "fleet registered but never checked" "swap-guard fleet status --text"
+  else
+    KV=$(cat "$STATE_ROOT/kit-version" 2>/dev/null)
+    while IFS="$(printf '\t')" read -r name online kit dead; do
+      [ -n "$name" ] || continue
+      if [ "$online" != true ]; then _warn "$name: offline (no SSH answer at last check)" "ssh $name true   (then: swap-guard fleet status --text)"
+      elif [ -z "$kit" ]; then _warn "$name: overclaude not installed" "on $name: pipx install overclaude && overclaude install"
+      elif [ -n "$dead" ]; then _warn "$name: dead login(s): $dead" "on $name: swap-guard login <slot>"
+      elif [ -n "$KV" ] && [ "$kit" != "$KV" ]; then _warn "$name: overclaude $kit (this Mac: $KV)" "on $name: overclaude update"
+      else ok "$name: online, overclaude $kit"; fi
+    done <<EOF
+$(jq -r '.macs[] | select(.self | not) | [.name, (.online | tostring), (.kit // ""), ((.dead // []) | join(","))] | @tsv' "$FC" 2>/dev/null)
+EOF
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 echo "-- version --"
 KIT_VER=$(cat "$STATE_ROOT/kit-version" 2>/dev/null)
 LATEST=$(jq -r '.version // empty' "$STATE_ROOT/cache/latest-version.json" 2>/dev/null)

@@ -480,6 +480,32 @@ EOF
 cdx=$(codex_lines 2>/dev/null) || cdx=""
 [ -n "$cdx" ] && printf "%s\n" "$cdx"
 
+# Fleet line: only once other Macs are registered (swap-guard fleet add). A
+# background `swap-guard fleet status` refreshes the cache at most every 10
+# minutes; a render only reads it, so it never waits on SSH. SWAP_HIDE_FLEET=1 hides.
+fleet_line() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock
+  [ -z "${SWAP_HIDE_FLEET:-}" ] && command -v jq >/dev/null 2>&1 || return 0
+  jq -e '(.hosts // []) | length > 0' "$st/fleet.json" >/dev/null 2>&1 || return 0
+  cache="$st/cache/fleet.json"; now=$(date +%s); m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( now - m )) -ge 600 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/fleet.lock"
+    if [ -z "$(find "$lock" -mmin -10 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" fleet status >/dev/null 2>&1 & )
+    fi
+  fi
+  [ -s "$cache" ] || return 0
+  jq -r --argjson now "$now" --arg dim "$DIM" --arg red "$RED" --arg reset "$RESET" '
+    (.macs // []) as $m | [$m[] | select(.online)] as $on
+    | "↳ fleet \($on | length)/\($m | length) macs · \([$on[].sessions // 0] | add // 0) sessions"
+      + ([$on[] | select(.busy > 0)] | if length > 0 then " (\([.[].busy] | add) busy)" else "" end)
+      + ([$m[] | select(.online | not) | .name] | if length > 0 then " · \($dim)offline: \(join(", "))\($reset)" else "" end)
+      + ([$on[] | select((.dead // []) | length > 0) | .name] | if length > 0 then " \($red)⚠ relogin on \(join(", "))\($reset)" else "" end)
+      + (($now - (.checkedAt // $now)) as $age | if $age > 1800 then " \($dim)(\($age / 60 | floor)m old)\($reset)" else "" end)' "$cache" 2>/dev/null
+}
+flt=$(fleet_line 2>/dev/null) || flt=""
+[ -n "$flt" ] && printf "%s\n" "$flt"
+
 # Update badge: a newer overclaude is on PyPI. The check itself runs in the
 # background at most once a day (swap-guard version-check); a render only reads
 # its cache, so the statusline never waits on the network.
