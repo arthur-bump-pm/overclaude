@@ -1169,6 +1169,7 @@ printf 'keepalive\t%s\n' "$(swap-guard keepalive status 2>/dev/null | tr -d '\n'
 printf 'load\t%s\n' "$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
 printf 'memgb\t%s\n' "$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
 printf 'cpus\t%s\n' "$(sysctl -n hw.ncpu 2>/dev/null)"
+printf 'done\t1\n'
 EOF
 }
 
@@ -1200,13 +1201,70 @@ EOF
 
 _fleet_hosts() { jq -r '.hosts[]?.name' "$FLEET_JSON" 2>/dev/null; }
 
+# A probe answer counts only if it ran to the end (a host killed at the deadline can
+# leave half an answer).
+_fleet_complete() { printf '%s\n' "$1" | grep -q "^done$(printf '\t')1"; }
+
+_fleet_kill_tree() { # _fleet_kill_tree <pid> — the process and everything under it
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do _fleet_kill_tree "$c"; done
+  kill "$1" 2>/dev/null
+}
+
 _fleet_valid_host() { case "$1" in ''|-*|*[!A-Za-z0-9._@-]*) return 1;; esac; return 0; }
+_fleet_valid_email() { case "$1" in ''|-*|*[!A-Za-z0-9@._+-]*) return 1;; esac; return 0; }
+
+# fleet follow --from <email> --to <email> (runs ON a worker, called by the hub's
+# fleet swap): under this Mac's instant-swap lock, switch only if it is still on
+# <from>, then record the swap so this Mac's own rate-limit hook reuses it instead
+# of switching again.
+_fleet_follow() {
+  local from="" to="" model="" lock i=0 list act to_n from_n sw now
+  while [ $# -gt 0 ]; do
+    case "$1" in --from) from="${2:-}"; shift;; --to) to="${2:-}"; shift;; --model) model="${2:-}"; shift;; esac
+    shift
+  done
+  _fleet_valid_email "$from" && _fleet_valid_email "$to" || { echo '{"switched":false,"reason":"bad-arguments"}'; return 1; }
+  command -v cswap >/dev/null 2>&1 || { echo '{"switched":false,"reason":"cswap-not-found"}'; return 1; }
+  mkdir -p "$STATE_ROOT" || return 1
+  lock="$STATE_ROOT/ratelimit.lock"
+  until mkdir "$lock" 2>/dev/null; do
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null; continue; fi
+    i=$((i + 1)); [ "$i" -lt 10 ] || { echo '{"switched":false,"reason":"lock-busy"}'; return 1; }
+    sleep 1
+  done
+  # The path is baked in now: at EXIT this function's locals are out of scope.
+  trap "rmdir $(printf '%q' "$lock") 2>/dev/null" EXIT
+  list="$(cswap list --json 2>/dev/null)"
+  act="$(printf '%s' "$list" | jq -r 'first(.accounts[]? | select(.active == true)) | .email // empty' 2>/dev/null)"
+  if [ "$(printf '%s' "$act" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$from" | tr 'A-Z' 'a-z')" ]; then
+    jq -cn --arg a "$act" '{switched:false, reason:"not-on-that-account", active:$a}'; return 0
+  fi
+  to_n="$(printf '%s' "$list" | jq -r --arg e "$to" 'first(.accounts[]? | select((.email // "" | ascii_downcase) == ($e | ascii_downcase))) | .number // empty' 2>/dev/null)"
+  from_n="$(printf '%s' "$list" | jq -r '.activeAccountNumber // empty' 2>/dev/null)"
+  [ -n "$to_n" ] || { echo '{"switched":false,"reason":"target-not-logged-in-here"}'; return 1; }
+  sw="$(cswap switch "$to_n" --json 2>/dev/null)" &&
+    [ "$(printf '%s' "$sw" | jq -r '.switched // false' 2>/dev/null)" = true ] ||
+    { jq -cn --arg d "$(printf '%s' "$sw" | tail -c 200)" '{switched:false, reason:"switch-failed", detail:$d}'; return 1; }
+  now="$(date +%s)"
+  jq -cn --argjson ts "$now" --arg f "$from_n" --arg to "$to_n" '{ts:$ts, from:$f, to:$to, model:"", source:"fleet"}' \
+    > "$RL_LAST.tmp.$$" && mv "$RL_LAST.tmp.$$" "$RL_LAST"
+  # Like instant swap: remember <from> is capped here (5 h, or until the window the
+  # hub saw at 100% resets — unknown here, so 5 h), so a later cap never hops back.
+  case "$model" in *[!A-Za-z0-9._-]*) model="";; esac
+  jq -cn --arg f "$from_n" --arg m "$model" --argjson now "$now" \
+      --argjson prev "$(jq -c 'if type == "array" then . else [] end' "$RL_CAPPED" 2>/dev/null || echo '[]')" \
+    '[$prev[] | select(.until > $now and (.slot != $f or .model != $m))] + [{slot:$f, model:$m, until:($now + 18000)}]' \
+    > "$RL_CAPPED.tmp.$$" 2>/dev/null && mv "$RL_CAPPED.tmp.$$" "$RL_CAPPED"
+  _auto_log "$(jq -cn --argjson ts "$now" --arg f "$from_n" --arg to "$to_n" '{ts:($ts|todate), source:"fleet", action:"switched", from:$f, to:$to}')"
+  jq -cn --arg f "$from" --arg t "$to" '{switched:true, from:$f, to:$t}'
+}
 
 _fleet_add() {
   local h="${1:-}" raw row tmp
   _fleet_valid_host "$h" || { echo "usage: swap-guard fleet add <tailscale-name>   (letters, digits, . _ - @ only)" >&2; return 2; }
   echo "Checking SSH to ${h}…" >&2
-  if ! raw="$(_fleet_ssh "$h" bash -s < <(_fleet_probe_script) 2>/dev/null)" || [ -z "$raw" ]; then
+  if ! raw="$(_fleet_ssh "$h" bash -s < <(_fleet_probe_script) 2>/dev/null)" || ! _fleet_complete "$raw"; then
     cat >&2 <<EOF
 Could not reach $h over SSH without a password. To set it up (once per Mac):
   1. On $h: System Settings → General → Sharing → turn on Remote Login.
@@ -1256,15 +1314,15 @@ _fleet_status() {
     pids="$pids $!"
   done
   # A hung host never holds the answer: anything not back in 15 s counts as offline.
-  ( sleep "${SWAP_FLEET_DEADLINE:-15}"; for p in $pids; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done ) >/dev/null 2>&1 &
+  ( sleep "${SWAP_FLEET_DEADLINE:-15}"; for p in $pids; do _fleet_kill_tree "$p"; done ) >/dev/null 2>&1 &
   local watchdog=$!
   for p in $pids; do wait "$p" 2>/dev/null; done
-  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+  _fleet_kill_tree "$watchdog"; wait "$watchdog" 2>/dev/null
   rows="$(_fleet_snapshot_json "this Mac" "$(cat "$d/0.raw" 2>/dev/null)" | jq -c '.self = true')"
   local n=1
   while [ "$n" -le "$i" ]; do
     h="$(cat "$d/$n.name")"
-    if [ -s "$d/$n.raw" ]; then
+    if [ -s "$d/$n.raw" ] && _fleet_complete "$(cat "$d/$n.raw")"; then
       rows="$rows
 $(_fleet_snapshot_json "$h" "$(cat "$d/$n.raw")")"
     else
@@ -1290,6 +1348,94 @@ $(jq -cn --arg h "$h" '{name:$h, online:false}')"
   fi
 }
 
+# fleet swap [--from <email>] [--model M] [--dry-run] [--notify]: move every worker
+# Mac whose active account is capped (or is <email>) to the account with the most
+# room among those logged in THERE, judged by this Mac's usage numbers (limits are
+# per account, so the hub's figures cover every Mac); ties go to the account whose
+# week resets soonest. Each worker switches with its own cswap — nothing is copied.
+# The instant-swap hook runs it in the background after switching this Mac.
+_fleet_swap() {
+  local from="" model="" dry=0 notify=0 list st plan out="" row name to afrom rc sw moved=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) from="${2:-}"; shift;; --model) model="${2:-}"; shift;;
+      --dry-run) dry=1;; --notify) notify=1;;
+    esac
+    shift
+  done
+  [ -n "$(_fleet_hosts)" ] || { echo '[]'; return 0; }
+  local margs=""
+  case "$model" in ''|*[!A-Za-z0-9._-]*) :;; *) margs=" --model '$model'";; esac
+  list="$(cswap list --json 2>/dev/null)"
+  printf '%s' "$list" | jq -e '.accounts' >/dev/null 2>&1 || { echo '{"error":"cswap-list-failed"}'; return 1; }
+  st="$(_fleet_status 2>/dev/null)"
+  printf '%s' "$st" | jq -e '.macs' >/dev/null 2>&1 || { echo '{"error":"fleet-status-failed"}'; return 1; }
+  local capped; capped="$(jq -c 'if type == "array" then . else [] end' "$RL_CAPPED" 2>/dev/null)" || capped="[]"
+  [ -n "$capped" ] || capped="[]"
+  plan="$(jq -cn --argjson hub "$list" --argjson st "$st" --arg from "$from" --arg model "$model" --argjson dry "$dry" \
+      --argjson capped "$capped" \
+      --argjson now "$(date +%s)" "$JQ_EPOCH"'
+    def pct($w): if $w == null then 0
+      elif (($w.resetsAt // "") | ep) as $r | ($r != null and $r <= $now) then 0
+      else ($w.pct // 0) end;
+    def lc: ascii_downcase;
+    def okstatus: . as $s | ["ok", "token_expired", "unavailable"] | index($s) != null;
+    def acct($e): first($hub.accounts[]? | select((.email // "" | lc) == ($e | lc))) // null;
+    def usage($a): $a.usage // $a.lastGoodUsage;
+    def score($u): [pct($u.fiveHour), pct($u.sevenDay),
+                    (if $model == "" then 0 else pct([$u.scoped[]? | select((.name | lc) == ($model | lc))] | first) end)] | max;
+    def listed($a): [$capped[] | select(.slot == ($a.number | tostring) and .until > $now
+                      and (.model == "" or (.model | lc) == ($model | lc)))] | length > 0;
+    # A target needs the same filters instant swap uses on this Mac: not disabled,
+    # a usable login here, numbers to judge by, and not recorded as capped.
+    def room($e): acct($e) as $a
+      | if $a == null or ($a.disabled // false) or (($a.usageStatus // "") | okstatus | not) or listed($a)
+           or usage($a) == null then null
+        else {score: score(usage($a)), reset: (((usage($a).sevenDay // {}).resetsAt // "") | ep // 99999999999)} end;
+    # Capped = recorded as capped here, or a window at 100%. Unknown is not capped.
+    def capped($e): acct($e) as $a
+      | $a != null and (listed($a) or (usage($a) != null and score(usage($a)) >= 100));
+    [$st.macs[] | select(.online and ((.self // false) | not))
+     | (first(.accounts[]? | select(.active)) // null) as $act
+     | if $act == null then {name, action:"skip", reason:"no-active-account"}
+       elif $from != "" and (($act.email // "") | lc) != ($from | lc) then {name, action:"skip", reason:"not-on-that-account", active:$act.email}
+       elif $from == "" and (capped($act.email) | not) then {name, action:"skip", reason:"active-has-room", active:$act.email}
+       else ([.accounts[] | select((.active | not) and (.status | okstatus))
+              | . + {r: room(.email)} | select(.r != null and .r.score < 100)]
+             | sort_by([.r.score, .r.reset]) | first) as $best
+         | if $best == null then {name, action:"none", reason:"no-account-with-room-there", from:$act.email}
+           else {name, action:(if $dry == 1 then "would-switch" else "switch" end), from:$act.email, to:$best.email, score:$best.r.score} end
+       end]' 2>/dev/null)" || { echo '{"error":"plan-failed"}'; return 1; }
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    if [ "$(printf '%s' "$row" | jq -r .action)" = switch ]; then
+      name="$(printf '%s' "$row" | jq -r .name)"; to="$(printf '%s' "$row" | jq -r .to)"
+      afrom="$(printf '%s' "$row" | jq -r .from)"
+      if _fleet_valid_host "$name" && _fleet_valid_email "$to" && _fleet_valid_email "$afrom"; then
+        # stdin closed: ssh would otherwise swallow the rest of this loop's rows.
+        sw="$(_fleet_ssh "$name" "PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\" swap-guard fleet follow --from '$afrom' --to '$to'$margs" </dev/null 2>/dev/null)"; rc=$?
+        if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$sw" | jq -r '.switched // false' 2>/dev/null)" = true ]; then
+          row="$(printf '%s' "$row" | jq -c '.action = "switched"')"; moved="${moved:+$moved, }$name"
+        elif [ "$(printf '%s' "$sw" | jq -r '.reason // empty' 2>/dev/null)" = not-on-that-account ]; then
+          row="$(printf '%s' "$row" | jq -c --arg a "$(printf '%s' "$sw" | jq -r '.active // ""')" '.action = "skip" | .reason = "moved-already" | .active = $a')"
+        elif [ "$rc" -eq 2 ]; then
+          row="$(printf '%s' "$row" | jq -c '.action = "failed" | .detail = "overclaude there is older than 1.5 — on that Mac: overclaude update"')"
+        else
+          row="$(printf '%s' "$row" | jq -c --argjson rc "$rc" --arg d "$(printf '%s' "$sw" | tail -c 200)" '.action = "failed" | .rc = $rc | .detail = $d')"
+        fi
+      else
+        row="$(printf '%s' "$row" | jq -c '.action = "failed" | .detail = "unsafe host or account name"')"
+      fi
+    fi
+    out="${out:+$out
+}$row"
+  done <<EOF
+$(printf '%s' "$plan" | jq -c '.[]')
+EOF
+  [ "$notify" -eq 1 ] && [ -n "$moved" ] && _auto_notify "Also switched on your other Macs: $moved."
+  printf '%s\n' "$out" | jq -sc '.'
+}
+
 cmd_fleet() {
   local sub="${1:-status}"; [ $# -gt 0 ] && shift
   case "$sub" in
@@ -1297,7 +1443,9 @@ cmd_fleet() {
     rm)     _fleet_rm "$@"; exit $?;;
     list)   { [ -f "$FLEET_JSON" ] && jq -c '[.hosts[]?.name]' "$FLEET_JSON"; } || echo '[]'; exit 0;;
     status) _fleet_status "$@"; exit $?;;
-    *) echo "usage: swap-guard fleet add <host> | rm <host> | list | status [--text]" >&2; exit 1;;
+    swap)   _fleet_swap "$@"; exit $?;;
+    follow) _fleet_follow "$@"; exit $?;;
+    *) echo "usage: swap-guard fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run]" >&2; exit 2;;
   esac
 }
 
@@ -1599,6 +1747,11 @@ cmd_ratelimit() {
   rmdir "$lock" 2>/dev/null; trap - EXIT
   [ "$notify" -eq 1 ] &&
     _auto_notify "${model:-Usage} limit on $from_l → switched to $to_l. If the session does not resume by itself, send any message."
+  # Other Macs on the capped account follow (background: SSH must never delay the wake).
+  if [ -n "$(_fleet_hosts)" ] && [ -z "${SWAP_NO_FLEET_SWAP:-}" ]; then
+    local from_e; from_e="$(printf '%s' "$list" | jq -r --arg f "$from" 'first(.accounts[]? | select((.number | tostring) == $f)) | .email // empty' 2>/dev/null)"
+    [ -n "$from_e" ] && ( "$0" fleet swap --from "$from_e" --model "$model" $([ "$notify" -eq 1 ] && echo --notify) >/dev/null 2>&1 & )
+  fi
   wake_txt="overclaude: the ${model:-usage} limit stopped this session, so the account was switched from $from_l to $to_l (now $(printf '%s' "$pick" | jq -r --arg m "$model" '"5h \(.h5)% · week \(.d7)%" + (if $m != "" then " · \($m) \(.m)%" else "" end)')). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying."
   _rl_wake "$sid" "$wake_txt" && exit 2
   exit 0

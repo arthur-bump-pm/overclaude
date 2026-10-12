@@ -58,14 +58,14 @@ Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on
 - Doctor: `fleet` section (SSH, versions behind the hub, a worker with a dead login).
 - Setup per worker, done once by you: turn on Remote Login, run `ssh-copy-id <mac>` from the hub (Tailscale SSH works on macOS only with the open-source `tailscaled`), `pipx install overclaude && overclaude install`, then log in to the accounts that Mac should use.
 
-## Phase 3: accounts across the fleet
+## Phase 3: accounts across the fleet: partly built (fleet swap, broadcast and `/swap fleet` done; remote re-login waits on S4)
 
 - **The hub is where usage is read.** Limits are per account, so the hub's cswap figures cover every Mac. Workers do not need to fetch usage, and workers on setup-tokens cannot.
-- **Worker re-login from the hub.** `swap-guard login N --host <mac>` starts the login on the worker over SSH, shows you the URL, and passes back the code you paste (depends on S4). A dead login on a worker shows up in `fleet status` and the alert from 1c.
-- **Capped account, all Macs.** When an account reaches its limit, the hub tells every worker using it to swap to the account with the most room, preferring the one whose limit resets soonest. `/swap --fleet` does the same by hand. Each worker's swap is still its own cswap: nothing copies logins.
-- `fleet status` lists which Mac is on which account.
+- **Worker re-login from the hub.** ⏳ waits on S4 (needs SSH to a worker). `swap-guard login N --host <mac>` starts the login on the worker over SSH, shows you the URL, and passes back the code you paste (depends on S4). A dead login on a worker shows up in `fleet status` and the alert from 1c.
+- **Capped account, all Macs.** ✅ `swap-guard fleet swap [--from <email>] [--dry-run]` moves every worker whose active account is capped (by the hub's numbers) to the account with the most room among those logged in there. Ties go to the account whose week resets soonest; dead logins and accounts the hub has no numbers for are never targets. The instant-swap hook runs it in the background after switching the hub. `/swap fleet swap` shows the dry run and asks first. Each worker switches with its own cswap: nothing copies logins.
+- `fleet status` lists which Mac is on which account. ✅
 
-## Phase 4: remote sessions
+## Phase 4: remote sessions: waits on S6 (needs SSH to a worker)
 
 - `/remote <mac> [goal]` (and `overclaude remote <mac> [goal]`): starts `claude --remote-control "<mac>-<goal>"` on the worker, using `claude --bg` if S6 passes and tmux otherwise. It is named so it appears in claude.ai/code and the phone app, where you drive it.
 - `/handoff <mac>`: writes the handoff package as today, copies it to the worker (`scp`, into the path that the worker's SessionStart hook loads), and starts the remote session. The session picks up where this one left off.
