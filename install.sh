@@ -342,6 +342,28 @@ done
 echo
 
 # ---------------------------------------------------------------------------
+# Keepalive agent: refreshes idle accounts' logins every 2 h so none expires
+# unused. On by default; `swap-guard keepalive off` is remembered here.
+# ---------------------------------------------------------------------------
+echo "-- keepalive --"
+KA_PLIST="$HOME/Library/LaunchAgents/com.overclaude.keepalive.plist"
+if [ -f "$HOME/.claude-swap-backup/keepalive.off" ]; then
+  note_skip "keepalive agent is off (turn on: swap-guard keepalive on)"
+else
+  ka_had=no; [ -f "$KA_PLIST" ] && ka_had=yes
+  ka_int=$(plutil -extract StartInterval raw "$KA_PLIST" 2>/dev/null)
+  case "$ka_int" in ''|*[!0-9]*) ka_int=7200;; esac
+  if ka_out=$("$LOCALBIN/swap-guard" keepalive on --interval "$ka_int" 2>&1); then
+    if [ "$ka_had" = yes ]; then note_skip "keepalive agent already on (reloaded)"
+    else note_did "keepalive agent on: idle accounts' logins are refreshed every $((ka_int / 60)) min (off: swap-guard keepalive off)"; fi
+  else
+    note_warn "keepalive agent not installed: $(printf '%s' "$ka_out" | tail -n 1)"
+    note_warn "  retry later with: swap-guard keepalive on"
+  fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # Summary.
 # ---------------------------------------------------------------------------
 echo "== summary =="

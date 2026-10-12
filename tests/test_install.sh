@@ -5,7 +5,7 @@
 new_home
 VEND_VER=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/vendor/claude-swap/pyproject.toml" | head -1)
 STUB="$HOME/stubbin"; mkdir -p "$STUB"
-printf '#!/bin/bash\n[ "$1" = --version ] && echo "claude-swap %s"\nexit 0\n' "$VEND_VER" > "$STUB/cswap"
+printf '#!/bin/bash\n[ "$1" = --version ] && echo "claude-swap %s"\n[ "$1" = list ] && echo "{\\"accounts\\":[]}"\nexit 0\n' "$VEND_VER" > "$STUB/cswap"
 chmod +x "$STUB/cswap"
 export PATH="$STUB:$HOME/.local/bin:$PATH"
 export SWAP_GUARD_NO_LAUNCHCTL=1   # never touch the real launchd domain
@@ -34,15 +34,29 @@ assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")" "my-own-hook" 
 assert_eq "$(jq -r '.model' "$S")" "opus" "unrelated settings survive"
 assert_eq "$([ -x "$HOME/.local/bin/swap-guard" ] && echo yes)" "yes" "swap-guard installed"
 
+KA="$HOME/Library/LaunchAgents/com.overclaude.keepalive.plist"
+assert_eq "$([ -f "$KA" ] && echo yes)" "yes" "install turns the keepalive agent on"
+assert_contains "$(cat "$HOME/i1.log")" "keepalive agent on" "and says so"
+
 AFTER1="$(jq -S . "$S")"
 bash "$REPO/install.sh" > "$HOME/i2.log" 2>&1
 assert_absent "$(cat "$HOME/i2.log")" "Instant swap is ON" "and only the first time"
 assert_eq "$(jq -S . "$S")" "$AFTER1" "a second install changes nothing"
+assert_contains "$(cat "$HOME/i2.log")" "keepalive agent already on" "a re-install only reloads the keepalive agent"
+"$HOME/.local/bin/swap-guard" keepalive on --interval 3600 >/dev/null
+bash "$REPO/install.sh" >/dev/null 2>&1
+assert_eq "$(plutil -extract StartInterval raw "$KA")" "3600" "a re-install keeps a custom keepalive interval"
+"$HOME/.local/bin/swap-guard" keepalive off >/dev/null
+bash "$REPO/install.sh" > "$HOME/i3.log" 2>&1
+assert_eq "$([ -f "$KA" ] && echo yes || echo no)" "no" "a re-install respects keepalive off"
+assert_contains "$(cat "$HOME/i3.log")" "keepalive agent is off" "and says how to turn it back on"
+"$HOME/.local/bin/swap-guard" keepalive on >/dev/null
 
 bash "$REPO/uninstall.sh" >/dev/null 2>&1
 assert_eq "$?" "0" "uninstall exits 0"
 assert_eq "$(jq -S . "$S")" "$ORIG" "uninstall restores the original settings exactly"
 assert_eq "$([ -e "$HOME/.local/bin/swap-guard" ] && echo present || echo gone)" "gone" "swap-guard removed"
+assert_eq "$([ -f "$KA" ] && echo yes || echo no)" "no" "uninstall removes the keepalive agent"
 assert_absent "$(cat "$HOME/.zshrc" 2>/dev/null)" "claude-swap integration (begin)" "zshrc block removed"
 
 # A damaged end marker must never cost the user the rest of their .zshrc; mode + symlink kept.

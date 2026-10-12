@@ -33,6 +33,13 @@ bars and percentages turn yellow at 50% · red at 80%
 
 Install or upgrade: `pipx install overclaude && overclaude install` (upgrade: `overclaude update`, or `pipx upgrade overclaude && overclaude install` from versions before 1.3).
 
+## What's new in 1.5 (in progress)
+
+Plan and status: [docs/plan-1.5.md](docs/plan-1.5.md). Built so far:
+
+- **Logins that stay alive** — a small background job (`swap-guard keepalive`, on by default) fetches every account's usage every 2 hours, which is what makes cswap refresh a login. Each refresh hands back a fresh refresh token, so an account you don't touch for weeks no longer loses its login. It never switches accounts and never writes a credential itself. When a login does die (revoked, or used on two machines), you get one notification a day with the fix (`swap-guard login N`). Off: `swap-guard keepalive off` (remembered across reinstalls).
+- **Long-lived tokens for headless jobs** — `swap-guard token add <account>` runs `claude setup-token` with its output hidden (you see only the sign-in link), checks that the one-year token works with one tiny `claude -p`, and stores it in the keychain. The token never appears on screen, in a file or in a process list. `swap-guard token run <account> -- claude -p "…"` runs one command with it. These tokens only make model requests (no Remote Control, no usage figures), so they are for scripts and worker Macs; interactive sessions keep their normal logins. `overclaude doctor` warns 30 days before one expires.
+
 ## What's new in 1.4
 
 - **Codex as the next place to work** — `/handoff codex` (or `/swap codex`) writes the handoff where overcodex's Codex hook loads it, so work continues in the Codex CLI when every Claude account is out; typing `$handoff-claude` in Codex (overcodex 0.3) hands it back. The usage note and the instant-swap notification suggest it when no Claude account has room.
@@ -179,6 +186,8 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap codex` *(or `/handoff codex`)* | Continue this work in the Codex CLI *(1.4)* |
 | `/swap spend [days N]` | API-price value of your usage vs your plans *(1.4)* |
 | `/swap guard on\|off\|status` | Routing guard for subagents on Fable *(1.4)* |
+| `swap-guard keepalive on\|off\|status` *(shell)* | Background refresh that keeps idle accounts' logins alive (default on) *(1.5)* |
+| `swap-guard token add\|list\|rm\|run` *(shell)* | One-year tokens for `claude -p` jobs, kept in the keychain, never shown *(1.5)* |
 | `overclaude update` *(shell)* | Upgrade from PyPI and reinstall the kit |
 | `swap-guard artifacts find <words>` *(shell)* | Search every artifact published from this machine, with its owner |
 | `swap <alias>` *(shell)* | Panic-switch from any terminal, even with sessions hung |

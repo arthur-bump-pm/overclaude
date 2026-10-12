@@ -222,6 +222,28 @@ if [ -f "$HOME/Library/LaunchAgents/com.overclaude.autoswap.plist" ]; then
 else
   ok "auto-swap agent not installed (optional: swap-guard auto install)"
 fi
+KA_PLIST="$HOME/Library/LaunchAgents/com.overclaude.keepalive.plist"
+if [ -f "$KA_PLIST" ]; then
+  if launchctl print "gui/$(id -u)/com.overclaude.keepalive" >/dev/null 2>&1; then
+    last=$(tail -n 1 "$STATE_ROOT/keepalive.log" 2>/dev/null | jq -r '"\(.ts) \(.action)\(if (.dead // []) != [] then " (dead: " + (.dead | map(tostring) | join(",")) + ")" else "" end)"' 2>/dev/null)
+    ok "keepalive agent loaded${last:+ — last tick: $last}"
+  else
+    _warn "keepalive plist exists but the agent is not loaded" "swap-guard keepalive on"
+  fi
+elif [ -f "$STATE_ROOT/keepalive.off" ]; then
+  _warn "keepalive is off — an account you don't use for a while can lose its login" "swap-guard keepalive on"
+else
+  _warn "keepalive agent not installed" "swap-guard keepalive on"
+fi
+if [ -f "$STATE_ROOT/tokens.json" ]; then
+  jq -r --argjson now "$(date +%s)" 'to_entries[] | "\(.key)\t\(((.value.expires - $now) / 86400) | floor)"' "$STATE_ROOT/tokens.json" 2>/dev/null |
+  while IFS="$(printf '\t')" read -r acct days; do
+    if [ "$days" -lt 0 ]; then echo "  [warn] long-lived token for $acct has expired"; echo "         fix: swap-guard token add '$acct'"
+    elif [ "$days" -lt 30 ]; then echo "  [warn] long-lived token for $acct expires in $days days"; echo "         fix: swap-guard token add '$acct'"
+    else echo "  [ok]   long-lived token for $acct ($days days left)"; fi
+  done
+  WARNS=$((WARNS + $(jq --argjson now "$(date +%s)" '[.[] | select(.expires - $now < 30 * 86400)] | length' "$STATE_ROOT/tokens.json" 2>/dev/null || echo 0)))
+fi
 if [ -f "$STATE_ROOT/instant-swap.off" ]; then
   _warn "instant swap on rate limit is OFF" "swap-guard auto instant on"
 else
