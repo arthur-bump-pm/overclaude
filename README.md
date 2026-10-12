@@ -23,6 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
+| 1.5.0 | 🚧 in progress | Logins that stay alive (keepalive, dead-login alert, long-lived tokens for headless jobs) and a fleet of Macs over Tailscale (status, accounts across Macs, remote sessions, job queue) — see [docs/plan-1.5.md](docs/plan-1.5.md) |
 | **1.4.0** | ✅ released 2026-10-09 | Codex as a fallback and a reviewer (`/handoff codex`, Codex limits on the statusline, `swap-guard codex-review`), model-routing guard for subagents, spend report with API-price value of your usage, works with overcodex 0.3 (Codex skills) |
 | 1.3.1 | released 2026-10-09 | QA fixes for 1.3: `/swap` from plain requests (behind a consent gate), artifact links, terminal y/N during re-login, accurate token status in doctor |
 | 1.3.0 | released 2026-10-09 | Instant swap on usage caps, safe re-login, usage notes for the model, artifact registry, `overclaude update`, `doctor --fix`, release gate |
@@ -267,7 +268,7 @@ A plain `git push` updates git installs only — **PyPI users get changes only v
 
 ## Roadmap
 
-1.4 is being built (see Versions). After it:
+1.5 is planned in [docs/plan-1.5.md](docs/plan-1.5.md) (see Versions). Also on the list:
 
 1. **Weekly pace forecast** on the statusline — cswap 0.26 already computes the projection (`expectedPct`, `projectedExhaustionAt`).
 2. **Titled relaunch after handoff** — `claude -n "↪ <goal>" "Continue from the handoff"`.
