@@ -34,6 +34,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap add` | register a new account without touching the live login (`swap-guard login --new`) | — |
 | `/swap relogin <target>` | revive a dead token without killing the live account's (`swap-guard login <target>`) | browser sign-in |
 | `/swap auto [on\|off\|status] [threshold N] [model X]` | busy-aware auto-switching LaunchAgent (opt-in) | defers proactive switches while sessions are busy |
+| `/swap auto retry [on\|off]` | resume a session automatically after a temporary server error (opt-in; at most 3 tries per session per hour) | auth/limit errors never retried |
 | `/swap auto instant [on\|off]` | instant swap the moment a usage cap stops a session (default on) | dead/disabled/API-key accounts never targeted |
 | `/swap codex` | continue this work in the Codex CLI (delegates to `/handoff codex`) | Codex CLI + overcodex installed, Codex account has room |
 | `/swap spend [days N]` | what your usage would cost at API prices, by model / account / day, vs your plans | — |
@@ -46,7 +47,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 Edge rulings:
 - `/swap <target> now` without `handoff`/`restart` → error: `now` only modifies handoff/restart.
 - `/swap handoff` (no target) → error: "did you mean /handoff? For an account aliased 'handoff' use slot number/email."
-- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`, `threshold <50-99.9>`, `model <names>`), never a target.
+- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`/`retry`, `threshold <50-99.9>`, `model <names>`), never a target.
 - `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
 - `relogin` takes the target account as its argument; it never switches.
@@ -104,6 +105,10 @@ Note: a session paused at a usage limit does NOT resume by itself after a backgr
 Independent of the LaunchAgent and ON by default: a StopFailure hook (`swap-guard ratelimit`) fires the moment a usage CAP stops a session ("You've reached your Fable limit"), picks the other account with the most room on that window (dead, disabled and API-key accounts are never targets), switches, sends a notification, and wakes the stopped session to continue (asyncRewake; each session at most once per 10 min, so a still-capped account cannot loop). A transient 429 throttle never swaps. Sessions that hit the cap together share one swap.
 - `instant on` / `instant off` → `swap-guard auto instant on|off`; `instant` alone → `swap-guard auto instant status`.
 - Recent instant-swap events appear in `swap-guard auto status` (entries with `"source":"ratelimit"`).
+
+### Server-error retry (`/swap auto retry [on|off]`)
+Off by default. A StopFailure hook (`swap-guard server-retry --hook`, matcher `server_error|overloaded`) waits 30 s, then 2 min, then 5 min and wakes the stopped session to continue, at most 3 times per session per hour; after that it gives up and logs it. Rate limits (instant swap's job), auth and billing errors are never retried.
+- `retry on` / `retry off` → `swap-guard server-retry on|off`; `retry` alone → `swap-guard server-retry status`.
 
 ## `/swap doctor [fix]`
 

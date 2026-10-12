@@ -86,8 +86,8 @@ Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on
 
 ## Smaller items in 1.5
 
-- **Auto-resume after server errors.** A `StopFailure` hook (matcher `server_error|overloaded`) records the failure. If S5 shows `asyncRewake` works there, it waits (30 s, then 2 min, then 5 min; at most 3 tries per session per hour) and wakes Claude with "the last turn failed on a server error — continue". If not, it sends only a notification. Off by default.
-- **Instruction-size check in doctor.** Warns when CLAUDE.md and the files it imports exceed a size budget.
+- **Auto-resume after server errors.** ✅ Built (`swap-guard server-retry`, `/swap auto retry`, `tests/test_retry.sh`). Opt-in StopFailure hook (matcher `server_error|overloaded`, asyncRewake): waits 30 s, 2 min, 5 min, at most 3 tries per session per hour, then gives up and logs it. Only the last wake tells Claude to stop if it fails again.
+- **Instruction-size check in doctor.** ✅ Built (CLAUDE.md + `@` imports, 40 KB budget, missing imports flagged). Warns when CLAUDE.md and the files it imports exceed a size budget.
 - **Loop guard (experimental).** Spots the same tool call failing the same way several times in a row and tells Claude to stop and rethink. Off by default.
 
 ## Will not do

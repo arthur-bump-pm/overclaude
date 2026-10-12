@@ -92,7 +92,7 @@ elif ! jq -e . "$SETTINGS" >/dev/null 2>&1; then
   _fail "$SETTINGS is not valid JSON — Claude Code ignores it" "fix the syntax (backups: $SETTINGS.bak-*)"
 else
   for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "Stop:ctx-notify.sh" \
-              "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" \
+              "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" \
               "PostToolUse:swap-guard artifact-log" "PreToolUse:swap-guard route-guard"; do
     ev="${pair%%:*}"; hk="${pair#*:}"
     if jq -e --arg ev "$ev" --arg hk "$hk" '[.hooks[$ev][]?.hooks[]?.command // ""] | any(contains($hk))' "$SETTINGS" >/dev/null 2>&1; then
@@ -270,6 +270,32 @@ if jq -e '(.hosts // []) | length > 0' "$STATE_ROOT/fleet.json" >/dev/null 2>&1;
 $(jq -r '.macs[] | select(.self | not) | [.name, (.online | tostring), (.kit // ""), ((.dead // []) | join(","))] | join("\u001f")' "$FC" 2>/dev/null)
 EOF
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Global instructions load into every session's context: CLAUDE.md plus the files it
+# imports with "@path" lines (one level, the way they are usually written).
+echo "-- instructions --"
+CM="$HOME/.claude/CLAUDE.md"
+if [ -f "$CM" ]; then
+  total=$(wc -c < "$CM" | tr -d ' '); missing=""
+  while IFS= read -r imp; do
+    [ -n "$imp" ] || continue
+    case "$imp" in /*) f="$imp";; "~/"*) f="$HOME/${imp#\~/}";; *) f="$HOME/.claude/$imp";; esac
+    if [ -f "$f" ]; then total=$((total + $(wc -c < "$f" | tr -d ' ')))
+    else missing="${missing:+$missing, }$imp"; fi
+  done <<EOF
+$(sed -n 's/^@\([^[:space:]]*\)[[:space:]]*$/\1/p' "$CM")
+EOF
+  kb=$((total / 1024)); tok=$((total / 4))
+  if [ "$total" -gt "${OVERCLAUDE_INSTR_BUDGET:-40960}" ]; then
+    _warn "global instructions are ${kb} KB (~${tok} tokens), loaded into every session" "trim ~/.claude/CLAUDE.md or the files it imports with @"
+  else
+    ok "global instructions ${kb} KB (~${tok} tokens, including @imports)"
+  fi
+  [ -z "$missing" ] || _warn "CLAUDE.md imports files that don't exist: $missing" "fix or remove those @ lines in ~/.claude/CLAUDE.md"
+else
+  ok "no global CLAUDE.md"
 fi
 
 # ---------------------------------------------------------------------------

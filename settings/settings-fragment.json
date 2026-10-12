@@ -57,6 +57,17 @@
             "timeout": 120
           }
         ]
+      },
+      {
+        "matcher": "server_error|overloaded",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/swap-guard server-retry --hook",
+            "asyncRewake": true,
+            "timeout": 420
+          }
+        ]
       }
     ],
     "PostToolUse": [

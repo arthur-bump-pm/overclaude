@@ -25,6 +25,7 @@
 #                                   the artifact registry (every publish, with its owning account)
 #   artifact-log                    PostToolUse hook (Artifact): append one publish to the registry
 #   ratelimit [--dry-run]           StopFailure hook (rate_limit): instant swap on a usage cap
+#   server-retry on|off|status|--hook  StopFailure hook (server_error|overloaded): capped auto-resume, opt-in
 #   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
 #   login <slot|alias|email> | --new
 #                                   safe re-login / add that never overwrites the live account's token
@@ -68,6 +69,7 @@ usage: swap-guard <subcommand> [args]
   artifacts index                 backfill the registry from past transcripts
   ratelimit [--dry-run] [--print] StopFailure hook: switch accounts the moment a usage cap hits
   auto instant on|off|status      enable/disable that instant swap (default: on)
+  server-retry on|off|status      resume a session after a temporary server error (opt-in; max 3 tries/hour)
   budget [--hook]                 usage bands the model should know about (hook: inject on change)
   login <slot|alias|email>        re-login a dead account WITHOUT killing the live one's token
   login --new                     add a new account the same safe way
@@ -1757,6 +1759,60 @@ cmd_ratelimit() {
   exit 0
 }
 
+# --- server-retry: resume after a temporary server error (opt-in) ----------------
+# Wired as a StopFailure hook (matcher server_error|overloaded, asyncRewake): it
+# waits, then exits 2 so Claude Code wakes the session to continue. Off by default.
+# Capped hard: an uncapped rewake retries about once a second (measured, plan S5),
+# so at most SR_MAX tries per session per hour, waiting 30 s, 2 min, then 5 min.
+SR_ON="$STATE_ROOT/server-retry.on"
+SR_MAX=3
+
+cmd_server_retry() {
+  local input sid err f now n=0 t delays d keep=""
+  case "${1:-}" in
+    on)  mkdir -p "$STATE_ROOT" && touch "$SR_ON"; jq -cn '{serverRetry:true}'; exit 0;;
+    off) rm -f "$SR_ON"; jq -cn '{serverRetry:false}'; exit 0;;
+    status|"") jq -cn --argjson on "$([ -f "$SR_ON" ] && echo true || echo false)" '{serverRetry:$on}'; exit 0;;
+    --hook) :;;
+    *) echo "usage: swap-guard server-retry on|off|status" >&2; exit 1;;
+  esac
+  input="$(cat 2>/dev/null)" || input=""
+  [ -f "$SR_ON" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  err="$(printf '%s' "$input" | jq -r '.error // empty' 2>/dev/null)"
+  case "$err" in server_error|overloaded) :;; *) exit 0;; esac
+  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-')"
+  [ -n "$sid" ] || exit 0
+  mkdir -p "$CTX_DIR" 2>/dev/null || exit 0
+  f="$CTX_DIR/$sid.retry"; now="$(date +%s)"
+  # Tries in the last hour (one epoch per line; older lines are dropped).
+  if [ -f "$f" ]; then
+    while IFS= read -r t; do
+      case "$t" in ''|*[!0-9]*) continue;; esac
+      [ $(( now - t )) -lt 3600 ] || continue
+      keep="${keep}${t}
+"; n=$((n + 1))
+    done < "$f"
+  fi
+  if [ "$n" -ge "$SR_MAX" ]; then
+    _auto_log "$(jq -cn --argjson ts "$now" --arg e "$err" --arg s "$sid" '{ts:($ts|todate), source:"server-retry", action:"gave-up", error:$e, session:$s}')"
+    exit 0
+  fi
+  printf '%s%s\n' "$keep" "$now" > "$f"
+  delays="${SWAP_RETRY_DELAYS:-30 120 300}"
+  # shellcheck disable=SC2086
+  set -- $delays
+  shift "$n" 2>/dev/null || true
+  d="${1:-300}"; case "$d" in ''|*[!0-9]*) d=300;; esac
+  _auto_log "$(jq -cn --argjson ts "$now" --arg e "$err" --arg s "$sid" --argjson try "$((n + 1))" --argjson d "$d" '{ts:($ts|todate), source:"server-retry", action:"retrying", error:$e, try:$try, waitSec:$d, session:$s}')"
+  sleep "$d"
+  # Only the last try says to stop: earlier ones are retried by this hook, not by Claude.
+  local last=""
+  [ $((n + 1)) -ge "$SR_MAX" ] && last=" This is the last automatic retry: if it fails again, stop and tell the user."
+  printf 'overclaude: the last turn ended on a temporary server error (%s); this is automatic retry %s of %s. Continue the task from where it stopped.%s\n' "$err" "$((n + 1))" "$SR_MAX" "$last" >&2
+  exit 2
+}
+
 # --- budget: tell the model when usage crosses a band (UserPromptSubmit hook) ------
 # ULTRACODE's budget-pressure rules key off "Fable ~75%+", a number the model cannot
 # see. `budget --hook` injects one line when the active account crosses a band
@@ -1836,7 +1892,7 @@ $line
 EOF
   f="$CTX_DIR/$sid.budget"
   # Per-session state for sessions long gone is pruned as we go.
-  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' \) -mtime +7 -delete 2>/dev/null
+  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' \) -mtime +7 -delete 2>/dev/null
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
@@ -2722,6 +2778,7 @@ main() {
       esac;;
     artifact-log)  cmd_artifact_log "$@";;
     ratelimit)     cmd_ratelimit "$@";;
+    server-retry)  cmd_server_retry "$@";;
     budget)        cmd_budget "$@";;
     login)         cmd_login "$@";;
     version-check) cmd_version_check "$@";;
