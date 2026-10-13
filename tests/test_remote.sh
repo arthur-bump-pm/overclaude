@@ -59,7 +59,7 @@ cd "$HOME/hosts/$h" && HOME="$HOME/hosts/$h" PATH="/usr/bin:/bin:/usr/sbin:/sbin
 EOF
 chmod +x "$STUB/ssh"
 export PATH="$STUB:$PATH"
-H="$(cd "$HOME/hosts" && pwd)"
+H="$(cd "$HOME/hosts" && pwd -P)"
 
 GOAL="fix the 'auth' bug; rm -rf \$HOME \`x\` \"now\" — ok"
 out="$("$SG" remote start w1 --dir proj -- "$GOAL")"

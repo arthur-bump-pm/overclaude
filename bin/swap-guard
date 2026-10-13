@@ -5,7 +5,7 @@
 #   whoami                          own session registry JSON (compact); exit 1 if not in a session
 #   sessions                        JSON array of OTHER live claude sessions (always exit 0)
 #   preflight <target>              switch-safety verdict JSON for slot number / alias / email (always exit 0)
-#   path flag|handoff|codex-handoff [--cwd <dir>]
+#   path flag|handoff|codex-handoff|remote-handoff [--cwd <dir>]
 #                                   print per-cwd state-file path (codex-handoff: overcodex's pending file)
 #   flag <json>                     validate + fill + atomic-write relaunch flag; prints path (exit 1 on bad input)
 #   status                          own-session status JSON (always exit 0)
@@ -46,7 +46,7 @@ usage: swap-guard <subcommand> [args]
   whoami                          own session registry JSON (compact)
   sessions                        JSON array of other live claude sessions
   preflight <target>              switch-safety verdict for slot / alias / email
-  path flag|handoff|codex-handoff [--cwd <dir>]
+  path flag|handoff|codex-handoff|remote-handoff [--cwd <dir>]
                                   print per-cwd state-file path (codex-handoff: where overcodex picks it up)
   flag <json>                     write relaunch flag ({"mode":"handoff"|"restart",...}); prints path
   status                          own-session status JSON
@@ -64,7 +64,7 @@ usage: swap-guard <subcommand> [args]
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
   fleet add <host> | rm <host> | list | status [--text]
                                   your other Macs (Tailscale SSH): sessions, accounts, dead logins, load
-  remote start <mac> [--dir D] [--name N] [goal…] | list <mac> | logs|stop|attach <mac> <id|name>
+  remote start <mac> [--dir D] [--name N] [goal…] | handoff <mac> [--dir D] [--name N] [--force] | list <mac> | logs|stop|attach <mac> <id|name>
                                   a session on another Mac you drive from claude.ai/code or the app
   artifacts [--session <id>] [--cwd <dir>]
                                   snapshot this session's artifacts (sources + manifest) for handoff
@@ -280,6 +280,8 @@ cmd_path() {
   case "$kind" in
     flag)    flag_path_for "$cwd";;
     handoff) pending_path_for "$cwd";;
+    # The package `/handoff <mac>` sends to another Mac (never loaded on this one).
+    remote-handoff) printf '%s/handoff-outbox-%s.md\n' "$STATE_ROOT" "$(hash_cwd "$cwd")";;
     # Where overcodex's SessionStart hook looks for a package in this cwd: same
     # header and hash convention, under the Codex home a new `codex` will use.
     codex-handoff)
@@ -1495,7 +1497,7 @@ _remote_ssh() {
 
 # Killed mid-call (Ctrl-C, TERM): remove the temp files and stop the ssh/watchdog
 # children. Globals, not locals: the trap runs after the function has returned.
-_RM_D=""; _RM_SF=""; _RM_P=""; _RM_W=""
+_RM_D=""; _RM_SF=""; _RM_P=""; _RM_W=""; _RM_PKGF=""; _RM_FORCE=0
 _remote_cleanup() {
   [ -n "$_RM_P" ] && _fleet_kill_tree "$_RM_P"
   [ -n "$_RM_W" ] && _fleet_kill_tree "$_RM_W"
@@ -1505,32 +1507,66 @@ _remote_cleanup() {
 }
 _remote_trap() { trap '_remote_cleanup' EXIT; trap '_remote_cleanup; exit 130' INT TERM; }
 
-_remote_start_script() { # <name> <dir-b64> <goal-b64>
+_remote_start_script() { # <name> <dir-b64> <goal-b64> [<package-b64> <force:0|1>]
   printf '%s\n' "$_remote_path"
-  printf "n='%s'; db='%s'; gb='%s'\n" "$1" "$2" "$3"
+  printf "n='%s'; db='%s'; gb='%s'; pb='%s'; force='%s'\n" "$1" "$2" "$3" "${4:-}" "${5:-0}"
   cat <<'EOF'
 dec() { [ -n "$1" ] || return 0; printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null; }
 d="$(dec "$db")"; g="$(dec "$gb")"
 [ -n "$d" ] || d="$HOME"
 case "$d" in "~") d="$HOME";; "~/"*) d="$HOME/${d#\~/}";; esac
 one() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | tr '\t\r\n' '   ' | cut -c1-400; }
-if ! cd "$d" 2>/dev/null; then printf 'result\terr\tno-dir\ndir\t%s\ndone\t1\n' "$(one "$d")"; exit 0; fi
+# -P: the physical path, which is the folder Claude reports (handoff headers match it)
+if ! cd -P "$d" 2>/dev/null; then printf 'result\terr\tno-dir\ndir\t%s\ndone\t1\n' "$(one "$d")"; exit 0; fi
 printf 'dir\t%s\n' "$(one "$PWD")"
 command -v claude >/dev/null 2>&1 || { printf 'result\terr\tno-claude\ndone\t1\n'; exit 0; }
+# A handoff package: written where this Mac's SessionStart hook (handoff-inject)
+# loads it for this folder, with the header rewritten to this folder and this
+# Mac's clock, plus a lasting copy the task points at, for a Mac without the hook.
+P=""; unpend() { :; }
+if [ -n "$pb" ]; then
+  om="$(umask)"; umask 077  # the package is private; restored before claude starts
+  sr="$HOME/.claude-swap-backup"; here="$(pwd -P)"
+  mkdir -p "$sr/handoff-remote" "$sr/handoff-archive" 2>/dev/null || { printf 'result\terr\tno-state\ndone\t1\n'; exit 0; }
+  command -v swap-guard >/dev/null 2>&1 && P="$(swap-guard path handoff --cwd "$here" 2>/dev/null)"
+  if [ -z "$P" ]; then
+    hh="$(printf '%s' "$here" | /usr/bin/shasum -a 256 | awk '{print $1}' | cut -c1-12)"
+    P="$sr/handoff-pending-$hh.md"
+  fi
+  if [ -f "$P" ]; then
+    c="$(sed -n '1s/.*created="\([0-9][0-9]*\)".*/\1/p' "$P" 2>/dev/null)"
+    # The same package again (a retry after a timeout) may replace itself.
+    same=0; [ "$(tail -n +2 "$P" 2>/dev/null)" = "$(dec "$pb" | tail -n +2)" ] && same=1
+    if [ "$force" != 1 ] && [ "$same" != 1 ] && [ -n "$c" ] && [ $(( $(date +%s) - c )) -lt 600 ]; then
+      printf 'result\terr\tpending-exists\ndone\t1\n'; exit 0
+    fi
+    hb="${P##*/}"; hb="${hb#handoff-pending-}"; hb="${hb%.md}"
+    mv -f "$P" "$sr/handoff-archive/$(date -u +%Y%m%d-%H%M%S)-$hb-replaced.md" 2>/dev/null
+  fi
+  C="$sr/handoff-remote/$n-$(date +%Y%m%d-%H%M%S).md"
+  { printf '<!-- handoff cwd="%s" created="%s" -->\n' "$here" "$(date +%s)"; dec "$pb" | tail -n +2; } > "$C" 2>/dev/null &&
+    cp "$C" "$P.tmp.$$" 2>/dev/null && mv -f "$P.tmp.$$" "$P" 2>/dev/null ||
+    { rm -f "$P.tmp.$$"; printf 'result\terr\tno-state\ndone\t1\n'; exit 0; }
+  umask "$om"
+  unpend() { rm -f "$P"; }  # the launch failed: don't leave it for an unrelated session here
+  inj=0; grep -q 'handoff-inject' "$HOME/.claude/settings.json" 2>/dev/null && inj=1
+  printf 'package\t%s\ninjector\t%s\n' "$(one "$C")" "$inj"
+  g="Continue from the handoff package from another Mac. If it is not already in your context, read it first: $C"
+fi
 set -- -n "$n" --remote-control "$n"; [ -n "$g" ] && set -- "$@" "Task: $g"
 out="$(claude --bg "$@" </dev/null 2>&1)"; rc=$?
 case "$out" in
-  *"not trusted"*) printf 'result\terr\tuntrusted\ndetail\t%s\ndone\t1\n' "$(one "$out")"; exit 0;;
+  *"not trusted"*) unpend; printf 'result\terr\tuntrusted\ndetail\t%s\ndone\t1\n' "$(one "$out")"; exit 0;;
 esac
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE "unknown option.*(--bg|--background)"; then
-  command -v tmux >/dev/null 2>&1 || { printf 'result\terr\tno-bg-no-tmux\ndone\t1\n'; exit 0; }
+  command -v tmux >/dev/null 2>&1 || { unpend; printf 'result\terr\tno-bg-no-tmux\ndone\t1\n'; exit 0; }
   # tmux session names can't hold "." or ":"; tmux 3.0+ runs a multi-word command
   # without a shell, so the goal stays one argument.
   if tmux new-session -d -s "$(printf '%s' "$n" | tr '.:' '__')" -c "$PWD" claude "$@" 2>/dev/null; then printf 'result\tok\ttmux\ndone\t1\n'
-  else printf 'result\terr\ttmux-failed\ndone\t1\n'; fi
+  else unpend; printf 'result\terr\ttmux-failed\ndone\t1\n'; fi
   exit 0
 fi
-if [ "$rc" -ne 0 ]; then printf 'result\terr\tfailed\ndetail\t%s\ndone\t1\n' "$(one "$out")"; exit 0; fi
+if [ "$rc" -ne 0 ]; then unpend; printf 'result\terr\tfailed\ndetail\t%s\ndone\t1\n' "$(one "$out")"; exit 0; fi
 printf 'result\tok\tbg\ndetail\t%s\ndone\t1\n' "$(one "$out")"
 EOF
 }
@@ -1541,6 +1577,7 @@ _remote_slug() { # free text → a session-name-safe slug (ASCII letters, digits
 
 _remote_start() {
   local h="" dir="" name="" goal="" raw rc k v res="" code="" mode="" detail="" rdir="" fix="" tab hs gs sf
+  local pkgf="$_RM_PKGF" force="$_RM_FORCE" pkg="" inj=""  # set only by _remote_handoff
   tab="$(printf '\t')"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1562,7 +1599,8 @@ _remote_start() {
   fi
   sf="$(mktemp "${TMPDIR:-/tmp}/swap-guard-remote-script.XXXXXX")" || return 1
   _RM_SF="$sf"; _remote_trap
-  _remote_start_script "$name" "$(printf '%s' "$dir" | base64 | tr -d '\n')" "$(printf '%s' "$goal" | base64 | tr -d '\n')" > "$sf"
+  _remote_start_script "$name" "$(printf '%s' "$dir" | base64 | tr -d '\n')" "$(printf '%s' "$goal" | base64 | tr -d '\n')" \
+    "$( [ -n "$pkgf" ] && base64 < "$pkgf" | tr -d '\n')" "$force" > "$sf"
   raw="$(SWAP_FLEET_TIMEOUT="${SWAP_FLEET_TIMEOUT:-10}" _remote_ssh "${SWAP_REMOTE_DEADLINE:-45}" "$sf" "$h" bash -s)"; rc=$?
   rm -f "$sf"; _RM_SF=""
   if ! _fleet_complete "$raw"; then
@@ -1577,6 +1615,7 @@ _remote_start() {
     case "$k" in
       result) res="${v%%"$tab"*}"; code="${v#*"$tab"}";;
       detail) detail="$v";; dir) rdir="$v";;
+      package) pkg="$v";; injector) inj="$v";;
     esac
   done <<EOF
 $raw
@@ -1584,7 +1623,10 @@ EOF
   if [ "$res" = ok ]; then
     mode="$code"
     jq -cn --arg h "$h" --arg n "$name" --arg m "$mode" --arg d "$rdir" --arg x "$detail" --arg p "$_remote_path" \
-      '{started:true, host:$h, name:$n, mode:$m, dir:$d, detail:(if $x == "" then null else $x end),
+      --arg pkg "$pkg" --arg inj "$inj" \
+      '{started:true, host:$h, name:$n, mode:$m, dir:$d, detail:(if $x == "" then null else $x end)}
+       + (if $pkg == "" then {} else {package:$pkg, injector:($inj == "1")} end)
+       + {
         next:("Open claude.ai/code (or the Claude app) and pick \"" + $n + "\"."
           + (if $m == "tmux" then " It runs in tmux there: ssh -t " + $h + " '\''" + $p + "; tmux attach -t " + ($n | gsub("[.:]"; "_")) + "'\''" else "" end))}'
     return 0
@@ -1594,6 +1636,8 @@ EOF
     no-dir)    fix="That folder does not exist on $h. Pass --dir <folder> (relative to its home, or ~/…).";;
     no-claude) fix="Claude Code is not installed (or not on PATH) on $h.";;
     no-bg-no-tmux) fix="Claude Code on $h is too old for --bg and tmux is missing: update Claude Code there (claude update).";;
+    pending-exists) fix="A different handoff for that folder arrived on $h less than 10 minutes ago. Re-run with --force to replace it.";;
+    no-state) fix="Could not write the package under ~/.claude-swap-backup on $h (disk full or permissions?).";;
     *) fix="Remote Control needs a /login login on $h (setup-tokens don't work); see the detail.";;
   esac
   jq -cn --arg h "$h" --arg n "$name" --arg c "${code:-failed}" --arg d "$rdir" --arg x "$detail" --arg f "$fix" \
@@ -1637,10 +1681,54 @@ _remote_resolve() {
   printf '%s\n' "$ids"
 }
 
+# remote handoff <mac> [--dir D] [--name N] [--force] [--cwd C]: send this folder's
+# outbox package (`swap-guard path remote-handoff`, written by /handoff <mac>) and
+# start a session there that continues from it. One SSH call carries both, so a
+# package never lands without a session or the other way round. The folder there
+# defaults to the same place relative to home.
+_remote_handoff() {
+  local h="" cwd_opt="" cwd f title dir="" name="" hs ts created out rc force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) cwd_opt="${2:-}"; shift 2 || shift;;
+      --dir) dir="${2:-}"; shift 2 || shift;;
+      --name) name="${2:-}"; shift 2 || shift;;
+      --force) force=1; shift;;
+      *) [ -z "$h" ] && h="$1"; shift;;
+    esac
+  done
+  _fleet_valid_host "$h" || { echo '{"error":"usage","detail":"swap-guard remote handoff <mac> [--dir <folder>] [--name <name>] [--force]"}'; return 2; }
+  cwd="$(resolve_cwd "$cwd_opt")"
+  f="$STATE_ROOT/handoff-outbox-$(hash_cwd "$cwd").md"
+  [ -f "$f" ] && [ ! -L "$f" ] || { jq -cn --arg f "$f" '{error:"no-package", detail:("write the package first: " + $f)}'; return 1; }
+  head -n 1 "$f" | grep -Eq '^<!-- handoff cwd=".*" created="[0-9]+" -->[[:space:]]*$' ||
+    { jq -cn --arg f "$f" '{error:"malformed-header", detail:("line 1 of " + $f + " must be the <!-- handoff cwd=... created=... --> header")}'; return 1; }
+  # An old outbox is a leftover (the skill writes it right before sending), never this handoff.
+  created="$(sed -n '1s/.*created="\([0-9][0-9]*\)".*/\1/p' "$f")"
+  [ $(( $(date +%s) - created )) -le 3600 ] || { jq -cn --arg f "$f" '{error:"stale-package", detail:("the package at " + $f + " was written over an hour ago; write it again for this handoff")}'; return 1; }
+  [ "$(LC_ALL=C wc -c < "$f" | tr -d ' ')" -le 65536 ] || { jq -cn '{error:"too-big", detail:"the package is over 64 KB; tighten it (aim for ~8,000 bytes)"}'; return 1; }
+  if [ -z "$dir" ]; then
+    # shellcheck disable=SC2088  # a literal ~: the worker expands it to its own home
+    case "$cwd" in "$HOME") dir="~";; "$HOME"/*) dir="~/${cwd#"$HOME"/}";; *) dir="$cwd";; esac
+  fi
+  if [ -z "$name" ]; then
+    title="$(sed -n '2s/^#[[:space:]]*//p' "$f" | sed 's/^Handoff[[:space:]]*[^A-Za-z0-9]*[[:space:]]*//')"
+    hs="$(_remote_slug "${h%%.*}" 20)"; [ -n "$hs" ] || hs="remote"
+    ts="$(_remote_slug "$title" 24)"; [ -n "$ts" ] || ts="$(date +%m%d-%H%M%S)"
+    name="$hs-$ts"
+  fi
+  out="$(_RM_PKGF="$f" _RM_FORCE="$force" _remote_start "$h" --dir "$dir" --name "$name")"; rc=$?
+  printf '%s\n' "$out"
+  # Sent and started: the outbox is done. On a failure it stays, so a retry needs no rewrite.
+  [ "$rc" -eq 0 ] && rm -f "$f"
+  return "$rc"
+}
+
 cmd_remote() {
   local sub="${1:-}" h ref id out rc text=0; [ $# -gt 0 ] && shift
   case "$sub" in
     start) _remote_start "$@"; exit $?;;
+    handoff) _remote_handoff "$@"; exit $?;;
     list)
       h="${1:-}"; [ "${2:-}" = "--text" ] && text=1
       _fleet_valid_host "$h" || { echo '{"error":"usage","detail":"swap-guard remote list <mac> [--text]"}'; exit 2; }
@@ -1678,7 +1766,7 @@ cmd_remote() {
         jq -cn --arg h "$h" --arg i "$id" --argjson rc "$rc" --arg x "$(printf '%s' "$out" | LC_ALL=C tr -d '\000-\010\013-\037\177' | tail -c 300)" '{error:(if $rc == 124 then "timeout" else "stop-failed" end), host:$h, id:$i, detail:$x}'; exit 1
       fi
       exit 0;;
-    *) echo "usage: swap-guard remote start <mac> [--dir D] [--name N] [goal…] | list <mac> [--text] | logs|stop|attach <mac> <id|name>" >&2; exit 2;;
+    *) echo "usage: swap-guard remote start <mac> [--dir D] [--name N] [goal…] | handoff <mac> [--dir D] [--name N] [--force] | list <mac> [--text] | logs|stop|attach <mac> <id|name>" >&2; exit 2;;
   esac
 }
 
