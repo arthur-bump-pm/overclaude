@@ -18,6 +18,7 @@
 #   keepalive tick|on|off|status    keep idle accounts' logins alive (LaunchAgent, on by default)
 #   token add|list|rm|run           one-year setup-tokens for headless jobs (keychain; never shown)
 #   fleet add|rm|list|status        other Macs over Tailscale SSH: sessions, accounts, logins
+#   remote start|list|logs|stop|attach  Remote Control sessions on another Mac (claude --bg)
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
 #                                   $STATE_ROOT/handoff-artifacts/<sid>/ + manifest.json; prints manifest
@@ -63,6 +64,8 @@ usage: swap-guard <subcommand> [args]
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
   fleet add <host> | rm <host> | list | status [--text]
                                   your other Macs (Tailscale SSH): sessions, accounts, dead logins, load
+  remote start <mac> [--dir D] [--name N] [goal…] | list <mac> | logs|stop|attach <mac> <id|name>
+                                  a session on another Mac you drive from claude.ai/code or the app
   artifacts [--session <id>] [--cwd <dir>]
                                   snapshot this session's artifacts (sources + manifest) for handoff
   artifacts find|list [words] [--account X]   search every artifact you have published
@@ -1453,6 +1456,232 @@ cmd_fleet() {
   esac
 }
 
+# --- remote: Claude sessions on a worker Mac, driven from claude.ai/code ----------
+# `remote start` launches `claude --bg --remote-control <name>` on the worker over
+# SSH (tmux when that Claude Code has no --bg), so the session shows up in
+# claude.ai/code and the phone app under <name>. Remote Control needs a /login login
+# on the worker (setup-tokens don't work). Free text (goal, folder) travels base64-
+# encoded inside the script on stdin, never through the remote shell's parser, and
+# the goal reaches claude as "Task: <goal>", so it can never be read as an option
+# or a subcommand. Every SSH call has a deadline: a hung worker never hangs us.
+_remote_valid_ref() { case "$1" in ''|-*|*[!A-Za-z0-9._-]*) return 1;; esac; return 0; }
+_remote_is_id() { case "$1" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0;; esac; return 1; }
+_remote_path='export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
+
+# _remote_ssh <deadline-secs> <stdin-file|""> <host> <remote command...>
+# The answer on stdout; status 124 when the deadline hit, 255 when ssh itself failed.
+_remote_ssh() {
+  local secs="$1" in="$2" d p w rc; shift 2
+  d="$(mktemp -d "${TMPDIR:-/tmp}/swap-guard-remote.XXXXXX")" || return 1
+  _RM_D="$d"; _remote_trap
+  [ -n "$in" ] || in=/dev/null
+  ( _fleet_ssh "$@" < "$in" > "$d/out" 2>/dev/null; echo "$?" > "$d/rc" ) &
+  p=$!; _RM_P="$p"
+  # `&&`: a watchdog whose sleep was killed (the call finished first) does nothing.
+  ( sleep "$secs" && { touch "$d/timeout"; _fleet_kill_tree "$p"; } ) >/dev/null 2>&1 &
+  w=$!; _RM_W="$w"
+  wait "$p" 2>/dev/null
+  _fleet_kill_tree "$w"; wait "$w" 2>/dev/null
+  _RM_P=""; _RM_W=""
+  cat "$d/out" 2>/dev/null
+  # A call that finished on its own wins, even if the deadline fired at the same
+  # moment; a status from being killed by the watchdog (>128) is the timeout.
+  rc="$(cat "$d/rc" 2>/dev/null)"; case "$rc" in ''|*[!0-9]*) rc="";; esac
+  if [ -e "$d/timeout" ] && { [ -z "$rc" ] || [ "$rc" -gt 128 ]; }; then rc=124; fi
+  rm -rf "$d"; _RM_D=""
+  case "$rc" in ''|*[!0-9]*) rc=1;; esac
+  return "$rc"
+}
+
+# Killed mid-call (Ctrl-C, TERM): remove the temp files and stop the ssh/watchdog
+# children. Globals, not locals: the trap runs after the function has returned.
+_RM_D=""; _RM_SF=""; _RM_P=""; _RM_W=""
+_remote_cleanup() {
+  [ -n "$_RM_P" ] && _fleet_kill_tree "$_RM_P"
+  [ -n "$_RM_W" ] && _fleet_kill_tree "$_RM_W"
+  [ -n "$_RM_D" ] && rm -rf "$_RM_D"
+  [ -n "$_RM_SF" ] && rm -f "$_RM_SF"
+  _RM_P=""; _RM_W=""; _RM_D=""; _RM_SF=""
+}
+_remote_trap() { trap '_remote_cleanup' EXIT; trap '_remote_cleanup; exit 130' INT TERM; }
+
+_remote_start_script() { # <name> <dir-b64> <goal-b64>
+  printf '%s\n' "$_remote_path"
+  printf "n='%s'; db='%s'; gb='%s'\n" "$1" "$2" "$3"
+  cat <<'EOF'
+dec() { [ -n "$1" ] || return 0; printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null; }
+d="$(dec "$db")"; g="$(dec "$gb")"
+[ -n "$d" ] || d="$HOME"
+case "$d" in "~") d="$HOME";; "~/"*) d="$HOME/${d#\~/}";; esac
+one() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | tr '\t\r\n' '   ' | cut -c1-400; }
+if ! cd "$d" 2>/dev/null; then printf 'result\terr\tno-dir\ndir\t%s\ndone\t1\n' "$(one "$d")"; exit 0; fi
+printf 'dir\t%s\n' "$(one "$PWD")"
+command -v claude >/dev/null 2>&1 || { printf 'result\terr\tno-claude\ndone\t1\n'; exit 0; }
+set -- -n "$n" --remote-control "$n"; [ -n "$g" ] && set -- "$@" "Task: $g"
+out="$(claude --bg "$@" </dev/null 2>&1)"; rc=$?
+case "$out" in
+  *"not trusted"*) printf 'result\terr\tuntrusted\ndetail\t%s\ndone\t1\n' "$(one "$out")"; exit 0;;
+esac
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE "unknown option.*(--bg|--background)"; then
+  command -v tmux >/dev/null 2>&1 || { printf 'result\terr\tno-bg-no-tmux\ndone\t1\n'; exit 0; }
+  # tmux session names can't hold "." or ":"; tmux 3.0+ runs a multi-word command
+  # without a shell, so the goal stays one argument.
+  if tmux new-session -d -s "$(printf '%s' "$n" | tr '.:' '__')" -c "$PWD" claude "$@" 2>/dev/null; then printf 'result\tok\ttmux\ndone\t1\n'
+  else printf 'result\terr\ttmux-failed\ndone\t1\n'; fi
+  exit 0
+fi
+if [ "$rc" -ne 0 ]; then printf 'result\terr\tfailed\ndetail\t%s\ndone\t1\n' "$(one "$out")"; exit 0; fi
+printf 'result\tok\tbg\ndetail\t%s\ndone\t1\n' "$(one "$out")"
+EOF
+}
+
+_remote_slug() { # free text → a session-name-safe slug (ASCII letters, digits, dashes); may be empty
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '-' | LC_ALL=C tr -s '-' | sed 's/^-//; s/-$//' | cut -c1-"${2:-24}" | sed 's/-$//'
+}
+
+_remote_start() {
+  local h="" dir="" name="" goal="" raw rc k v res="" code="" mode="" detail="" rdir="" fix="" tab hs gs sf
+  tab="$(printf '\t')"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)  dir="${2:-}"; shift 2 || shift;;
+      --name) name="${2:-}"; shift 2 || shift;;
+      --) shift; goal="$*"; break;;
+      *) if [ -z "$h" ]; then h="$1"; else goal="${goal:+$goal }$1"; fi; shift;;
+    esac
+  done
+  _fleet_valid_host "$h" || { echo '{"error":"usage","detail":"swap-guard remote start <mac> [--dir <folder>] [--name <name>] [goal…]"}'; return 2; }
+  if [ -n "$name" ]; then
+    { _remote_valid_ref "$name" && ! _remote_is_id "$name"; } || { jq -cn '{error:"bad-name", detail:"use letters, digits, dot, dash or underscore (not 8 hex characters, which look like a session id)"}'; return 2; }
+  else
+    # <mac>-<goal words>; no usable words (e.g. a goal in Korean) → <mac>-<time>.
+    hs="$(_remote_slug "${h%%.*}" 20)"; [ -n "$hs" ] || hs="remote"
+    gs="$(_remote_slug "$goal" 24)"; [ -n "$gs" ] || gs="$(date +%m%d-%H%M%S)"
+    name="$hs-$gs"
+    _remote_valid_ref "$name" || name="remote-$(date +%m%d-%H%M%S)"
+  fi
+  sf="$(mktemp "${TMPDIR:-/tmp}/swap-guard-remote-script.XXXXXX")" || return 1
+  _RM_SF="$sf"; _remote_trap
+  _remote_start_script "$name" "$(printf '%s' "$dir" | base64 | tr -d '\n')" "$(printf '%s' "$goal" | base64 | tr -d '\n')" > "$sf"
+  raw="$(SWAP_FLEET_TIMEOUT="${SWAP_FLEET_TIMEOUT:-10}" _remote_ssh "${SWAP_REMOTE_DEADLINE:-45}" "$sf" "$h" bash -s)"; rc=$?
+  rm -f "$sf"; _RM_SF=""
+  if ! _fleet_complete "$raw"; then
+    if [ "$rc" -eq 124 ]; then
+      jq -cn --arg h "$h" --arg n "$name" '{error:"timeout", host:$h, name:$n, detail:"no complete answer before the deadline; the session may have started anyway", fix:("Check before retrying: swap-guard remote list " + $h)}'
+    else
+      jq -cn --arg h "$h" --arg n "$name" '{error:"unreachable", host:$h, name:$n, detail:"no answer over SSH", fix:("Check: ssh " + $h + " true   (Remote Login on, key added with ssh-copy-id)")}'
+    fi
+    return 1
+  fi
+  while IFS="$tab" read -r k v; do
+    case "$k" in
+      result) res="${v%%"$tab"*}"; code="${v#*"$tab"}";;
+      detail) detail="$v";; dir) rdir="$v";;
+    esac
+  done <<EOF
+$raw
+EOF
+  if [ "$res" = ok ]; then
+    mode="$code"
+    jq -cn --arg h "$h" --arg n "$name" --arg m "$mode" --arg d "$rdir" --arg x "$detail" --arg p "$_remote_path" \
+      '{started:true, host:$h, name:$n, mode:$m, dir:$d, detail:(if $x == "" then null else $x end),
+        next:("Open claude.ai/code (or the Claude app) and pick \"" + $n + "\"."
+          + (if $m == "tmux" then " It runs in tmux there: ssh -t " + $h + " '\''" + $p + "; tmux attach -t " + ($n | gsub("[.:]"; "_")) + "'\''" else "" end))}'
+    return 0
+  fi
+  case "$code" in
+    untrusted) fix="On $h, run claude once in ${rdir:-that folder} and accept the trust prompt, or pass --dir <a project you already use there>.";;
+    no-dir)    fix="That folder does not exist on $h. Pass --dir <folder> (relative to its home, or ~/…).";;
+    no-claude) fix="Claude Code is not installed (or not on PATH) on $h.";;
+    no-bg-no-tmux) fix="Claude Code on $h is too old for --bg and tmux is missing: update Claude Code there (claude update).";;
+    *) fix="Remote Control needs a /login login on $h (setup-tokens don't work); see the detail.";;
+  esac
+  jq -cn --arg h "$h" --arg n "$name" --arg c "${code:-failed}" --arg d "$rdir" --arg x "$detail" --arg f "$fix" \
+    '{error:$c, host:$h, name:$n, dir:(if $d == "" then null else $d end), detail:(if $x == "" then null else $x end), fix:$f}'
+  return 1
+}
+
+# _remote_agents <host> → the worker's background sessions as a JSON array, its
+# strings stripped of control characters (they reach a terminal and the model).
+# Status 124 deadline, 255 ssh failed, 3 the answer was not the JSON we expect.
+_remote_agents() {
+  local out rc
+  out="$(_remote_ssh "${SWAP_REMOTE_DEADLINE:-20}" "" "$1" "$_remote_path; claude agents --json")"; rc=$?
+  [ "$rc" -eq 124 ] || [ "$rc" -eq 255 ] && return "$rc"
+  printf '%s' "$out" | jq -ce 'def clean: if type == "string" then gsub("[\u0000-\u001f\u007f]"; "") else . end;
+    [.[]? | select(.kind == "background") | {id, name:(.name // null), state:(.state // .status // null), cwd:(.cwd // null), startedAt:(.startedAt // null)} | map_values(clean)]' 2>/dev/null || return 3
+}
+
+_remote_agents_error() { # <host> <status> → the JSON error for a failed _remote_agents
+  case "$2" in
+    124) jq -cn --arg h "$1" '{error:"timeout", host:$h, detail:"no answer before the deadline"}';;
+    255) jq -cn --arg h "$1" '{error:"unreachable", host:$h, fix:("Check: ssh " + $h + " true")}';;
+    *)   jq -cn --arg h "$1" '{error:"bad-answer", host:$h, detail:"claude agents --json gave no session list there", fix:"Is Claude Code installed and up to date on that Mac? (claude update)"}';;
+  esac
+}
+
+# _remote_resolve <host> <id|name> → the session id: an exact id, else an exact name,
+# else a unique part of a name. Status 1 none, 4 more than one (ids on stdout), else
+# _remote_agents' status.
+_remote_resolve() {
+  local list rc ids
+  list="$(_remote_agents "$1")"; rc=$?
+  if [ "$rc" -ne 0 ]; then _remote_is_id "$2" && { printf '%s\n' "$2"; return 0; }; return "$rc"; fi
+  ids="$(printf '%s' "$list" | jq -r --arg r "$2" '
+      [.[] | select(.id == $r)] as $byid | [.[] | select(.name == $r)] as $exact
+    | (if ($byid | length) > 0 then $byid elif ($exact | length) > 0 then $exact
+       else [.[] | select((.name // "") | contains($r))] end) | .[].id')"
+  [ -n "$ids" ] || { _remote_is_id "$2" && { printf '%s\n' "$2"; return 0; }; return 1; }
+  if [ "$(printf '%s\n' "$ids" | wc -l | tr -d ' ')" -gt 1 ]; then printf '%s\n' "$ids"; return 4; fi
+  _remote_is_id "$ids" || return 1
+  printf '%s\n' "$ids"
+}
+
+cmd_remote() {
+  local sub="${1:-}" h ref id out rc text=0; [ $# -gt 0 ] && shift
+  case "$sub" in
+    start) _remote_start "$@"; exit $?;;
+    list)
+      h="${1:-}"; [ "${2:-}" = "--text" ] && text=1
+      _fleet_valid_host "$h" || { echo '{"error":"usage","detail":"swap-guard remote list <mac> [--text]"}'; exit 2; }
+      out="$(_remote_agents "$h")" || { _remote_agents_error "$h" "$?"; exit 1; }
+      if [ "$text" -eq 1 ]; then
+        printf '%s' "$out" | jq -r --arg h "$h" 'if length == 0 then "no background sessions on \($h)" else .[] | "\(.id)  \(.name // "-")  \(.state // "?")  \(.cwd // "")" end'
+      else printf '%s\n' "$out"; fi
+      exit 0;;
+    logs|stop|attach)
+      h="${1:-}"; ref="${2:-}"
+      { _fleet_valid_host "$h" && _remote_valid_ref "$ref"; } || { jq -cn --arg s "$sub" '{error:"usage", detail:("swap-guard remote " + $s + " <mac> <id|name>")}'; exit 2; }
+      if [ "$sub" = attach ]; then
+        if [ ! -t 0 ] || [ ! -t 1 ]; then
+          jq -cn --arg h "$h" --arg r "$ref" --arg p "$_remote_path" '{error:"needs-terminal", command:("ssh -t " + $h + " '\''" + $p + "; claude attach " + $r + "'\''")}'; exit 1
+        fi
+        exec ssh -t -o ConnectTimeout="${SWAP_FLEET_TIMEOUT:-5}" -- "$h" "$_remote_path; claude attach '$ref'"
+      fi
+      if [ "$sub" = logs ]; then
+        out="$(_remote_ssh "${SWAP_REMOTE_DEADLINE:-20}" "" "$h" "$_remote_path; claude logs '$ref'")"; rc=$?
+        printf '%s\n' "$out" | LC_ALL=C tr -d '\000-\010\013-\037\177'
+        [ "$rc" -eq 124 ] && echo "(stopped waiting after ${SWAP_REMOTE_DEADLINE:-20} s)" >&2
+        exit "$rc"
+      fi
+      id="$(_remote_resolve "$h" "$ref")"; rc=$?
+      case "$rc" in
+        0) :;;
+        1) jq -cn --arg h "$h" --arg r "$ref" '{error:"no-such-session", host:$h, ref:$r, fix:("See: swap-guard remote list " + $h)}'; exit 1;;
+        4) jq -cn --arg h "$h" --arg r "$ref" --arg ids "$id" '{error:"ambiguous", host:$h, ref:$r, ids:($ids | split("\n") | map(select(. != ""))), fix:"Stop it by id (swap-guard remote list shows them)."}'; exit 1;;
+        *) _remote_agents_error "$h" "$rc"; exit 1;;
+      esac
+      out="$(_remote_ssh "${SWAP_REMOTE_DEADLINE:-20}" "" "$h" "$_remote_path; claude stop '$id' 2>&1")"; rc=$?
+      if [ "$rc" -eq 0 ]; then
+        jq -cn --arg h "$h" --arg i "$id" '{stopped:true, host:$h, id:$i, detail:("Claude Code keeps its conversation; resume with: swap-guard remote attach " + $h + " " + $i)}'
+      else
+        jq -cn --arg h "$h" --arg i "$id" --argjson rc "$rc" --arg x "$(printf '%s' "$out" | LC_ALL=C tr -d '\000-\010\013-\037\177' | tail -c 300)" '{error:(if $rc == 124 then "timeout" else "stop-failed" end), host:$h, id:$i, detail:$x}'; exit 1
+      fi
+      exit 0;;
+    *) echo "usage: swap-guard remote start <mac> [--dir D] [--name N] [goal…] | list <mac> [--text] | logs|stop|attach <mac> <id|name>" >&2; exit 2;;
+  esac
+}
+
 # cmd_artifacts — snapshot every claude.ai artifact this session (and its subagents /
 # workflows) published or touched, so a handoff can carry them across sessions and
 # accounts. Source of truth is the transcript's structured toolUseResult
@@ -2830,6 +3059,7 @@ main() {
     auto)          cmd_auto "$@";;
     keepalive)     cmd_keepalive "$@";;
     token)         cmd_token "$@";;
+    remote)        cmd_remote "$@";;
     fleet)         cmd_fleet "$@";;
     artifacts)
       case "${1:-}" in

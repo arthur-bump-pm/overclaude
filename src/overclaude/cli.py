@@ -89,6 +89,8 @@ def main():
     p_up.add_argument("--check", action="store_true", help="only report installed vs latest")
     p_fl = sub.add_parser("fleet", help="your other Macs over Tailscale SSH: add <host> | rm <host> | list | status")
     p_fl.add_argument("args", nargs=argparse.REMAINDER)
+    p_rm = sub.add_parser("remote", help="a Claude session on another Mac, driven from claude.ai/code: start <mac> [goal] | list <mac> | logs|stop|attach <mac> <name>")
+    p_rm.add_argument("args", nargs=argparse.REMAINDER)
     sub.add_parser("path", help="print the bundled payload directory")
     sub.add_parser("version", help="print the overclaude version")
     args = ap.parse_args()
@@ -107,6 +109,12 @@ def main():
         if rest == ["status"]:
             rest = ["status", "--text"]
         sys.exit(subprocess.call(["bash", sg, "fleet", *rest]))
+    if args.cmd == "remote":
+        sg = shutil.which("swap-guard") or os.path.join(_payload_dir(), "bin", "swap-guard")
+        rest = args.args
+        if len(rest) == 2 and rest[0] == "list":
+            rest = [*rest, "--text"]
+        sys.exit(subprocess.call(["bash", sg, "remote", *rest]))
     if args.cmd == "path":
         print(_payload_dir())
         return

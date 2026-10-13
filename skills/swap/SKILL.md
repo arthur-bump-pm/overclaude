@@ -1,11 +1,11 @@
 ---
 name: swap
-description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, model-routing guard, kit health check, continue in the Codex CLI, your other Macs (fleet status, switch them off a capped account). Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
-argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | auto [on|off|status|instant on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | guard [on|off|status] | fleet [swap] | doctor [fix]"
+description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, model-routing guard, kit health check, continue in the Codex CLI, your other Macs (fleet status, switch them off a capped account, start a session there). Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
+argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | auto [on|off|status|instant on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | guard [on|off|status] | fleet [swap] | remote <mac> [goal] | doctor [fix]"
 allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(overclaude doctor *), Bash(bash *doctor.sh*)
 ---
 
-GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, routing guard, continue in Codex, fleet, doctor). Never invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task. If explicit consent is missing, STOP and ask. A dead account token is ALWAYS fixed with `swap-guard login <N>` (the relogin section) — never a plain `/login`, which kills the live account's token.
+GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, routing guard, continue in Codex, fleet, remote session, doctor). Never invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task. If explicit consent is missing, STOP and ask. A dead account token is ALWAYS fixed with `swap-guard login <N>` (the relogin section) — never a plain `/login`, which kills the live account's token.
 
 # /swap — Claude account switcher
 
@@ -17,7 +17,7 @@ GATE — read before acting. If this skill was invoked by you (the model) rather
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `guard`, `fleet` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `guard`, `fleet`, `remote` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Example: `/swap work handoff` ≡ `/swap handoff work`.
@@ -41,6 +41,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap spend [days N]` | what your usage would cost at API prices, by model / account / day, vs your plans | — |
 | `/swap guard [on\|off\|status]` | the routing guard that blocks un-routed subagents on Fable (default on) | — |
 | `/swap fleet [swap]` | your other Macs: sessions, accounts, dead logins; `swap` moves Macs on a capped account to the one with the most room | Macs added with `overclaude fleet add` |
+| `/swap remote <mac> [goal]` | start a Claude session on another Mac that you drive from claude.ai/code or the app; `remote list\|logs\|stop <mac>` | a /login login on that Mac |
 | `/swap artifacts [words] [account X]` | search every artifact you published, with its owning account | — |
 | `/swap doctor [fix]` | health check of the whole kit, with fixes; `fix` applies the safe ones | — |
 | `/handoff ...` | same-account handoff, `status`, `cancel`, `history`, `restore` — owned by the handoff skill, never duplicated here | — |
@@ -53,6 +54,7 @@ Edge rulings:
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
 - `relogin` takes the target account as its argument; it never switches.
 - `fleet` takes an optional `swap` (alone → status); it never has a target.
+- `remote` is followed either by `list`/`logs`/`stop`/`attach` and then the Mac (and a session name), or by the Mac and then free goal text; it never has an account target. A goal whose first word is one of those four words still works when the Mac comes first (`/swap remote mini stop the flaky test`).
 - `spend` takes an optional `days N` (default 7); `guard` takes `on`/`off`/`status` (alone → `status`). Neither has a target.
 - `codex` present (e.g. `/swap codex`, `/swap codex handoff`) → INVOKE the handoff skill as `/handoff codex` (continue in the Codex CLI); `codex` is never a Claude account target. This takes precedence over the `/swap handoff` (no target) ruling. An account aliased `codex` stays reachable by slot number or email.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
@@ -146,6 +148,12 @@ The routing guard is a PreToolUse hook (`swap-guard route-guard`): when the sess
 Your other Macs over Tailscale SSH. No Macs registered (`swap-guard fleet list` is `[]`) → say how to add one: on that Mac turn on Remote Login, then here `ssh-copy-id <mac>` and `overclaude fleet add <mac>`; never run `fleet add` yourself without the user naming the Mac.
 - `/swap fleet` → run `swap-guard fleet status --text` and show its lines (this Mac first). Point out offline Macs, `⚠ relogin` (fixed ON that Mac with `swap-guard login <slot>`), and Macs whose overclaude is behind this one.
 - `/swap fleet swap` → first `swap-guard fleet swap --dry-run`, show each Mac's planned move (`from` → `to`, or why it is skipped), and ask before running `swap-guard fleet swap`. Report each result (`switched` / `failed` with detail). It moves only Macs whose active account is capped by this Mac's usage numbers; each Mac switches with its own cswap. Logins are never copied between Macs.
+
+## `/swap remote <mac> [goal]`
+
+A Claude session on another Mac (registered with `overclaude fleet add`), started in the background with Remote Control so the user drives it from claude.ai/code or the Claude app. It runs on that Mac's own active account and needs a `/login` login there (setup-tokens can't do Remote Control). Start one only when the user asks for it in their own words.
+- `/swap remote <mac> <goal>` → `swap-guard remote start <mac> [--dir <folder>] -- '<goal>'`: put the goal in SINGLE quotes, writing each `'` inside it as `'\''`, so this shell never expands it. Add `--dir` only when the user names a folder on that Mac (relative paths are from its home). The session gets the goal as `Task: <goal>`. Report `name` and `next`. On an error relay `fix` (and `detail`): `untrusted` → the folder needs a one-time trust prompt on that Mac (or another `--dir`; the home folder often is untrusted); `failed` → usually no `/login` login there; `unreachable` → SSH (Remote Login, `ssh-copy-id`); `timeout` → it may have started anyway, so run `remote list` before retrying.
+- `/swap remote list <mac>` → `swap-guard remote list <mac> --text`. `logs <name>` → `swap-guard remote logs <mac> <name>`. `stop <name>` → `swap-guard remote stop <mac> <name>` (Claude Code keeps the conversation; `ambiguous` → show the `ids` and ask which). `attach <name>` needs a terminal: give the user the `command` it prints, to run in their own terminal.
 
 ## `/swap artifacts [words] [account X]`
 
