@@ -92,7 +92,7 @@ elif ! jq -e . "$SETTINGS" >/dev/null 2>&1; then
   _fail "$SETTINGS is not valid JSON — Claude Code ignores it" "fix the syntax (backups: $SETTINGS.bak-*)"
 else
   for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "Stop:ctx-notify.sh" \
-              "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" \
+              "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" \
               "PostToolUse:swap-guard artifact-log" "PreToolUse:swap-guard route-guard"; do
     ev="${pair%%:*}"; hk="${pair#*:}"
     if jq -e --arg ev "$ev" --arg hk "$hk" '[.hooks[$ev][]?.hooks[]?.command // ""] | any(contains($hk))' "$SETTINGS" >/dev/null 2>&1; then

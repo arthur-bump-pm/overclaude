@@ -26,6 +26,7 @@
 #   artifact-log                    PostToolUse hook (Artifact): append one publish to the registry
 #   ratelimit [--dry-run]           StopFailure hook (rate_limit): instant swap on a usage cap
 #   server-retry on|off|status|--hook  StopFailure hook (server_error|overloaded): capped auto-resume, opt-in
+#   loop-guard on|off|status|--hook    PostToolUseFailure hook: same call failing the same way, opt-in
 #   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
 #   login <slot|alias|email> | --new
 #                                   safe re-login / add that never overwrites the live account's token
@@ -70,6 +71,7 @@ usage: swap-guard <subcommand> [args]
   ratelimit [--dry-run] [--print] StopFailure hook: switch accounts the moment a usage cap hits
   auto instant on|off|status      enable/disable that instant swap (default: on)
   server-retry on|off|status      resume a session after a temporary server error (opt-in; max 3 tries/hour)
+  loop-guard on|off|status        tell Claude to rethink when one call keeps failing the same way (opt-in)
   budget [--hook]                 usage bands the model should know about (hook: inject on change)
   login <slot|alias|email>        re-login a dead account WITHOUT killing the live one's token
   login --new                     add a new account the same safe way
@@ -1813,6 +1815,66 @@ cmd_server_retry() {
   exit 2
 }
 
+# --- loop-guard: notice the same tool call failing the same way (opt-in) ----------
+# Wired as a PostToolUseFailure hook (all tools). A failure's signature is the tool
+# name, its input (minus the free-text description) and the error with digits and
+# whitespace folded, so timings and line numbers don't hide a repeat. Successes in
+# between don't reset the count (edit → same test fails again is the classic loop);
+# a different failure does. At SWAP_LOOP_MAX repeats (default 3) Claude is told to rethink; at twice
+# that, to stop and tell the user. Silent otherwise. Off by default.
+LG_ON="$STATE_ROOT/loop-guard.on"
+
+cmd_loop_guard() {
+  local input sid aid f raw sig tool prev="" n=0 ts=0 max now
+  case "${1:-}" in
+    on)  mkdir -p "$STATE_ROOT" && touch "$LG_ON"; jq -cn '{loopGuard:true}'; exit 0;;
+    off) rm -f "$LG_ON"; jq -cn '{loopGuard:false}'; exit 0;;
+    status|"") jq -cn --argjson on "$([ -f "$LG_ON" ] && echo true || echo false)" '{loopGuard:$on}'; exit 0;;
+    --hook) :;;
+    *) echo "usage: swap-guard loop-guard on|off|status" >&2; exit 1;;
+  esac
+  input="$(cat 2>/dev/null)" || input=""
+  [ -f "$LG_ON" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  [ "$(printf '%s' "$input" | jq -r '.is_interrupt // false' 2>/dev/null)" = "true" ] && exit 0
+  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-')"
+  [ -n "$sid" ] || exit 0
+  # Hooks inside a subagent carry agent_id (session_id appears to be the parent's,
+  # per the docs' SubagentStop example), so key on both: each agent keeps its own
+  # count, and parallel agents neither reset nor trip each other's.
+  aid="$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-64)"
+  tool="$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_.:-' | cut -c1-80)"
+  [ -n "$tool" ] || exit 0
+  raw="$(printf '%s' "$input" | jq -r '
+    [ .tool_name,
+      ((.tool_input // {}) | if type == "object" then del(.description) | to_entries | sort_by(.key) | from_entries else . end | tojson),
+      ((.error // "") | tostring | gsub("[0-9]+"; "0") | gsub("\\s+"; " ") | .[0:2000]) ] | join("\u001f")' 2>/dev/null)" || exit 0
+  [ -n "$raw" ] || exit 0
+  sig="$(printf '%s' "$raw" | cksum | tr -s ' ' '-')"
+  mkdir -p "$CTX_DIR" 2>/dev/null || exit 0
+  f="$CTX_DIR/$sid${aid:+.$aid}.loop"; now="$(date +%s)"
+  { read -r prev n ts < "$f"; } 2>/dev/null
+  case "$n" in ''|*[!0-9]*) n=0;; esac
+  case "$ts" in ''|*[!0-9]*) ts=0;; esac
+  # A repeat counts only within 30 min of the last one: the same failure coming
+  # back much later is not a loop.
+  if [ "$prev" = "$sig" ] && [ $(( now - ts )) -lt 1800 ]; then n=$((n + 1)); else n=1; fi
+  # Concurrent failures in one agent can lose an update (no lock): the count can
+  # only come out low, so the guard stays quiet rather than nagging.
+  { printf '%s %s %s\n' "$sig" "$n" "$now" > "$f"; } 2>/dev/null || exit 0
+  max="${SWAP_LOOP_MAX:-3}"; case "$max" in ''|*[!0-9]*|0*|1) max=3;; esac
+  if [ "$n" -eq "$max" ]; then
+    _auto_log "$(jq -cn --argjson ts "$now" --arg t "$tool" --arg s "$sid" --argjson n "$n" '{ts:($ts|todate), source:"loop-guard", action:"rethink", tool:$t, repeats:$n, session:$s}')"
+    printf 'overclaude loop guard: this exact %s call has now failed the same way %s times in a row. Do not run it again unchanged: reread the error, question the assumption behind the call, and try a different approach (or ask the user if you are stuck).\n' "$tool" "$n" >&2
+    exit 2
+  elif [ "$n" -eq $((max * 2)) ]; then
+    _auto_log "$(jq -cn --argjson ts "$now" --arg t "$tool" --arg s "$sid" --argjson n "$n" '{ts:($ts|todate), source:"loop-guard", action:"stop", tool:$t, repeats:$n, session:$s}')"
+    printf 'overclaude loop guard: this exact %s call has failed the same way %s times in a row. Stop retrying it and tell the user what is failing and what you have tried.\n' "$tool" "$n" >&2
+    exit 2
+  fi
+  exit 0
+}
+
 # --- budget: tell the model when usage crosses a band (UserPromptSubmit hook) ------
 # ULTRACODE's budget-pressure rules key off "Fable ~75%+", a number the model cannot
 # see. `budget --hook` injects one line when the active account crosses a band
@@ -1892,7 +1954,7 @@ $line
 EOF
   f="$CTX_DIR/$sid.budget"
   # Per-session state for sessions long gone is pruned as we go.
-  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' \) -mtime +7 -delete 2>/dev/null
+  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' \) -mtime +7 -delete 2>/dev/null
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
@@ -2779,6 +2841,7 @@ main() {
     artifact-log)  cmd_artifact_log "$@";;
     ratelimit)     cmd_ratelimit "$@";;
     server-retry)  cmd_server_retry "$@";;
+    loop-guard)    cmd_loop_guard "$@";;
     budget)        cmd_budget "$@";;
     login)         cmd_login "$@";;
     version-check) cmd_version_check "$@";;

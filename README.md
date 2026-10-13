@@ -23,7 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
-| 1.5.0 | 🚧 in progress | Logins that stay alive (keepalive, dead-login alert, long-lived tokens for headless jobs), your other Macs over Tailscale (fleet status, moving them off a capped account), resume after server errors, instruction-size check. Still planned: remote sessions, job queue — see [docs/plan-1.5.md](docs/plan-1.5.md) |
+| 1.5.0 | 🚧 in progress | Logins that stay alive (keepalive, dead-login alert, long-lived tokens for headless jobs), your other Macs over Tailscale (fleet status, moving them off a capped account), resume after server errors, loop guard, instruction-size check. Still planned: remote sessions, job queue — see [docs/plan-1.5.md](docs/plan-1.5.md) |
 | **1.4.0** | ✅ released 2026-10-09 | Codex as a fallback and a reviewer (`/handoff codex`, Codex limits on the statusline, `swap-guard codex-review`), model-routing guard for subagents, spend report with API-price value of your usage, works with overcodex 0.3 (Codex skills) |
 | 1.3.1 | released 2026-10-09 | QA fixes for 1.3: `/swap` from plain requests (behind a consent gate), artifact links, terminal y/N during re-login, accurate token status in doctor |
 | 1.3.0 | released 2026-10-09 | Instant swap on usage caps, safe re-login, usage notes for the model, artifact registry, `overclaude update`, `doctor --fix`, release gate |
@@ -41,6 +41,7 @@ Plan and status: [docs/plan-1.5.md](docs/plan-1.5.md). Built so far:
 - **Long-lived tokens for headless jobs** — `swap-guard token add <account>` runs `claude setup-token` with its output hidden (you see only the sign-in link), checks that the one-year token works with one tiny `claude -p`, and stores it in the keychain. The token never appears on screen, in a file or in a process list. `swap-guard token run <account> -- claude -p "…"` runs one command with it. These tokens only make model requests (no Remote Control, no usage figures), so they are for scripts and worker Macs; interactive sessions keep their normal logins. `overclaude doctor` warns 30 days before one expires.
 - **Your other Macs, from this one** — `overclaude fleet add <mac>` registers a Mac on your Tailscale network (SSH with a key, never a password prompt). `overclaude fleet` then shows every Mac: sessions (and how many are busy), which accounts are logged in and which is active, dead logins, load and memory, overclaude version. The statusline gets a `↳ fleet 3/3 macs · 7 sessions` line (refreshed in the background every 10 minutes; `SWAP_HIDE_FLEET=1` hides it), and `overclaude doctor` flags offline Macs, outdated kits and dead logins there. When an account hits its limit, the instant swap now also moves your other Macs off it, each to the account with the most room among those logged in there (`/swap fleet swap` does it by hand, after showing the plan). Logins are never copied between Macs: each Mac logs in to its own accounts.
 - **Resume after server errors (opt-in)** — `/swap auto retry on`: when a turn dies on a temporary server error (`server_error` / `overloaded`), the session waits (30 s, 2 min, 5 min) and continues by itself, at most 3 times per session per hour. Off by default.
+- **Loop guard (opt-in)** — `/swap auto loop on`: when the same tool call fails the same way 3 times in a row (timings and line numbers don't hide a repeat; successful calls in between don't reset it, a different failure does; repeats more than 30 min apart don't count), Claude is told to stop repeating it and try a different approach; at 6, to stop and tell you. Silent otherwise. Off by default; `SWAP_LOOP_MAX` changes the 3.
 - **Instruction-size check** — `overclaude doctor` reports how big your global instructions are (CLAUDE.md plus its `@` imports, loaded into every session), warns past ~40 KB, and flags imports that point at missing files.
 
 ## What's new in 1.4
@@ -192,6 +193,7 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `swap-guard keepalive on\|off\|status` *(shell)* | Background refresh that keeps idle accounts' logins alive (default on) *(1.5)* |
 | `overclaude fleet [add <mac>\|rm <mac>\|list]` *(shell)* | Your other Macs over Tailscale: sessions, accounts, dead logins, load *(1.5)* |
 | `/swap auto retry on\|off` | Resume a session after a temporary server error (opt-in, max 3 tries/hour) *(1.5)* |
+| `/swap auto loop on\|off` | Tell Claude to rethink when one tool call keeps failing the same way (opt-in) *(1.5)* |
 | `swap-guard token add\|list\|rm\|run` *(shell)* | One-year tokens for `claude -p` jobs, kept in the keychain, never shown *(1.5)* |
 | `overclaude update` *(shell)* | Upgrade from PyPI and reinstall the kit |
 | `swap-guard artifacts find <words>` *(shell)* | Search every artifact published from this machine, with its owner |

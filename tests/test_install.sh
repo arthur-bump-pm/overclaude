@@ -24,7 +24,8 @@ assert_eq "$?" "0" "install exits 0"
 assert_contains "$(cat "$HOME/i1.log")" "Instant swap is ON" "the installer says when it turns instant swap on"
 assert_contains "$(cat "$HOME/i1.log")" "Routing guard is ON" "and when it turns the routing guard on"
 for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "UserPromptSubmit:swap-guard budget --hook" \
-            "Stop:ctx-notify.sh" "StopFailure:swap-guard ratelimit" "PostToolUse:swap-guard artifact-log"; do
+            "Stop:ctx-notify.sh" "StopFailure:swap-guard ratelimit" "PostToolUse:swap-guard artifact-log" \
+            "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard"; do
   ev="${pair%%:*}"; hk="${pair#*:}"
   assert_eq "$(jq --arg e "$ev" --arg h "$hk" '[.hooks[$e][]?.hooks[]?.command // "" | select(contains($h))] | length' "$S")" "1" "$ev hook → $hk registered once"
 done

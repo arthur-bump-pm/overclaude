@@ -88,7 +88,7 @@ Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on
 
 - **Auto-resume after server errors.** ✅ Built (`swap-guard server-retry`, `/swap auto retry`, `tests/test_retry.sh`). Opt-in StopFailure hook (matcher `server_error|overloaded`, asyncRewake): waits 30 s, 2 min, 5 min, at most 3 tries per session per hour, then gives up and logs it. Only the last wake tells Claude to stop if it fails again.
 - **Instruction-size check in doctor.** ✅ Built (CLAUDE.md + `@` imports, 40 KB budget, missing imports flagged). Warns when CLAUDE.md and the files it imports exceed a size budget.
-- **Loop guard (experimental).** Spots the same tool call failing the same way several times in a row and tells Claude to stop and rethink. Off by default.
+- **Loop guard (experimental).** ✅ Built (`swap-guard loop-guard`, `/swap auto loop`, `tests/test_loop.sh`; PostToolUseFailure hook, 3 repeats → rethink, 6 → stop and tell the user). Spots the same tool call failing the same way several times in a row and tells Claude to stop and rethink. Off by default.
 
 ## Will not do
 
