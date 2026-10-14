@@ -87,7 +87,7 @@ def main():
     p_doc.add_argument("--fix", action="store_true", help="apply the safe repairs, then check again")
     p_up = sub.add_parser("update", help="upgrade overclaude from PyPI and reinstall the kit")
     p_up.add_argument("--check", action="store_true", help="only report installed vs latest")
-    p_fl = sub.add_parser("fleet", help="your other Macs over Tailscale SSH: add <host> | rm <host> | list | status | swap [--from <email>] [--dry-run]")
+    p_fl = sub.add_parser("fleet", help="your other Macs over Tailscale SSH: add <host> | rm <host> | list | status | swap [--from <email>] [--dry-run] | auto on|off")
     p_fl.add_argument("args", nargs=argparse.REMAINDER)
     p_rm = sub.add_parser("remote", help="a Claude session on another Mac, driven from claude.ai/code: start <mac> [goal] | list <mac> | logs|stop|attach <mac> <name>")
     p_rm.add_argument("args", nargs=argparse.REMAINDER)

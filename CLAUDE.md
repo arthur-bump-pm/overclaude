@@ -12,7 +12,7 @@ This repo is the **published** overclaude kit: GitHub (arthur-bump-pm/overclaude
 ## Rules
 
 - Keep repo copies and live files **byte-identical** — that's what keeps sync.sh diffs clean. If you edit a kit file in the repo directly, also run `./install.sh` to propagate it to the live setup.
-- Never weaken the scrub gate in sync.sh. No usernames, emails, or `/Users/...` paths in any committed file — use `$HOME`, generic aliases (`work`/`personal`), and `myproject` in examples.
+- Never weaken the scrub gate in sync.sh. Once per clone, `bash scrub.sh --install-hook` adds a pre-push check for commits made outside sync.sh; `bash scrub.sh --history` scans every commit. No usernames, emails, or `/Users/...` paths in any committed file — use `$HOME`, generic aliases (`work`/`personal`), and `myproject` in examples.
 - `vendor/claude-swap/` is unmodified third-party source (MIT, credited in README). Never edit it in place; version bumps follow `vendor/README.md`.
 - For a minor/major version bump (new feature / breaking change), edit `version` in pyproject.toml manually before `./sync.sh --release` (it only auto-bumps the patch level).
 - After releasing, remind the user that other machines update via `pipx upgrade overclaude && overclaude install`.

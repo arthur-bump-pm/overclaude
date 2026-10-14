@@ -20,7 +20,7 @@
 #   forecast [--text]               when you run out at this pace, and which account to use first
 #   prewarm on|off|status|tick      start idle accounts' 5-hour windows early (opt-in; long-lived tokens)
 #   token add|list|rm|run           one-year setup-tokens for headless jobs (keychain; never shown)
-#   fleet add|rm|list|status|swap   other Macs over Tailscale SSH: sessions, accounts, logins
+#   fleet add|rm|list|status|swap|auto  other Macs over Tailscale SSH: sessions, accounts, logins
 #   remote start|list|logs|stop|attach  Remote Control sessions on another Mac (claude --bg)
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
@@ -72,7 +72,7 @@ usage: swap-guard <subcommand> [args]
                                   start idle accounts' 5-hour windows early (opt-in; needs token add)
   token add <account> | list | rm <account> | run <account> -- <cmd...>
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
-  fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run]
+  fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run] | auto on|off
                                   your other Macs (Tailscale SSH): sessions, accounts, dead logins, load;
                                   swap moves them off a capped account
   remote start <mac> [--dir D] [--name N] [goal…] | handoff <mac> [--dir D] [--name N] [--force] | list <mac> | logs|stop|attach <mac> <id|name>
@@ -1979,6 +1979,8 @@ EOF
   printf '%s\n' "$out" | jq -sc '.'
 }
 
+FLEET_SWAP_OFF="$STATE_ROOT/fleet-swap.off"
+
 cmd_fleet() {
   local sub="${1:-status}"; [ $# -gt 0 ] && shift
   case "$sub" in
@@ -1988,7 +1990,17 @@ cmd_fleet() {
     status) _fleet_status "$@"; exit $?;;
     swap)   _fleet_swap "$@"; exit $?;;
     follow) _fleet_follow "$@"; exit $?;;
-    *) echo "usage: swap-guard fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run]" >&2; exit 2;;
+    # Whether an instant swap here also moves the other Macs off the capped account
+    # (default on; remembered). SWAP_NO_FLEET_SWAP=1 still turns it off per process.
+    auto)
+      case "${1:-status}" in
+        on)  rm -f "$FLEET_SWAP_OFF";;
+        off) mkdir -p "$STATE_ROOT" && touch "$FLEET_SWAP_OFF";;
+        status) :;;
+        *) echo "usage: swap-guard fleet auto on|off|status" >&2; exit 2;;
+      esac
+      jq -cn --argjson on "$([ -f "$FLEET_SWAP_OFF" ] && echo false || echo true)" '{fleetAuto:$on}'; exit 0;;
+    *) echo "usage: swap-guard fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run] | auto on|off" >&2; exit 2;;
   esac
 }
 
@@ -2612,7 +2624,7 @@ cmd_ratelimit() {
   [ "$notify" -eq 1 ] &&
     _auto_notify "${model:-Usage} limit on $from_l → switched to $to_l. If the session does not resume by itself, send any message."
   # Other Macs on the capped account follow (background: SSH must never delay the wake).
-  if [ -n "$(_fleet_hosts)" ] && [ -z "${SWAP_NO_FLEET_SWAP:-}" ]; then
+  if [ -n "$(_fleet_hosts)" ] && [ -z "${SWAP_NO_FLEET_SWAP:-}" ] && [ ! -f "$FLEET_SWAP_OFF" ]; then
     local from_e; from_e="$(printf '%s' "$list" | jq -r --arg f "$from" 'first(.accounts[]? | select((.number | tostring) == $f)) | .email // empty' 2>/dev/null)"
     [ -n "$from_e" ] && ( "$0" fleet swap --from "$from_e" --model "$model" $([ "$notify" -eq 1 ] && echo --notify) >/dev/null 2>&1 & )
   fi

@@ -102,6 +102,8 @@ fi
 if [ "$RELEASE" = yes ]; then
   echo
   echo "== release gate (tests before anything ships) =="
+  # Homebrew's folders aren't on PATH in every shell (Claude Code's `!` runs a bare one).
+  PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
   command -v shellcheck >/dev/null 2>&1 || {
     echo "release: shellcheck not found — brew install shellcheck" >&2; exit 1; }
   shellcheck -S error bin/swap-guard hooks/*.sh statusline/statusline-command.sh \
@@ -139,9 +141,13 @@ if [ "$NOTHING_TO_COMMIT" = no ]; then
   # commits those too). Not scanned: vendor/ — verbatim upstream source whose
   # own test fixtures use placeholder emails; the repo rules forbid editing it.
   # The matching rules live in scrub.sh (tested by tests/test_scrub.sh).
-  DIFF=$(git diff -- . ':(exclude)vendor'; git diff --cached -- . ':(exclude)vendor'
+  DIFF=$(git diff --no-color --no-ext-diff --no-textconv -- . ':(exclude)vendor'; git diff --no-color --no-ext-diff --no-textconv --cached -- . ':(exclude)vendor'
          git ls-files --others --exclude-standard -z -- . ':(exclude)vendor' |
            xargs -0 -I{} sed 's/^/+/' {} 2>/dev/null)
+  # First prove the gate itself still works: it must catch a planted path, email
+  # and username (a broken rule would otherwise pass everything silently).
+  bash ./scrub.sh --self-test "$ME" >/dev/null || {
+    echo "sync: ABORTED — scrub.sh failed its self-test (run: bash scrub.sh --self-test)" >&2; exit 1; }
   HITS=$(printf '%s\n' "$DIFF" | bash ./scrub.sh "$ME")
   if [ -n "$HITS" ]; then
     echo

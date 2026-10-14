@@ -137,6 +137,10 @@ reset_state
 hit s1 "$CAP"
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$HOME/ssh-calls" ] && break; sleep 0.5; done
 assert_contains "$(cat "$HOME/ssh-calls" 2>/dev/null)" "w1" "otherwise the other Macs are checked for a fleet swap"
+"$SG" fleet auto off >/dev/null; rm -f "$HOME/ssh-calls"; reset_state
+hit s1 "$CAP"; sleep 2
+assert_eq "$(switches):$([ -s "$HOME/ssh-calls" ] && echo ssh || echo none)" "switch 1;:none" "fleet auto off (remembered): swap here, other Macs untouched"
+assert_eq "$("$SG" fleet auto on | jq -r .fleetAuto)" "true" "fleet auto on undoes it"
 rm -f "$HOME/.claude-swap-backup/fleet.json"
 
 rm -rf "$HOME"

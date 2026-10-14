@@ -42,7 +42,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap forecast` | when your accounts run out at this pace, and which account to use first so its week doesn't reset unused | — |
 | `/swap spend [days N]` | what your usage would cost at API prices, by model / account / day, vs your plans | — |
 | `/swap guard [on\|off\|status]` | the routing guard that blocks un-routed subagents on Fable (default on) | — |
-| `/swap fleet [swap]` | your other Macs: sessions, accounts, dead logins; `swap` moves Macs on a capped account to the one with the most room | Macs added with `overclaude fleet add` |
+| `/swap fleet [swap\|auto on\|off]` | your other Macs: sessions, accounts, dead logins; `swap` moves Macs on a capped account to the one with the most room; `auto off` stops the instant swap here from moving them | Macs added with `overclaude fleet add` |
 | `/swap remote <mac> [goal]` | start a Claude session on another Mac that you drive from claude.ai/code or the app; `remote list\|logs\|stop <mac>` | a /login login on that Mac |
 | `/swap artifacts [words] [account X]` | search every artifact you published, with its owning account | — |
 | `/swap doctor [fix]` | health check of the whole kit, with fixes; `fix` applies the safe ones | — |
@@ -55,7 +55,7 @@ Edge rulings:
 - `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
 - `relogin` takes the target account as its argument; it never switches.
-- `fleet` takes an optional `swap` (alone → status); it never has a target.
+- `fleet` takes an optional `swap`, or `auto on|off` (alone → status); it never has a target. `fleet auto off` → `swap-guard fleet auto off`: an instant swap here no longer moves the other Macs (remembered).
 - `remote` is followed either by `list`/`logs`/`stop`/`attach` and then the Mac (and a session name), or by the Mac and then free goal text; it never has an account target. A goal whose first word is one of those four words still works when the Mac comes first (`/swap remote mini stop the flaky test`).
 - `forecast` takes nothing else and never has a target; it never switches.
 - `spend` takes an optional `days N` (default 7); `guard` takes `on`/`off`/`status` (alone → `status`). Neither has a target.

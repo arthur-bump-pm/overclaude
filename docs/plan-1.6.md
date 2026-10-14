@@ -1,6 +1,6 @@
 # overclaude 1.6 plan — use every account well, and re-login without friction
 
-Status: 🚧 in progress (plan written 2026-10-14). Part A (this Mac) is being built now. Part B (worker re-login and the job queue) waits until there are real worker Macs to test on.
+Status: ✅ Part A released as 1.6.0 on 2026-10-14 (plan written the same day). Part B (worker re-login and the job queue) moved to 1.7: it waits until there are real worker Macs to test on.
 
 Two goals:
 
@@ -36,7 +36,7 @@ Several ideas here were prompted by [claude-cockpit](https://github.com/christia
 - Simulates the next 7 days in 15-minute steps: use the account with room whose week resets soonest; each account refills at its reset. Reports when you would run out (or that you last the week), and how much room each account will lose unused at its reset.
 - The hint names the account to use first: the one with room that resets soonest. When room would expire unused, it says so ("personal: 100% left, resets in 1h 36m — use it first"). It points at `swap-guard auto install --strategy consume-first` to make this automatic.
 - The same simulation for the Fable (per-model) limit.
-- Statusline: on an inactive account's line, `⏳ 100% unused · resets 1h 36m` when it has at least 30% room left and resets within 24 h. On line 2, `⚠ out ~Sat 14:00` when the forecast runs out within 24 h. Cached; a render never computes it inline more than every 5 minutes.
+- Statusline: on an inactive account's line, `⏳ use first` when it has at least 30% room left and its week resets within 24 h and before the active account's. On line 2, `⚠ accounts out ~Sat 14:00` when the forecast runs out within 24 h. A render only reads the forecast cache, refreshed in the background at most every 5 minutes.
 
 ### A2. Start an idle account's 5-hour window early (opt-in)
 
@@ -54,12 +54,12 @@ Several ideas here were prompted by [claude-cockpit](https://github.com/christia
 - `login N` picks the Chrome profile for that account: your saved choice first (only the profile's folder name is saved), else the profile signed in to the same Google address. `browser list` shows profiles and their Google addresses on screen; addresses are never logged or saved. The opener lives in the login's private temporary folder, with the profile name quoted. It points `BROWSER` at a two-line opener for that profile, so the sign-in page opens there, and says which profile it used. No match (or no Chrome): the default browser, as before.
 - Nothing about the consent page is automated.
 
-### A4. Smaller items
+### A4. Smaller items ✅
 
 - `scrub.sh --self-test` (proves the gate still catches a planted path, email and username) and `scrub.sh --history` (scans every commit), plus an optional pre-push hook.
-- 1.5 leftovers: `SWAP_NO_FLEET_SWAP` as a remembered setting instead of an environment variable.
+- 1.5 leftovers: `SWAP_NO_FLEET_SWAP` as a remembered setting instead of an environment variable (`swap-guard fleet auto on|off`).
 
-## Part B — worker Macs (waits for real Macs)
+## Part B — worker Macs (moved to 1.7; waits for real Macs)
 
 - **Re-login on a worker** (`swap-guard login N --host <mac>`): the worker prints the sign-in link, you open it here, the code is pasted back over SSH. Needs test S4 from the 1.5 plan on a real worker.
 - **Job queue**: hand a headless task to whichever Mac has room (`overclaude job add|list|logs`), running on that Mac's long-lived token.
