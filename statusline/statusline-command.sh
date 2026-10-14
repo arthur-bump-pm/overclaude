@@ -363,6 +363,16 @@ other_accounts_lines() {
     esac
     if [ -n "$dead" ]; then seg="$seg ${RED}⚠ relogin${RESET}"
     else lw=$(login_warn "$slot"); [ -n "$lw" ] && seg="$seg $lw"; fi
+    # "⏳ use first": at least 30% of its week left, resetting within a day and before
+    # the active account's week — use it now or that room is lost (swap-guard forecast).
+    case "$r7" in
+      ''|*[!0-9]*) : ;;
+      *) if [ -z "$dead" ] && [ -z "${lw:-}" ] && [ "$r7" -gt "$now" ] && [ $(( r7 - now )) -lt 86400 ] &&
+            awk -v p="${p7:-100}" 'BEGIN { exit !(p + 0 <= 70) }' &&
+            { [ -z "${week_reset_epoch:-}" ] || [ "$r7" -lt "$week_reset_epoch" ]; }; then
+           seg="$seg ${YELLOW}⏳ use first${RESET}"
+         fi ;;
+    esac
     case "$fetched" in
       ''|*[!0-9]*) [ -z "$p7$p5" ] && seg="$seg ${DIM}(no usage data)${RESET}" ;;
       *) [ $(( now - fetched )) -gt 900 ] && seg="$seg ${DIM}($(fmt_left $(( now - fetched ))) old)${RESET}" ;;
@@ -464,6 +474,27 @@ spend_segment() {
 }
 spend_seg=$(spend_segment 2>/dev/null) || spend_seg=""
 [ -n "$spend_seg" ] && line2="$line2 | ${DIM}${spend_seg}${RESET}"
+
+# Run-out warning: at this pace every account's week runs out within a day
+# (swap-guard forecast, refreshed in the background every 5 minutes; a render only
+# reads its cache). SWAP_HIDE_FORECAST=1 hides it.
+forecast_segment() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock out
+  [ -z "${SWAP_HIDE_FORECAST:-}" ] && command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/forecast.json"; now=$(date +%s); m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( now - m )) -ge 300 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/forecast.lock"
+    if [ -z "$(find "$lock" -mmin -5 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" forecast >/dev/null 2>&1 & )
+    fi
+  fi
+  out=$(jq -r '.week.runsOutAt // empty' "$cache" 2>/dev/null)
+  case "$out" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$out" -gt $(( now - 900 )) ] && [ $(( out - now )) -lt 86400 ] || return 0
+  printf '⚠ accounts out ~%s' "$(date -r "$out" '+%a %H:%M')"
+}
+fc_seg=$(forecast_segment 2>/dev/null) || fc_seg=""
+[ -n "$fc_seg" ] && line2="$line2 | ${RED}${fc_seg}${RESET}"
 
 printf "%s\n" "$line1"
 printf "%s\n" "$line2"

@@ -274,6 +274,12 @@ elif [ -f "$STATE_ROOT/keepalive.off" ]; then
 else
   _warn "keepalive agent not installed" "swap-guard keepalive on"
 fi
+if [ -f "$STATE_ROOT/prewarm.on" ]; then
+  ntok=$(jq 'length' "$STATE_ROOT/tokens.json" 2>/dev/null || echo 0)
+  if [ -f "$STATE_ROOT/keepalive.off" ]; then _warn "idle-window pre-warm is on, but it runs inside keepalive, which is off" "swap-guard keepalive on"
+  elif [ "${ntok:-0}" -eq 0 ] 2>/dev/null; then _warn "idle-window pre-warm is on, but no account has a long-lived token" "swap-guard token add <account>   (in a terminal)"
+  else ok "idle-window pre-warm on ($ntok account(s) with a long-lived token)"; fi
+fi
 if [ -f "$STATE_ROOT/tokens.json" ]; then
   jq -r --argjson now "$(date +%s)" 'to_entries[] | "\(.key)\t\(((.value.expires - $now) / 86400) | floor)"' "$STATE_ROOT/tokens.json" 2>/dev/null |
   while IFS="$(printf '\t')" read -r acct days; do

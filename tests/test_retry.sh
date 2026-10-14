@@ -40,7 +40,9 @@ printf '{"session_id":"../../x","error":"server_error"}' | "$SG" server-retry --
 assert_eq "$([ -e "$B/x.retry" ] || [ -e "$HOME/x.retry" ] && echo leaked || echo ok)" "ok" "session id cannot escape the state dir"
 # The session moved on while the hook waited (asyncRewake: the user can type) → no late "continue".
 tp="$HOME/t.jsonl"; echo x > "$tp"; touch -t 202001010000 "$tp"
-( printf '{"session_id":"s6","error":"server_error","transcript_path":"%s"}' "$tp" | SWAP_RETRY_GRACE=0 SWAP_RETRY_DELAYS="2 2 2" "$SG" server-retry --hook 2>/dev/null; echo $? > "$HOME/rc6" ) &
+( printf '{"session_id":"s6","error":"server_error","transcript_path":"%s"}' "$tp" | SWAP_RETRY_GRACE=0 SWAP_RETRY_DELAYS="4 4 4" "$SG" server-retry --hook 2>/dev/null; echo $? > "$HOME/rc6" ) &
+# Touch it only once the hook is waiting (it logs "retrying" first), a second later.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do grep -q '"session":"s6"' "$B/auto.log" 2>/dev/null && break; sleep 0.2; done
 sleep 1; echo y >> "$tp"; wait
 assert_eq "$(cat "$HOME/rc6")" "0" "transcript grew during the wait → no wake"
 assert_contains "$(tail -n 1 "$B/auto.log")" '"session-moved-on"' "and logs why"

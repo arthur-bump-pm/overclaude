@@ -102,5 +102,49 @@ fi
 "$SG" login --new >/dev/null 2>&1
 assert_contains "$(sed -n 3p "$LOG")" "cswap add cfg=$HOME/.claude-swap-backup/login." "--new registers the throwaway profile as a new account"
 
+# Chrome profile: the sign-in page opens in the profile for that account.
+mkdir -p "$HOME/Applications/Google Chrome.app" "$HOME/Library/Application Support/Google/Chrome"
+export SWAP_CHROME_APPS="$HOME/Applications/Google Chrome.app"
+cat > "$HOME/Library/Application Support/Google/Chrome/Local State" <<'EOF'
+{"profile":{"info_cache":{"Default":{"name":"Home","user_name":"someone@example.com"},
+  "Profile 2":{"name":"Work stuff","user_name":"WORK@example.com"},"Profile 3":{"name":"Spare","user_name":""}}}}
+EOF
+cat > "$STUB/claude" <<'EOF'
+#!/bin/bash
+case "$1 $2" in
+  "auth login")  echo "claude auth login ${*:3} cfg=${CLAUDE_CONFIG_DIR:-default}" >> "$HOME/calls"
+                 if [ -n "${BROWSER:-}" ]; then cat "$BROWSER" > "$HOME/opener"; ls -l "$BROWSER" | cut -c1-10 > "$HOME/opener-mode"; else echo none > "$HOME/opener"; fi ;;
+  "auth status") printf '{"loggedIn":true,"email":"%s"}\n' "${STUB_AS:-work@example.com}" ;;
+esac
+EOF
+chmod +x "$STUB/claude"
+out="$("$SG" login work 2>"$HOME/err")"
+assert_contains "$(cat "$HOME/opener")" "--profile-directory=Profile\ 2" "the profile signed in to the same address (case-insensitive)"
+assert_contains "$(cat "$HOME/opener")" 'open -na "Google Chrome"' "opened in Chrome"
+assert_eq "$(cat "$HOME/opener-mode")" "-rwx------" "the opener is private"
+assert_contains "$(cat "$HOME/err")" 'Chrome profile "Work stuff" (same address)' "and says which profile"
+"$SG" browser set work Spare >/dev/null
+assert_eq "$(jq -c . "$HOME/.claude-swap-backup/browser-profiles.json")" '{"work@example.com":"Profile 3"}' "browser set saves only the profile folder"
+"$SG" login work >/dev/null 2>"$HOME/err"
+assert_contains "$(cat "$HOME/opener")" "--profile-directory=Profile\ 3" "a saved choice wins"
+assert_contains "$(cat "$HOME/err")" "(saved)" "and is named as saved"
+"$SG" login work --profile Home >/dev/null 2>&1
+assert_contains "$(cat "$HOME/opener")" "--profile-directory=Default" "--profile picks one for this run"
+lst="$("$SG" browser list)"
+assert_contains "$(printf '%s\n' "$lst" | grep '^Profile 3')" "used for work" "browser list shows which account uses which profile"
+assert_contains "$(printf '%s\n' "$lst" | grep '^Profile 3')" "(not signed in)" "and profiles not signed in"
+"$SG" browser clear work >/dev/null
+assert_eq "$(jq -c . "$HOME/.claude-swap-backup/browser-profiles.json")" '{}' "browser clear forgets it"
+"$SG" browser set work Nope >/dev/null 2>&1; assert_eq "$?" "1" "an unknown profile is refused"
+"$SG" browser set wrok Spare >/dev/null 2>&1; assert_eq "$?" "1" "a misspelled account is refused, not saved"
+"$SG" login work --profile=Spare >/dev/null 2>&1
+assert_contains "$(cat "$HOME/opener")" "--profile-directory=Profile\ 3" "--profile=NAME works too"
+SWAP_NO_CHROME_PROFILE=1 "$SG" login work >/dev/null 2>&1
+assert_eq "$(cat "$HOME/opener")" "none" "SWAP_NO_CHROME_PROFILE=1 → the default browser"
+rm -rf "$HOME/Applications/Google Chrome.app"
+"$SG" login work >/dev/null 2>&1
+assert_eq "$(cat "$HOME/opener")" "none" "no Chrome installed → the default browser, as before"
+assert_absent "$(cat "$HOME/.claude-swap-backup/"*.log 2>/dev/null)" "someone@example.com" "Chrome's addresses are never logged"
+
 rm -rf "$HOME"
 finish

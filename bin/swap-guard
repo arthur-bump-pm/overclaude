@@ -17,6 +17,8 @@
 #                                   busy-aware wrapper around `cswap auto --once` (+ opt-in LaunchAgent)
 #   keepalive tick|on|off|status    keep idle accounts' logins alive (LaunchAgent, on by default)
 #   logins [--refresh|--cached] [--text]  when each account's login ends (keychain dates only)
+#   forecast [--text]               when you run out at this pace, and which account to use first
+#   prewarm on|off|status|tick      start idle accounts' 5-hour windows early (opt-in; long-lived tokens)
 #   token add|list|rm|run           one-year setup-tokens for headless jobs (keychain; never shown)
 #   fleet add|rm|list|status|swap   other Macs over Tailscale SSH: sessions, accounts, logins
 #   remote start|list|logs|stop|attach  Remote Control sessions on another Mac (claude --bg)
@@ -30,6 +32,7 @@
 #   server-retry on|off|status|--hook  StopFailure hook (server_error|overloaded): capped auto-resume, opt-in
 #   loop-guard on|off|status|--hook    PostToolUseFailure hook: same call failing the same way, opt-in
 #   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
+#   browser list | set <account> <profile> | clear <account>  the Chrome profile a re-login opens in
 #   login <slot|alias|email> | --new
 #                                   safe re-login / add that never overwrites the live account's token
 #   schedule-kill <pid>             v1 stub (exit 1)
@@ -64,6 +67,9 @@ usage: swap-guard <subcommand> [args]
                                   and warn 3 days before a login reaches its end date
   logins [--refresh|--cached] [--text]
                                   when each account's login ends (a new sign-in starts a new one)
+  forecast [--text]               when you run out at this pace, and which account to use first
+  prewarm on|off|status|tick [--dry-run]
+                                  start idle accounts' 5-hour windows early (opt-in; needs token add)
   token add <account> | list | rm <account> | run <account> -- <cmd...>
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
   fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run]
@@ -81,7 +87,11 @@ usage: swap-guard <subcommand> [args]
   server-retry on|off|status      resume a session after a temporary server error (opt-in; max 3 tries/hour)
   loop-guard on|off|status        tell Claude to rethink when one call keeps failing the same way (opt-in)
   budget [--hook]                 usage bands the model should know about (hook: inject on change)
-  login <slot|alias|email>        re-login a dead account WITHOUT killing the live one's token
+  login <slot|alias|email> [--profile P]
+                                  re-login a dead account WITHOUT killing the live one's token
+                                  (the sign-in page opens in that account's Chrome profile)
+  browser list | set <account> <profile> | clear <account>
+                                  which Chrome profile a re-login opens in
   login --new                     add a new account the same safe way
   version-check [--force]         newest overclaude on PyPI (cached for a day)
   codex-usage [--refresh]         Codex CLI rate limits per Codex home, from its session logs
@@ -679,7 +689,8 @@ _launchd_path_env() {
   local self d path_env=""
   self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   for d in "$(dirname "$(command -v cswap 2>/dev/null || echo /usr/bin/cswap)")" "$(dirname "$self")" \
-           "$(dirname "$(command -v jq 2>/dev/null || echo /usr/bin/jq)")" /opt/homebrew/bin /usr/local/bin \
+           "$(dirname "$(command -v jq 2>/dev/null || echo /usr/bin/jq)")" \
+           "$(dirname "$(command -v claude 2>/dev/null || echo /usr/bin/claude)")" /opt/homebrew/bin /usr/local/bin \
            /usr/bin /bin /usr/sbin /sbin; do
     case ":$path_env:" in *":$d:"*) :;; *) path_env="${path_env:+$path_env:}$d";; esac
   done
@@ -852,10 +863,13 @@ _keepalive_tick() {
     n="${stamp##*-}"
     printf '%s' "$ending" | jq -e --arg n "$n" 'any(.[]; .slot == $n)' >/dev/null 2>&1 || rm -f "$stamp"
   done
-  out="$(printf '%s' "$list" | jq -c --arg ts "$ts" --argjson ending "$ending" \
+  # Opt-in: start idle accounts' 5-hour windows (usage was just fetched above).
+  local pw; pw="$(_prewarm_tick 2>/dev/null)"; [ -n "$pw" ] || pw="[]"
+  out="$(printf '%s' "$list" | jq -c --arg ts "$ts" --argjson ending "$ending" --argjson pw "$pw" \
     '{ts:$ts, action:"tick", accounts:[.accounts[] | {number, active:(.active // false), status:(.usageStatus // "unknown")}],
       dead:[.accounts[] | select(.usageStatus == "relogin_required") | .number],
-      ending:[$ending[] | .slot | tonumber? // .]}')"
+      ending:[$ending[] | .slot | tonumber? // .]}
+     + (if ($pw | length) > 0 then {prewarm:$pw} else {} end)')"
   _keepalive_log "$out"; printf '%s\n' "$out"
   return 0
 }
@@ -926,7 +940,7 @@ LOGINS_JQ_DATES='(.claudeAiOauth // {}) | [(.refreshTokenExpiresAt // ""), (.exp
 
 _logins_item() { # _logins_item <service> <account> — "<refreshTokenExpiresAt> <expiresAt>" in ms, or nothing
   # perl's alarm stops a keychain read that hangs (a locked keychain prompting nobody under launchd).
-  perl -e 'alarm shift; exec @ARGV' "${SWAP_KEYCHAIN_TIMEOUT:-8}" security find-generic-password -a "$2" -s "$1" -w 2>/dev/null |
+  perl -e 'alarm shift; exec @ARGV or exit 127' "${SWAP_KEYCHAIN_TIMEOUT:-8}" security find-generic-password -a "$2" -s "$1" -w 2>/dev/null |
     jq -r "$LOGINS_JQ_DATES" 2>/dev/null
 }
 
@@ -1048,6 +1062,323 @@ cmd_logins() {
     esac
   done
   exit 0
+}
+
+# --- forecast: when you run out, and which account to use first -----------------
+# Reads cswap's usage cache (no network, no token). Pace = everything used across
+# your accounts in the last week, spread over the longest elapsed weekly window, in
+# "% of one account-week per hour". The next 7 days are simulated in 15-minute
+# steps, always drawing on the account with room whose week resets soonest (room
+# that resets unused is gone), each account refilling at its reset. Dead, disabled
+# and ending logins don't count. An estimate: it assumes the last week's pace.
+FORECAST_CACHE="$STATE_ROOT/cache/forecast.json"
+FORECAST_JQ='
+def W: 604800;
+def ep: if type == "string" and test("(Z|\\+00:00)$")
+        then (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | try fromdateiso8601 catch null)
+        elif type == "number" then . else null end;
+def acct_label($s; $n): ($s.accounts[$n] // {}) as $a
+  | (($a.alias // "") | tostring | gsub("[\u0000-\u001f\u007f]"; "")) as $al
+  | if $al != "" then $al else (($a.email // ("account " + $n)) | tostring | split("@")[0] | gsub("[\u0000-\u001f\u007f]"; "")) end;
+def pool($s; $acc; $skip; $active; $order; $now; $sel):
+  [ $order[] as $n | ($acc[$n] // {}) as $a | ($a.lastGood // {}) as $g
+    | select((($a.lastError // "") != "invalid_grant") and (($a.authDeadStrikes // 0) == 0))
+    | select((($s.accounts[$n].disabled // false) | not) and (($skip | index($n)) | not))
+    | (if $sel == "week" then $g.seven_day else first($g.scoped[]? | select(.name == $sel)) end) as $w
+    | select($w != null)
+    | ($w.resets_at | ep) as $r0 | (($w.pct // 0) | tonumber? // 0) as $p0
+    | (if $r0 == null then {p: $p0, r: ($now + W)}
+       elif $r0 <= $now then {p: 0, r: ($r0 + (((($now - $r0) / W) | floor) + 1) * W)}
+       else {p: $p0, r: $r0} end) as $x
+    | {slot: $n, label: acct_label($s; $n), active: ($n == $active), pct: $x.p, resetKnown: ($r0 != null),
+       room: ([100 - $x.p, 0] | max), resetsAt: ($x.r | floor), unusedAtReset: 0,
+       ageHours: (if ($a.fetchedAt | type) == "number" then (($now - $a.fetchedAt) / 3600 | floor) else null end)} ];
+def rate($a; $now):
+  ([$a[] | select(.pct > 0 and .resetKnown) | (W - (.resetsAt - $now)) / 3600] | max // 0) as $el
+  | ([$a[] | select(.resetKnown) | .pct] | add // 0) as $known
+  | ([$a[] | select(.resetKnown | not) | .pct] | add // 0) as $unknown
+  # Usage without a known window start (no reset time) counts over a full week.
+  | (if $known > 0 and $el > 0 then $known / ([$el, 6] | max) else 0 end) + $unknown / 168;
+def sim($a; $rate; $now):
+  reduce range(0; 672) as $i ({acc: $a, out: null, first: true};
+    ($now + $i * 900) as $t
+    | .acc |= map(if .resetsAt <= $t then
+        (if .reset1 then . else .unusedAtReset = .room | .reset1 = true end)
+        | .room = 100 | .resetsAt += W else . end)
+    | .need = ($rate / 4)
+    | reduce (.acc | to_entries | map(select(.value.room > 0)) | sort_by(.value.resetsAt) | .[].key) as $k (.;
+        if .need > 0 then ([.acc[$k].room, .need] | min) as $take
+          | .acc[$k].room -= $take | .need -= $take else . end)
+    | if .need > 0.0001 and .out == null then .out = $t else . end);
+def report($a; $now):
+  rate($a; $now) as $rate
+  | sim($a; $rate; $now) as $sim
+  | ([$a[] | select(.room >= 1)] | sort_by(.resetsAt) | first) as $bf
+  | { ratePerHour: (($rate * 100 | round) / 100),
+      accountWeeksPerWeek: (($rate * 168 / 100 * 10 | round) / 10),
+      accounts: ($a | length),
+      runsOutAt: $sim.out,
+      useFirst: (if $bf == null then null else ($bf | {slot, label, active, room, resetsAt}) end),
+      detail: [$a[] as $x | $x + {unusedAtReset: ((first($sim.acc[] | select(.slot == $x.slot)) | .unusedAtReset // 0) | round)}] };
+($seq[0] // {}) as $s | (($u[0] // {}).accounts // {}) as $acc
+| (($s.activeAccountNumber // "") | tostring) as $active
+| [($s.sequence // ($s.accounts // {} | keys | map(tonumber? // .)))[] | tostring] as $order
+| [(($lg[0] // {}).accounts // [])[] | select(.endsAt != null and .endsAt - $now < 21600) | .slot] as $skip
+| { asOf: $now,
+    week: report(pool($s; $acc; $skip; $active; $order; $now; "week"); $now),
+    fable: report(pool($s; $acc; $skip; $active; $order; $now; "Fable"); $now) }'
+
+_forecast_json() { # compute from the caches, write the forecast cache, print it
+  local seq="$STATE_ROOT/sequence.json" usage="$STATE_ROOT/cache/usage.json" lg="$LOGINS_CACHE" out
+  [ -r "$seq" ] && [ -r "$usage" ] || return 1
+  [ -r "$lg" ] || lg=/dev/null
+  # The cache format is cswap's; read only the version this was written against.
+  jq -e '.schemaVersion == 2' "$usage" >/dev/null 2>&1 || return 1
+  out="$(jq -cn --argjson now "$(date +%s)" --slurpfile seq "$seq" --slurpfile u "$usage" --slurpfile lg "$lg" \
+    "$FORECAST_JQ" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null
+  printf '%s\n' "$out" > "$FORECAST_CACHE.tmp.$$" && mv "$FORECAST_CACHE.tmp.$$" "$FORECAST_CACHE"
+  printf '%s\n' "$out"
+}
+
+_forecast_text_pool() { # _forecast_text_pool <json> <pool key> <title>
+  local j="$1" k="$2" title="$3" now rows out lf n label act pct room r un age
+  now="$(date +%s)"
+  [ "$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].accounts')" -gt 0 ] 2>/dev/null || return 0
+  printf '%s: ' "$title"
+  out="$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].runsOutAt // empty')"
+  case "$out" in
+    ''|*[!0-9]*) printf 'lasts the next 7 days at this pace' ;;
+    *) printf 'runs out around %s (in %s) at this pace' "$(date -r "$out" '+%a %b %-d %H:%M')" "$(_logins_left $(( out - now > 0 ? out - now : 0 )))" ;;
+  esac
+  printf ' (your pace: about %s accounts'"'"' worth a week; you have %s)\n' \
+    "$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].accountWeeksPerWeek')" "$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].accounts')"
+  lf="$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].useFirst // empty | [.label, (.active | tostring), (.room | floor | tostring), (.resetsAt | tostring)] | join("\u001f")')"
+  if [ -n "$lf" ]; then
+    IFS=$'\x1f' read -r label act room r <<EOF
+$lf
+EOF
+    case "$room$r" in *[!0-9]*) ;; *)
+      if [ "$act" = true ]; then printf '  use first: %s (the one you are on) — %s%% left, resets in %s\n' "$label" "$room" "$(_logins_left $(( r - now )))"
+      elif [ "$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].accounts')" -gt 1 ]; then printf '  use first: %s — %s%% left, resets in %s (sooner than the others; what is left then is lost)\n' "$label" "$room" "$(_logins_left $(( r - now )))"
+      else printf '  %s — %s%% left, resets in %s\n' "$label" "$room" "$(_logins_left $(( r - now )))"; fi ;;
+    esac
+  fi
+  rows="$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k].detail[] | [.slot, .label, (.active | tostring), (.pct | floor | tostring), (.resetsAt | tostring), (.unusedAtReset | tostring), (.ageHours // "" | tostring)] | join("\u001f")')"
+  while IFS=$'\x1f' read -r n label act pct r un age; do
+    case "$n$pct$r$un" in ''|*[!0-9]*) continue;; esac
+    [ "$act" = true ] && label="$label, active"
+    printf '  %s (%s): %s%% used, resets %s' "$n" "$label" "$pct" "$(date -r "$r" '+%a %b %-d %H:%M')"
+    [ "$un" -ge 5 ] && printf ' — about %s%% will go unused at this pace' "$un"
+    case "$age" in ''|*[!0-9]*) ;; *) [ "$age" -ge 6 ] && printf ' (numbers %sh old)' "$age";; esac
+    printf '\n'
+  done <<EOF
+$rows
+EOF
+}
+
+cmd_forecast() {
+  local text=0 j
+  for a in "$@"; do case "$a" in --text) text=1;; *) echo "usage: swap-guard forecast [--text]" >&2; exit 2;; esac; done
+  j="$(_forecast_json)" || { jq -cn '{error:"no-data", detail:"no usage data yet (cswap list fetches it)"}'; exit 1; }
+  if [ "$text" -eq 0 ]; then printf '%s\n' "$j"; exit 0; fi
+  if [ "$(printf '%s' "$j" | jq -r '.week.accounts')" = 0 ]; then
+    echo "No account to forecast: every account is dead, disabled, ending, or has no usage data yet."
+    exit 0
+  fi
+  _forecast_text_pool "$j" week "Weekly limit"
+  _forecast_text_pool "$j" fable "Fable limit"
+  if [ "$(printf '%s' "$j" | jq -r '.week.useFirst.active | tostring')" = false ]; then
+    printf 'To follow "use first" automatically: swap-guard auto install --strategy consume-first\n'
+  fi
+  exit 0
+}
+
+# --- browser: the Chrome profile a re-login opens in -------------------------------
+# Claude Code opens its sign-in page with `$BROWSER <url>` when BROWSER is set.
+# `swap-guard login N` points it at a two-line opener for the Chrome profile that
+# belongs to that account, so you approve in the right Google account. The choice:
+# what you saved (`browser set`; only the profile's folder name is stored), else the
+# Chrome profile signed in to the same address. Nothing about the consent page is
+# automated. Chrome's profile list (with its Google addresses) is read from Local
+# State; addresses are shown by `browser list` and never logged or stored.
+BROWSER_PROFILES="$STATE_ROOT/browser-profiles.json"   # {"<account email>": "<profile folder>"}
+CHROME_LOCAL_STATE="$HOME/Library/Application Support/Google/Chrome/Local State"
+
+_chrome_profiles() { # JSON array [{dir, name, email}] of Chrome's profiles (empty without Chrome)
+  jq -c '[(.profile.info_cache // {}) | to_entries[]
+          | {dir: .key, name: (.value.name // .key), email: ((.value.user_name // "") | ascii_downcase)}]
+         | map(.dir |= gsub("[\u0000-\u001f\u007f]"; "") | .name |= gsub("[\u0000-\u001f\u007f]"; "")
+               | .email |= gsub("[\u0000-\u001f\u007f]"; ""))' \
+    "$CHROME_LOCAL_STATE" 2>/dev/null || echo '[]'
+}
+
+_browser_for() { # _browser_for <email> — "<dir>\t<name>\t<how>" of the profile to use, or nothing
+  local e profs saved
+  e="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; [ -n "$e" ] || return 1
+  profs="$(_chrome_profiles)"
+  saved="$(jq -r --arg e "$e" '.[$e] // empty' "$BROWSER_PROFILES" 2>/dev/null)"
+  printf '%s' "$profs" | jq -r --arg e "$e" --arg s "$saved" '
+    (if $s != "" then first(.[] | select(.dir == $s)) | . + {how: "saved"} else empty end)
+    // (first(.[] | select(.email == $e and $e != "")) | . + {how: "same address"})
+    // empty | [.dir, .name, .how] | join("\t")' 2>/dev/null | head -n 1
+}
+
+_chrome_installed() { # SWAP_CHROME_APPS: colon-separated app paths to look for (tests)
+  local IFS=: d
+  for d in ${SWAP_CHROME_APPS:-/Applications/Google Chrome.app:$HOME/Applications/Google Chrome.app}; do
+    [ -d "$d" ] && return 0
+  done
+  return 1
+}
+
+_browser_opener() { # _browser_opener <dir> <file> — write the opener the login's BROWSER points at
+  { printf '#!/bin/bash\n# overclaude: open the sign-in page in one Chrome profile (swap-guard login)\n'
+    printf 'exec open -na "Google Chrome" --args --profile-directory=%q "$1"\n' "$1"; } > "$2" &&
+    chmod 700 "$2"
+}
+
+_browser_known() { # _browser_known <email> — is it one of cswap's accounts?
+  jq -e --arg e "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" \
+    'any(.accounts[]?; ((.email // "") | ascii_downcase) == $e)' "$STATE_ROOT/sequence.json" >/dev/null 2>&1
+}
+
+cmd_browser() {
+  local sub="${1:-list}" acct dir profs e
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    list)
+      profs="$(_chrome_profiles)"
+      if [ "$(printf '%s' "$profs" | jq 'length')" -eq 0 ]; then echo "No Chrome profiles found (is Google Chrome installed?)"; exit 0; fi
+      printf '%s' "$profs" | jq -r \
+        --argjson acc "$(jq -c '.accounts // {}' "$STATE_ROOT/sequence.json" 2>/dev/null || echo '{}')" \
+        --argjson saved "$(jq -c 'if type == "object" then . else {} end' "$BROWSER_PROFILES" 2>/dev/null || echo '{}')" '
+        ($acc // {}) as $acc | ($saved // {}) as $saved
+        | .[] | . as $p
+        | [$acc | to_entries[] | select(((.value.email // "") | ascii_downcase) as $e
+             | ($saved[$e] // "") == $p.dir or (($saved[$e] // "") == "" and $e == $p.email and $e != ""))
+           | (.value.alias // ((.value.email // "") | split("@")[0]))] as $for
+        | "\($p.dir)\t\($p.name)\t\(if $p.email == "" then "(not signed in)" else $p.email end)"
+          + (if ($for | length) > 0 then "\t→ used for " + ($for | join(", ")) else "" end)' 2>/dev/null
+      exit 0;;
+    set)
+      [ $# -ge 2 ] || { echo "usage: swap-guard browser set <account> <profile folder or name>" >&2; exit 2; }
+      e="$(_token_label "$1" 2>/dev/null)" && _browser_known "$e" || { echo "browser set: unknown account '$1' (a slot number, alias or email from cswap list)" >&2; exit 1; }
+      dir="$(_chrome_profiles | jq -r --arg p "$2" 'first(.[] | select(.dir == $p or (.name | ascii_downcase) == ($p | ascii_downcase))) | .dir // empty')"
+      [ -n "$dir" ] || { echo "browser set: no Chrome profile '$2' (see: swap-guard browser list)" >&2; exit 1; }
+      mkdir -p "$STATE_ROOT"
+      jq -n --arg e "$(printf '%s' "$e" | tr '[:upper:]' '[:lower:]')" --arg d "$dir" \
+        --argjson cur "$(jq -c 'if type == "object" then . else {} end' "$BROWSER_PROFILES" 2>/dev/null || echo '{}')" \
+        '$cur + {($e): $d}' > "$BROWSER_PROFILES.tmp.$$" && mv "$BROWSER_PROFILES.tmp.$$" "$BROWSER_PROFILES"
+      jq -cn --arg a "$1" --arg d "$dir" '{account:$a, profile:$d}'; exit 0;;
+    clear)
+      [ $# -ge 1 ] || { echo "usage: swap-guard browser clear <account>" >&2; exit 2; }
+      e="$(_token_label "$1" 2>/dev/null)" && _browser_known "$e" || { echo "browser clear: unknown account '$1'" >&2; exit 1; }
+      [ -f "$BROWSER_PROFILES" ] && jq --arg e "$(printf '%s' "$e" | tr '[:upper:]' '[:lower:]')" 'del(.[$e])' "$BROWSER_PROFILES" > "$BROWSER_PROFILES.tmp.$$" &&
+        mv "$BROWSER_PROFILES.tmp.$$" "$BROWSER_PROFILES"
+      jq -cn --arg a "$1" '{account:$a, profile:null}'; exit 0;;
+    *) echo "usage: swap-guard browser list | set <account> <profile> | clear <account>" >&2; exit 2;;
+  esac
+}
+
+# --- prewarm: start an idle account's 5-hour window early (opt-in) ------------------
+# A 5-hour window starts at an account's first message. Inside the keepalive tick,
+# for each account that is not active, has no window running, has weekly room
+# (< 90%), whose login isn't ending and that wasn't pinged in the last 5 hours, send
+# one tiny message so its clock starts: switch to it later and its window resets
+# sooner. It runs on the account's long-lived token (swap-guard token add) through
+# `token run` — the token travels in CLAUDE_CODE_OAUTH_TOKEN, never argv — from an
+# empty private folder with no tools, one turn, and settings, hooks, MCP servers and
+# session saving off. (Not --bare: it never reads OAuth tokens, only API keys.)
+# Output is discarded; only ok/failed is logged. Off by default.
+PREWARM_ON="$STATE_ROOT/prewarm.on"
+PREWARM_GAP=18000   # at most one ping per account per 5 hours
+
+_prewarm_candidates() { # JSON array of {slot, email, label, reason}; reason "" = eligible
+  local now; now="$(date +%s)"
+  jq -cn --argjson now "$now" --argjson gap "$PREWARM_GAP" \
+    --argjson s "$(jq -c . "$STATE_ROOT/sequence.json" 2>/dev/null || echo '{}')" \
+    --argjson u "$(jq -c '.accounts // {}' "$STATE_ROOT/cache/usage.json" 2>/dev/null || echo '{}')" \
+    --argjson t "$(jq -c 'if type == "object" then . else {} end' "$TOKENS_JSON" 2>/dev/null || echo '{}')" \
+    --argjson blocked "$(_logins_blocked)" \
+    --argjson stamps "$(for f in "$STATE_ROOT"/prewarm-stamp-*; do
+        case "${f##*-}" in (''|*[!0-9]*) continue;; esac
+        [ -f "$f" ] && printf '{"%s":%s}\n' "${f##*-}" "$(stat -f %m "$f")"; done | jq -sc 'add // {}')" "$JQ_EPOCH"'
+    (($s.activeAccountNumber // "") | tostring) as $active
+    | [($s.sequence // ($s.accounts // {} | keys | map(tonumber? // .)))[] | tostring as $n
+       | ($s.accounts[$n] // {}) as $a | ($u[$n] // {}) as $x | ($x.lastGood // {}) as $g
+       | (($a.email // "") | ascii_downcase) as $e
+       | {slot: $n, email: $e,
+          label: (($a.alias // "") | tostring | gsub("[\u0000-\u001f\u007f]"; "") | if . == "" then ($e | split("@")[0]) else . end),
+          reason: (
+            if $n == $active then "active"
+            elif ($t | keys | map(ascii_downcase) | index($e)) == null then "no-token"
+            elif ($blocked | index($n)) != null then "login-ending"
+            elif (($x.lastError // "") == "invalid_grant") or (($x.authDeadStrikes // 0) > 0) then "dead"
+            elif ($x.fetchedAt | type) != "number" or ($now - $x.fetchedAt) > 10800 then "no-recent-usage"
+            elif (($g.five_hour.resets_at // null) | ep) as $r | ($r != null and $r > $now) then "window-running"
+            elif ((($g.seven_day.resets_at // null) | ep) as $r | ($r == null or $r > $now)) and (($g.seven_day.pct // 0) >= 90) then "week-nearly-used"
+            elif ($now - ($stamps[$n] // 0)) < $gap then "pinged-recently"
+            else "" end)}]' 2>/dev/null
+}
+
+_prewarm_ping() { # _prewarm_ping <email> — one tiny message on that account's long-lived token
+  local d rc self
+  # Absolute path to this script before the cd below (a relative $0 would break).
+  self="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
+  [ -x "$self" ] || return 1
+  # A private folder in our own state dir: no shared /tmp ancestors whose CLAUDE.md
+  # could load. No tools, one turn, nothing may prompt: the reply is one word.
+  d="$(mktemp -d "$STATE_ROOT/prewarm.XXXXXX")" || return 1
+  ( cd "$d" && perl -e 'alarm shift; exec @ARGV or exit 127' "${SWAP_PREWARM_TIMEOUT:-60}" \
+      "$self" token run "$1" -- claude -p "Reply with only the word: ok" --model haiku \
+      --system-prompt "Reply with one word." --tools "" --max-turns 1 --permission-prompts none \
+      --setting-sources "" --settings '{"disableAllHooks":true}' \
+      --strict-mcp-config --no-session-persistence </dev/null >/dev/null 2>&1 ) 2>/dev/null; rc=$?
+  rm -rf "$d"
+  return "$rc"
+}
+
+_prewarm_tick() { # [--dry-run] — JSON array of {slot, label, result}
+  local dry=0 cands rows n e label reason res out="[]"
+  [ "${1:-}" = --dry-run ] && dry=1
+  [ "$dry" -eq 1 ] || [ -f "$PREWARM_ON" ] || { echo '[]'; return 0; }
+  cands="$(_prewarm_candidates)"; [ -n "$cands" ] || { echo '[]'; return 0; }
+  rows="$(printf '%s' "$cands" | jq -r '.[] | [.slot, .email, .label, .reason] | join("\u001f")')"
+  while IFS=$'\x1f' read -r n e label reason; do
+    case "$n" in ''|*[!0-9]*) continue;; esac
+    if [ -n "$reason" ]; then res="skip:$reason"
+    elif [ "$dry" -eq 1 ]; then res="would-ping"
+    else
+      touch "$STATE_ROOT/prewarm-stamp-$n"   # a failure waits the same 5 h (no retry storm)
+      if _prewarm_ping "$e"; then res="ok"; else res="failed"; fi
+    fi
+    out="$(printf '%s' "$out" | jq -c --arg n "$n" --arg l "$label" --arg r "$res" '. + [{slot:$n, label:$l, result:$r}]')"
+  done <<EOF
+$rows
+EOF
+  printf '%s\n' "$out"
+}
+
+cmd_prewarm() {
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    on)
+      mkdir -p "$STATE_ROOT" && touch "$PREWARM_ON"
+      jq -cn --argjson ka "$([ -f "$KEEPALIVE_OFF" ] && echo false || echo true)" \
+        --argjson tokens "$(jq 'length' "$TOKENS_JSON" 2>/dev/null || echo 0)" \
+        '{prewarm:true, keepalive:$ka, tokens:$tokens,
+          warnings: ([if $ka | not then "keepalive is off, and prewarm runs inside it: swap-guard keepalive on" else empty end,
+                      if $tokens == 0 then "no long-lived tokens yet: swap-guard token add <account> for each account to warm" else empty end])}'
+      exit 0;;
+    off) rm -f "$PREWARM_ON"; jq -cn '{prewarm:false}'; exit 0;;
+    status)
+      jq -cn --argjson on "$([ -f "$PREWARM_ON" ] && echo true || echo false)" --argjson c "$(_prewarm_candidates || echo '[]')" \
+        '{prewarm:$on, accounts:$c}'; exit 0;;
+    tick) _prewarm_tick "$@"; exit 0;;
+    *) echo "usage: swap-guard prewarm on|off|status|tick [--dry-run]" >&2; exit 2;;
+  esac
 }
 
 # --- token: long-lived tokens for headless jobs ---------------------------------
@@ -1273,7 +1604,7 @@ _token_add() {
        printf '%s\n' "$res" | jq -c '{error:"several-tokens"}'; return 1;;
   esac
   if [ "$(printf '%s' "$res" | jq -r '.verified // false')" != true ]; then
-    if [ "$(printf '%s' "$res" | jq -r '.verifyNetwork // true')" = false ]; then
+    if [ "$(printf '%s' "$res" | jq -r '.verifyNetwork | tostring')" = false ]; then
       echo "A token came back but the API could not be reached to check it; nothing was saved. Try again online." >&2
       echo '{"error":"could-not-verify"}'; return 1
     fi
@@ -2705,9 +3036,16 @@ _art_backfill() {
 #   3. that profile is registered into the slot, `cswap add` re-anchors cswap on the
 #      live account, and the throwaway dir + its keychain item are deleted.
 cmd_login() {
-  local raw="" new=0 slot="" email="" tmp svc st got live a
-  for a in "$@"; do
-    case "$a" in --new) new=1;; -*) :;; *) [ -z "$raw" ] && raw="$a";; esac
+  local raw="" new=0 slot="" email="" tmp svc st got live a profile_arg="" bline bdir="" bname="" bhow="" opener=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --new) new=1;;
+      --profile) profile_arg="${2:-}"; shift;;
+      --profile=*) profile_arg="${1#--profile=}";;
+      -*) :;;
+      *) [ -z "$raw" ] && raw="$1";;
+    esac
+    shift
   done
   command -v cswap >/dev/null 2>&1 || { echo '{"error":"cswap-not-found"}'; exit 1; }
   command -v claude >/dev/null 2>&1 || { echo '{"error":"claude-not-found"}'; exit 1; }
@@ -2753,10 +3091,28 @@ cmd_login() {
     /usr/bin/shasum -a 256 | cut -c1-8)"
   trap 'rm -rf "$tmp"; security delete-generic-password -s "$svc" >/dev/null 2>&1' EXIT
   echo "2/4 a browser window opens — sign in as ${email:-the new account}…" >&2
+  # The Chrome profile for this account (browser set, or the one signed in to the
+  # same address): the sign-in page opens there. --profile picks one for this run.
+  if [ -n "$profile_arg" ]; then
+    bline="$(_chrome_profiles | jq -r --arg p "$profile_arg" 'first(.[] | select(.dir == $p or (.name | ascii_downcase) == ($p | ascii_downcase))) | [.dir, .name, "--profile"] | join("\t")' 2>/dev/null)"
+    [ -n "$bline" ] || echo "    no Chrome profile '$profile_arg' (swap-guard browser list); using the default browser" >&2
+  elif [ -n "$email" ]; then
+    bline="$(_browser_for "$email")"
+  fi
+  if [ -n "${bline:-}" ] && [ -z "${SWAP_NO_CHROME_PROFILE:-}" ] && _chrome_installed; then
+    IFS="$(printf '\t')" read -r bdir bname bhow <<EOF
+$bline
+EOF
+    if [ -n "$bdir" ] && _browser_opener "$bdir" "$tmp/open-browser"; then
+      opener="$tmp/open-browser"
+      echo "    opening it in Chrome profile \"$bname\" ($bhow)" >&2
+    fi
+  fi
+  local login_env=(CLAUDE_CONFIG_DIR="$tmp"); [ -n "$opener" ] && login_env+=(BROWSER="$opener")
   if [ -n "$email" ]; then
-    CLAUDE_CONFIG_DIR="$tmp" claude auth login --email "$email" >&2 || { jq -cn '{error:"login-failed"}'; exit 1; }
+    env "${login_env[@]}" claude auth login --email "$email" >&2 || { jq -cn '{error:"login-failed"}'; exit 1; }
   else
-    CLAUDE_CONFIG_DIR="$tmp" claude auth login >&2 || { jq -cn '{error:"login-failed"}'; exit 1; }
+    env "${login_env[@]}" claude auth login >&2 || { jq -cn '{error:"login-failed"}'; exit 1; }
   fi
   st="$(CLAUDE_CONFIG_DIR="$tmp" claude auth status 2>/dev/null)"
   got="$(printf '%s' "$st" | jq -r '.email // .account.email // empty' 2>/dev/null)"
@@ -3379,6 +3735,9 @@ main() {
     auto)          cmd_auto "$@";;
     keepalive)     cmd_keepalive "$@";;
     logins)        cmd_logins "$@";;
+    forecast)      cmd_forecast "$@";;
+    browser)       cmd_browser "$@";;
+    prewarm)       cmd_prewarm "$@";;
     token)         cmd_token "$@";;
     remote)        cmd_remote "$@";;
     fleet)         cmd_fleet "$@";;

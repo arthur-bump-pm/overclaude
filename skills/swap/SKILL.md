@@ -1,7 +1,7 @@
 ---
 name: swap
-description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, model-routing guard, kit health check, continue in the Codex CLI, your other Macs (fleet status, switch them off a capped account, start a session there). Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
-argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | auto [on|off|status|instant on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | guard [on|off|status] | fleet [swap] | remote <mac> [goal] | doctor [fix]"
+description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, run-out forecast (which account to use first), model-routing guard, kit health check, continue in the Codex CLI, your other Macs (fleet status, switch them off a capped account, start a session there). Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
+argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | forecast | auto [on|off|status|instant on|off|prewarm on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | guard [on|off|status] | fleet [swap] | remote <mac> [goal] | doctor [fix]"
 allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(overclaude doctor *), Bash(bash *doctor.sh*)
 ---
 
@@ -17,7 +17,7 @@ GATE — read before acting. If this skill was invoked by you (the model) rather
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `guard`, `fleet`, `remote` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `forecast`, `guard`, `fleet`, `remote` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Example: `/swap work handoff` ≡ `/swap handoff work`.
@@ -35,9 +35,11 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap relogin <target>` | revive a dead token without killing the live account's (`swap-guard login <target>`) | browser sign-in |
 | `/swap auto [on\|off\|status] [threshold N] [model X]` | busy-aware auto-switching LaunchAgent (opt-in) | defers proactive switches while sessions are busy |
 | `/swap auto retry [on\|off]` | resume a session automatically after a temporary server error (opt-in; at most 3 tries per session per hour) | auth/limit errors never retried |
+| `/swap auto prewarm [on\|off]` | start an idle account's 5-hour window early with one tiny message, so it refills sooner (opt-in; uses long-lived tokens) | never the active account; once per 5 h |
 | `/swap auto loop [on\|off]` | tell Claude to rethink when the same tool call fails the same way 3 times in a row (opt-in) | silent otherwise |
 | `/swap auto instant [on\|off]` | instant swap the moment a usage cap stops a session (default on) | dead/disabled/API-key accounts never targeted |
 | `/swap codex` | continue this work in the Codex CLI (delegates to `/handoff codex`) | Codex CLI + overcodex installed, Codex account has room |
+| `/swap forecast` | when your accounts run out at this pace, and which account to use first so its week doesn't reset unused | — |
 | `/swap spend [days N]` | what your usage would cost at API prices, by model / account / day, vs your plans | — |
 | `/swap guard [on\|off\|status]` | the routing guard that blocks un-routed subagents on Fable (default on) | — |
 | `/swap fleet [swap]` | your other Macs: sessions, accounts, dead logins; `swap` moves Macs on a capped account to the one with the most room | Macs added with `overclaude fleet add` |
@@ -49,12 +51,13 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 Edge rulings:
 - `/swap <target> now` without `handoff`/`restart` → error: `now` only modifies handoff/restart.
 - `/swap handoff` (no target) → error: "did you mean /handoff? For an account aliased 'handoff' use slot number/email."
-- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`/`retry`/`loop`, `threshold <50-99.9>`, `model <names>`), never a target.
+- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`/`retry`/`loop`/`prewarm`, `threshold <50-99.9>`, `model <names>`), never a target.
 - `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
 - `relogin` takes the target account as its argument; it never switches.
 - `fleet` takes an optional `swap` (alone → status); it never has a target.
 - `remote` is followed either by `list`/`logs`/`stop`/`attach` and then the Mac (and a session name), or by the Mac and then free goal text; it never has an account target. A goal whose first word is one of those four words still works when the Mac comes first (`/swap remote mini stop the flaky test`).
+- `forecast` takes nothing else and never has a target; it never switches.
 - `spend` takes an optional `days N` (default 7); `guard` takes `on`/`off`/`status` (alone → `status`). Neither has a target.
 - `codex` present (e.g. `/swap codex`, `/swap codex handoff`) → INVOKE the handoff skill as `/handoff codex` (continue in the Codex CLI); `codex` is never a Claude account target. This takes precedence over the `/swap handoff` (no target) ruling. An account aliased `codex` stays reachable by slot number or email.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
@@ -117,6 +120,10 @@ Off by default. A StopFailure hook (`swap-guard server-retry --hook`, matcher `s
 Off by default. A PostToolUseFailure hook (`swap-guard loop-guard --hook`, every tool) notices when the same tool call (same input, ignoring its description) fails with the same error (digits and spacing ignored) 3 times in a row, and tells Claude to stop repeating it and rethink; at 6 it says to stop and tell the user. Successful calls in between don't reset the count; a different failure does, and so does a gap of more than 30 min. Each subagent keeps its own count. `SWAP_LOOP_MAX` changes the 3.
 - `loop on` / `loop off` → `swap-guard loop-guard on|off`; `loop` alone → `swap-guard loop-guard status`.
 
+### Idle-window pre-warm (`/swap auto prewarm [on|off]`)
+Off by default. Inside the keepalive tick (every 2 h), each account that is not active, has no 5-hour window running, has weekly room (< 90%) and a long-lived token gets one one-word `claude -p` reply on that token, at most once per 5 hours, so its window is already counting down when you switch to it. It spends a negligible amount of that account's usage.
+- `prewarm on` / `prewarm off` → `swap-guard prewarm on|off` (relay each of `warnings`: keepalive off, or no tokens yet — `swap-guard token add <account>` must run in a terminal); `prewarm` alone → `swap-guard prewarm status` and show each account's `reason` (empty = will be warmed).
+
 ## `/swap doctor [fix]`
 
 Run `overclaude doctor` (fallback: `bash "$(overclaude path)/doctor.sh"`). Relay the [FAIL]/[warn] lines with their fixes; offer to run any fix that is a plain command. With `fix`: run `overclaude doctor --fix` — it reinstalls drifted/missing kit files and hooks, reloads a stopped auto-swap agent, then re-checks. It cannot re-login dead tokens from here (that needs a browser): relay its `swap-guard login <N>` lines as `/swap relogin <N>` suggestions.
@@ -125,7 +132,7 @@ Run `overclaude doctor` (fallback: `bash "$(overclaude path)/doctor.sh"`). Relay
 
 Why this exists: refresh tokens rotate and are single-use. A plain `/login` while another account is live overwrites that live account's newest token before cswap saved it, so the live account dies the next time it is polled — re-logging one account kills the other.
 
-1. Tell the user a browser window will open and they must sign in as `<target>`'s email (from the accounts context).
+1. Tell the user a browser window will open and they must sign in as `<target>`'s email (from the accounts context). It opens in that account's Chrome profile when one is known (saved with `swap-guard browser set <account> <profile>`, or the profile signed in to the same Google address; the command's stderr names it); `swap-guard browser list` shows the choices. The user still clicks Approve themselves — never automate it.
 2. Run `swap-guard login <target>` with a 10-minute Bash timeout. It saves the live account's token (`cswap add`), signs in inside a throwaway `CLAUDE_CONFIG_DIR` (the live login is never touched), checks the signed-in email, registers the slot, re-anchors cswap on the live account, and deletes the throwaway profile and its keychain item.
 3. Report the JSON. Errors (nothing about the live account changed in any of them): `wrong-account` → the user signed in with a different email; `target-is-live` → the dead account IS the live one: `/login` inside Claude Code, then `cswap add`; `cswap-add-cancelled` → cswap wanted a y/N confirmation (usually an organization change) that only a terminal can answer — relay `.detail`, which names the exact command to run in a terminal (there the prompt reaches the user); `cswap-list-failed` → relay the detail; `ambiguous-target` → ask for the slot number; `unknown-target` → show the accounts table; `capture-failed` → the LIVE account's own token could not be saved, so nothing else was attempted — run `cswap list` to see why (often the live account itself needs `/login` + `cswap add`); `login-failed` → the browser sign-in did not complete, retry; `cswap-add-failed` → relay `.detail`; `cswap-not-found` / `claude-not-found` → run `overclaude doctor`. On success with `reanchored: false`, relay `.detail` (cswap may show the wrong active account until `cswap add` runs). If the command cannot open a browser from here, tell the user to run `swap-guard login <target>` in any terminal.
 
@@ -134,6 +141,10 @@ Why this exists: refresh tokens rotate and are single-use. A plain `/login` whil
 1. Tell the user a browser window will open for the NEW account's sign-in. No `/logout` is needed and live sessions are unaffected.
 2. Run `swap-guard login --new` with a 10-minute Bash timeout (same throwaway-profile flow as relogin; registers the next free slot and returns it as `.slot`). Errors as in relogin step 3.
 3. `cswap alias <.slot> <name>` — optional; do not use a reserved word (any word in the reserved-keywords list above, e.g. `codex`, `spend`, `guard`).
+
+## `/swap forecast`
+
+Run `swap-guard forecast --text` and relay it: when the weekly (and Fable) limits run out at this pace, or that they last the week; the account to use first (room that resets soonest — what is left at its reset is lost); numbers marked hours old are estimates from old data. If the use-first account is not the active one, offer `/swap <it>` (the user decides; never switch from here) and mention `swap-guard auto install --strategy consume-first` makes it automatic. `no-data` → cswap hasn't fetched usage yet: `cswap list`.
 
 ## `/swap spend [days N]`
 
