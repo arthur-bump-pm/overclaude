@@ -48,7 +48,7 @@ f="$HOME/keychain-$s-$a"
 case "$all" in
   *add-generic-password*)    IFS= read -r p1; IFS= read -r p2; [ "$p1" = "$p2" ] || exit 1; printf '%s' "$p1" > "$f";;
   *find-generic-password*)   [ -f "$f" ] && cat "$f" || exit 44;;
-  *delete-generic-password*) rm -f "$f";;
+  *delete-generic-password*) [ -f "$HOME/kc-locked" ] && exit 51; rm -f "$f";;
 esac
 EOF
 chmod +x "$STUB/security"
@@ -108,6 +108,11 @@ assert_eq "$([ -f "$HOME/keychain-overclaude-token-personal@example.com" ] && ec
 "$SG" token add 'bad name;rm' < /dev/null >/dev/null 2>&1
 assert_eq "$?" "1" "an unusable account name is refused"
 
+touch "$HOME/kc-locked"
+o="$("$SG" token rm work)"; rc=$?
+assert_eq "$rc:$(printf '%s' "$o" | jq -r .error)" "1:delete-failed" "a delete the keychain refuses is reported, not claimed"
+assert_contains "$("$SG" token list)" "work@example.com" "and the token stays listed (never orphaned)"
+rm -f "$HOME/kc-locked"
 "$SG" token rm work >/dev/null
 assert_eq "$([ -f "$HOME/keychain-overclaude-token-work@example.com" ] && echo yes || echo no)" "no" "token rm deletes the keychain item"
 assert_absent "$("$SG" token list)" "work@example.com" "and the metadata"

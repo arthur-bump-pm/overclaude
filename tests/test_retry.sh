@@ -38,6 +38,19 @@ ev s4 server_error | SWAP_RETRY_DELAYS="1 1 1" "$SG" server-retry --hook 2>/dev/
 assert_eq "$t0" "2" "waits before waking (delay honored)"
 printf '{"session_id":"../../x","error":"server_error"}' | "$SG" server-retry --hook 2>/dev/null
 assert_eq "$([ -e "$B/x.retry" ] || [ -e "$HOME/x.retry" ] && echo leaked || echo ok)" "ok" "session id cannot escape the state dir"
+# The session moved on while the hook waited (asyncRewake: the user can type) → no late "continue".
+tp="$HOME/t.jsonl"; echo x > "$tp"; touch -t 202001010000 "$tp"
+( printf '{"session_id":"s6","error":"server_error","transcript_path":"%s"}' "$tp" | SWAP_RETRY_GRACE=0 SWAP_RETRY_DELAYS="2 2 2" "$SG" server-retry --hook 2>/dev/null; echo $? > "$HOME/rc6" ) &
+sleep 1; echo y >> "$tp"; wait
+assert_eq "$(cat "$HOME/rc6")" "0" "transcript grew during the wait → no wake"
+assert_contains "$(tail -n 1 "$B/auto.log")" '"session-moved-on"' "and logs why"
+touch -t 202001010000 "$tp"
+( printf '{"session_id":"s8","error":"server_error","transcript_path":"%s"}' "$tp" | SWAP_RETRY_DELAYS="2 2 2" "$SG" server-retry --hook 2>/dev/null; echo $? > "$HOME/rc8" ) &
+sleep 1; echo z >> "$tp"; wait
+assert_eq "$(cat "$HOME/rc8")" "2" "a write right after the failure (inside the grace period) is Claude Code's own: still wakes"
+touch -t 202001010000 "$tp"
+printf '{"session_id":"s7","error":"server_error","transcript_path":"%s"}' "$tp" | SWAP_RETRY_DELAYS="1 1 1" "$SG" server-retry --hook 2>/dev/null
+assert_eq "$?" "2" "an untouched transcript → wakes as before"
 "$SG" server-retry off >/dev/null
 run s5 server_error
 assert_eq "$rc" "0" "off again → no retry"

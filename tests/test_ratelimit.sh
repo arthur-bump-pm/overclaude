@@ -119,5 +119,25 @@ out=$(printf '{"session_id":"s1","error":"rate_limit","last_assistant_message":"
 assert_eq "$(printf '%s' "$out" | jq -r .action)" "would-switch" "dry run reports the decision"
 assert_eq "$(switches)" "" "dry run never switches"
 
+# A `swap-guard token run` job bills its token's account: its cap never moves the login here.
+reset_state
+printf '{"session_id":"t1","error":"rate_limit","last_assistant_message":"%s"}' "$CAP" | CLAUDE_CODE_OAUTH_TOKEN=x "$SG" ratelimit --no-notify 2>/dev/null
+assert_eq "$(switches)" "" "a token job's cap never switches the logged-in account"
+assert_eq "$(lastlog .reason)" "token-session" "and is logged as skipped"
+
+# With other Macs registered, a swap here also starts a fleet swap (background),
+# unless SWAP_NO_FLEET_SWAP is set.
+echo '{"hosts":[{"name":"w1"}]}' > "$HOME/.claude-swap-backup/fleet.json"
+printf '#!/bin/bash\necho "$*" >> "$HOME/ssh-calls"\nexit 255\n' > "$STUB/ssh"; chmod +x "$STUB/ssh"
+reset_state
+SWAP_NO_FLEET_SWAP=1 hit s1 "$CAP"
+sleep 2
+assert_eq "$(switches):$([ -s "$HOME/ssh-calls" ] && echo ssh || echo none)" "switch 1;:none" "SWAP_NO_FLEET_SWAP: swap here, other Macs untouched"
+reset_state
+hit s1 "$CAP"
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$HOME/ssh-calls" ] && break; sleep 0.5; done
+assert_contains "$(cat "$HOME/ssh-calls" 2>/dev/null)" "w1" "otherwise the other Macs are checked for a fleet swap"
+rm -f "$HOME/.claude-swap-backup/fleet.json"
+
 rm -rf "$HOME"
 finish

@@ -49,7 +49,17 @@ fi
 
 if command -v claude >/dev/null 2>&1; then
   CC_VER=$(claude --version 2>/dev/null | awk '{print $1}')
-  ok "Claude Code ${CC_VER:-?}"
+  # cswap refreshes the active login under Claude Code's own refresh lock, which
+  # older versions don't take: the two could rotate the token past each other.
+  case "$CC_VER" in
+    [0-9]*.[0-9]*.[0-9]*)
+      if [ "$(printf '%s\n%s\n' "$CC_VER" 2.1.218 | sort -V | head -n 1)" != 2.1.218 ]; then
+        _warn "Claude Code $CC_VER is older than 2.1.218 — keepalive and swaps can log the active account out" "claude update"
+      else
+        ok "Claude Code $CC_VER"
+      fi ;;
+    *) ok "Claude Code ${CC_VER:-?}" ;;
+  esac
 else
   _warn "claude CLI not on PATH (fine if you only use the desktop/IDE app)"
 fi
@@ -161,6 +171,35 @@ if [ -n "$CSWAP_BIN" ] && command -v jq >/dev/null 2>&1; then
       fi
     fi
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Every login has a fixed end date (a refresh never moves it); only a new sign-in
+# starts a new one. Read from the keychain by swap-guard (dates only, never the token).
+echo "-- login end dates --"
+lj=""
+[ -x "$LOCALBIN/swap-guard" ] && command -v jq >/dev/null 2>&1 && lj=$("$LOCALBIN/swap-guard" logins --refresh 2>/dev/null)
+if printf '%s' "$lj" | jq -e '.accounts | length > 0' >/dev/null 2>&1; then
+  rows=$(printf '%s' "$lj" | jq -r '.accounts[] | [.slot, .label, (.active | tostring), (.endsAt // "" | tostring), (.secondsLeft // "" | tostring), .state] | map(tostring | gsub("[\u0000-\u001f\u007f]"; "")) | join("\u001f")')
+  while IFS=$'\x1f' read -r num label act ends left st; do
+    case "$num" in ''|*[!0-9]*) continue ;; esac
+    case "$ends$left" in *[!0-9-]*) st=unknown ;; esac
+    case "$ends" in ''|*[!0-9]*) st=unknown ;; esac
+    if [ "$act" = true ]; then fix="/login in Claude Code with the same account, then: cswap add"; else fix="swap-guard login $num"; fi
+    when=$(date -r "${ends:-0}" '+%a %b %-d %H:%M' 2>/dev/null)
+    case "$st" in
+      ended) warn "account $num ($label): login ended $when" "$fix" ;;
+      critical|soon)
+        if [ "$left" -ge 86400 ]; then lt="$((left / 86400))d $((left % 86400 / 3600))h"; else lt="$((left / 3600))h $((left % 3600 / 60))m"; fi
+        warn "account $num ($label): login ends $when ($lt left)" "$fix" ;;
+      ok) ok "account $num ($label): login ends $when ($((left / 86400)) days left)" ;;
+      *) ok "account $num ($label): no end date recorded" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+else
+  ok "no login end dates to check"
 fi
 
 # ---------------------------------------------------------------------------

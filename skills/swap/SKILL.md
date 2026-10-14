@@ -64,13 +64,13 @@ Edge rulings:
 
 <!-- SHARED:PREFLIGHT-RECIPE BEGIN -->
 1. Run `swap-guard preflight <target>` and read `.verdict` from its JSON output.
-2. If `unknown-target` → report `.detail` and stop. If `relogin-required` → REFUSE to switch; give the recovery recipe: `/swap relogin <N>` (runs `swap-guard login <N>`: saves the live account's token first, signs in inside a throwaway profile, registers slot N), then retry. Never suggest a plain `/login` + `cswap add`: signing in over the live account overwrites its newest token before cswap saved it, which kills the live account next. If `busy` and the `force` token was NOT given → STOP and show the `.busy` table (pid, sessionId, cwd, kind, entrypoint, status; missing status means possibly-busy); tell the user to re-run with `force` to override.
+2. If `unknown-target` → report `.detail` and stop. If `relogin-required` → REFUSE to switch (this includes a login past its end date); give the recovery recipe: `/swap relogin <N>` (runs `swap-guard login <N>`: saves the live account's token first, signs in inside a throwaway profile, registers slot N), then retry. Never suggest a plain `/login` + `cswap add`: signing in over the live account overwrites its newest token before cswap saved it, which kills the live account next. If `busy` and the `force` token was NOT given → STOP and show the `.busy` table (pid, sessionId, cwd, kind, entrypoint, status; missing status means possibly-busy); tell the user to re-run with `force` to override. If `login-ending` → REFUSE to switch: the target's login ends within hours (`.detail` says when), so sessions moved there would stop then; relay `.detail` — renew first with `/swap relogin <N>`, then retry. `force` never overrides it.
 3. If `ok` (or `busy` overridden by `force`) → run `cswap switch <target> --json`, then report `.reason` and every entry of `.warnings[]` to the user.
 <!-- SHARED:PREFLIGHT-RECIPE END -->
 
 ## `/swap` — dashboard
 
-Render from the auto-collected context above, then stop. Never switch from the dashboard.
+Render from the auto-collected context above, then stop. Never switch from the dashboard. Also run `swap-guard logins --text` and show each account's login end date; flag any inside 3 days with its renew command (an inactive account: `/swap relogin <N>`; the active one: `/login` signing in again with that SAME account, then `cswap add` — the preflight rule against a plain `/login` is about signing in over the live login with a DIFFERENT account, which this is not).
 - Accounts table: slot number, alias, email, active marker, usageStatus/token health.
 - Live-session table: pid, sessionId (first 8 chars), cwd, kind, entrypoint, status (missing status → show "unknown (possibly busy)").
 

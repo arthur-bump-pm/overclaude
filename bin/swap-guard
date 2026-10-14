@@ -16,8 +16,9 @@
 #   auto tick|install|uninstall|status [opts]
 #                                   busy-aware wrapper around `cswap auto --once` (+ opt-in LaunchAgent)
 #   keepalive tick|on|off|status    keep idle accounts' logins alive (LaunchAgent, on by default)
+#   logins [--refresh|--cached] [--text]  when each account's login ends (keychain dates only)
 #   token add|list|rm|run           one-year setup-tokens for headless jobs (keychain; never shown)
-#   fleet add|rm|list|status        other Macs over Tailscale SSH: sessions, accounts, logins
+#   fleet add|rm|list|status|swap   other Macs over Tailscale SSH: sessions, accounts, logins
 #   remote start|list|logs|stop|attach  Remote Control sessions on another Mac (claude --bg)
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
@@ -59,11 +60,15 @@ usage: swap-guard <subcommand> [args]
   auto install [--interval SEC] [--threshold PCT] [--model NAMES] [--no-notify]
   auto uninstall | auto status    manage the LaunchAgent that runs `auto tick` periodically
   keepalive on [--interval SEC] | off | status | tick
-                                  keep every account's login alive while no session runs (every 2 h)
+                                  keep every account's login alive while no session runs (every 2 h),
+                                  and warn 3 days before a login reaches its end date
+  logins [--refresh|--cached] [--text]
+                                  when each account's login ends (a new sign-in starts a new one)
   token add <account> | list | rm <account> | run <account> -- <cmd...>
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
-  fleet add <host> | rm <host> | list | status [--text]
-                                  your other Macs (Tailscale SSH): sessions, accounts, dead logins, load
+  fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run]
+                                  your other Macs (Tailscale SSH): sessions, accounts, dead logins, load;
+                                  swap moves them off a capped account
   remote start <mac> [--dir D] [--name N] [goal…] | handoff <mac> [--dir D] [--name N] [--force] | list <mac> | logs|stop|attach <mac> <id|name>
                                   a session on another Mac you drive from claude.ai/code or the app
   artifacts [--session <id>] [--cwd <dir>]
@@ -205,7 +210,7 @@ cmd_sessions() {
 }
 
 cmd_preflight() {
-  local raw="${1:-}" busy busy_n list tgt slot="" verdict detail target_json number email us
+  local raw="${1:-}" busy busy_n list tgt slot="" verdict detail target_json number email us ends="" left
   busy="$(sessions_json | jq -c '[.[] | select(.status == "busy" or .status == "unknown")]' 2>/dev/null)" || busy="[]"
   [ -n "$busy" ] || busy="[]"
   busy_n="$(printf '%s' "$busy" | jq 'length' 2>/dev/null)" || busy_n=0
@@ -256,7 +261,23 @@ cmd_preflight() {
       detail="account $number ($email) requires re-login (usageStatus: $us) - recover with: swap-guard login $number (never a plain /login: it kills the live account's token)"
       ;;
     *)
-      if [ "$busy_n" -gt 0 ] 2>/dev/null; then
+      # A login past (or within hours of) its end date: switching there strands every
+      # session on it when the date hits — a new sign-in comes first.
+      ends="$(_logins_json 2>/dev/null | jq -r --arg n "$number" 'first(.accounts[]? | select(.slot == $n)) | .endsAt // empty' 2>/dev/null)"
+      case "$ends" in ''|*[!0-9]*) ends="";; esac
+      # About to refuse on a cached date? Read it again: a renewal since then moved it.
+      if [ -n "$ends" ] && [ $(( ends - $(date +%s) )) -lt "$LOGINS_MIN" ]; then
+        ends="$(_logins_json --refresh 2>/dev/null | jq -r --arg n "$number" 'first(.accounts[]? | select(.slot == $n)) | .endsAt // empty' 2>/dev/null)"
+        case "$ends" in ''|*[!0-9]*) ends="";; esac
+      fi
+      left=$(( ${ends:-0} - $(date +%s) ))
+      if [ -n "$ends" ] && [ "$left" -le 0 ]; then
+        verdict="relogin-required"
+        detail="account $number ($email): its login ended $(date -r "$ends" '+%a %b %-d %H:%M') - sign in again with: swap-guard login $number (never a plain /login: it kills the live account's token)"
+      elif [ -n "$ends" ] && [ "$left" -lt "$LOGINS_MIN" ]; then
+        verdict="login-ending"
+        detail="account $number ($email): its login ends in $(_logins_left "$left") ($(date -r "$ends" '+%a %b %-d %H:%M')) - sessions switched there would stop then; renew first: swap-guard login $number"
+      elif [ "$busy_n" -gt 0 ] 2>/dev/null; then
         verdict="busy"
         detail="account $number ($email) is healthy, but $busy_n other session(s) are busy or possibly-busy - a switch flips ALL sessions within ~30s"
       else
@@ -267,7 +288,7 @@ cmd_preflight() {
   esac
 
   jq -cn --arg v "$verdict" --argjson t "$target_json" --argjson busy "$busy" --arg d "$detail" \
-    '{verdict:$v,target:$t,busy:$busy,detail:$d}'
+    --argjson ends "${ends:-null}" '{verdict:$v,target:$t,busy:$busy,detail:$d,loginEndsAt:$ends}'
   exit 0
 }
 
@@ -577,7 +598,7 @@ _auto_tick() {
   verdict="$(printf '%s' "$pre" | jq -r '.verdict // "unknown"' 2>/dev/null)"
   busy_n="$(printf '%s' "$pre" | jq -r '(.busy // []) | length' 2>/dev/null)"
   case "$verdict" in
-    relogin-required|unknown-target)
+    relogin-required|login-ending|unknown-target)
       out="$(jq -cn --arg ts "$now" --arg v "$verdict" --arg to "$to_num" '{ts:$ts, action:"skipped", reason:$v, to:$to}')"
       _auto_log "$out"; printf '%s\n' "$out"; return 3;;
     busy)
@@ -772,7 +793,7 @@ _keepalive_log() { # _keepalive_log <json> — append + keep the last 300 lines
 }
 
 _keepalive_tick() {
-  local notify=1 probe=0 list ts now n label stamp m out dead
+  local notify=1 probe=0 list ts now n label stamp m out dead ending ending_ok act e msg
   while [ $# -gt 0 ]; do
     case "$1" in --no-notify) notify=0;; --probe) probe=1;; esac
     shift
@@ -805,9 +826,36 @@ _keepalive_tick() {
     n="${stamp##*-}"
     printf '%s\n' "$dead" | grep -qx "$n" || rm -f "$stamp"
   done
-  out="$(printf '%s' "$list" | jq -c --arg ts "$ts" \
+  # Logins nearing their end date (a refresh never moves it): one notification a day
+  # each, from 3 days out. A dead one is already covered above.
+  ending="$(_logins_json --refresh 2>/dev/null | jq -c --argjson now "$now" --argjson soon "$LOGINS_SOON" \
+    '[.accounts[]? | select(.endsAt != null and .endsAt - $now < $soon) | {slot, label, active, endsAt}]' 2>/dev/null)"
+  ending_ok=1; [ -n "$ending" ] || { ending="[]"; ending_ok=0; }
+  printf '%s' "$ending" | jq -r '.[] | [.slot, .label, (.active | tostring), (.endsAt | tostring)] | map(tostring | gsub("[\u0000-\u001f\u007f]"; "")) | join("\u001f")' 2>/dev/null |
+  while IFS=$'\x1f' read -r n label act e; do
+    case "$n" in ''|*[!0-9]*) continue;; esac
+    case "$e" in ''|*[!0-9]*) continue;; esac
+    printf '%s\n' "$dead" | grep -qx "$n" && continue
+    stamp="$STATE_ROOT/keepalive-ending-alerted-$n"
+    m="$(stat -f %m "$stamp" 2>/dev/null || echo 0)"
+    [ $(( now - m )) -ge 86400 ] || continue
+    [ "$notify" -eq 1 ] || continue
+    if [ "$e" -le "$now" ]; then msg="$(printf "%s's login has ended. Sign in again: %s" "$label" "$(_logins_fix "$n" "$act")")"
+    else msg="$(printf "%s's login ends in %s. Renew: %s" "$label" "$(_logins_left $(( e - now )))" "$(_logins_fix "$n" "$act")")"; fi
+    command -v osascript >/dev/null 2>&1 &&
+      osascript -e "display notification \"$(printf '%s' "$msg" | tr -d '"\\')\" with title \"overclaude\"" >/dev/null 2>&1
+    touch "$stamp"
+  done
+  # Only a good read may clear a stamp: a failed one would re-alert within the day.
+  [ "$ending_ok" -eq 1 ] && for stamp in "$STATE_ROOT"/keepalive-ending-alerted-*; do
+    [ -f "$stamp" ] || continue
+    n="${stamp##*-}"
+    printf '%s' "$ending" | jq -e --arg n "$n" 'any(.[]; .slot == $n)' >/dev/null 2>&1 || rm -f "$stamp"
+  done
+  out="$(printf '%s' "$list" | jq -c --arg ts "$ts" --argjson ending "$ending" \
     '{ts:$ts, action:"tick", accounts:[.accounts[] | {number, active:(.active // false), status:(.usageStatus // "unknown")}],
-      dead:[.accounts[] | select(.usageStatus == "relogin_required") | .number]}')"
+      dead:[.accounts[] | select(.usageStatus == "relogin_required") | .number],
+      ending:[$ending[] | .slot | tonumber? // .]}')"
   _keepalive_log "$out"; printf '%s\n' "$out"
   return 0
 }
@@ -860,6 +908,146 @@ cmd_keepalive() {
     status) _keepalive_status; exit 0;;
     *) echo "usage: swap-guard keepalive tick|on|off|status" >&2; exit 1;;
   esac
+}
+
+# --- logins: when each account's login ends -------------------------------------
+# A /login has a fixed end: Claude Code stores refreshTokenExpiresAt (about 30 days
+# after sign-in) next to the token, and refreshing does not move it. Keepalive keeps
+# a login from dying of disuse, not past that date — only a new sign-in
+# (swap-guard login N) starts a new one. Claude Code warns 3 days ahead, but only for
+# the account it is logged into; this covers every account. Each keychain item goes
+# from `security` straight into jq over a pipe — no variable, file or argv holds the
+# token, and only the two dates come out. The cache holds dates and labels only.
+LOGINS_CACHE="$STATE_ROOT/cache/logins.json"
+LOGINS_SOON=259200   # warn this many seconds ahead (3 days, like Claude Code)
+LOGINS_MIN=21600     # never switch to an account with less than this left (6 h)
+LOGINS_TTL=3600      # cache age before a refresh
+LOGINS_JQ_DATES='(.claudeAiOauth // {}) | [(.refreshTokenExpiresAt // ""), (.expiresAt // "")] | map(tostring) | join(" ")'
+
+_logins_item() { # _logins_item <service> <account> — "<refreshTokenExpiresAt> <expiresAt>" in ms, or nothing
+  # perl's alarm stops a keychain read that hangs (a locked keychain prompting nobody under launchd).
+  perl -e 'alarm shift; exec @ARGV' "${SWAP_KEYCHAIN_TIMEOUT:-8}" security find-generic-password -a "$2" -s "$1" -w 2>/dev/null |
+    jq -r "$LOGINS_JQ_DATES" 2>/dev/null
+}
+
+_logins_refresh() { # read every account's dates, write the cache, print it
+  local seq="$STATE_ROOT/sequence.json" active rows n email alias d src r a ends act out="" now prev
+  command -v jq >/dev/null 2>&1 && [ -r "$seq" ] || return 1
+  now="$(date +%s)"
+  prev="$(jq -c '[.accounts[]? | select(.endsAt != null) | {slot, email, endsAt}]' "$LOGINS_CACHE" 2>/dev/null)" || prev=""
+  [ -n "$prev" ] || prev="[]"
+  active="$(jq -r '(.activeAccountNumber // "") | tostring' "$seq" 2>/dev/null)"
+  rows="$(jq -r '. as $s | ($s.sequence // ($s.accounts // {} | keys))[] | tostring as $n
+    | [$n, ($s.accounts[$n].email // ""), ($s.accounts[$n].alias // "")]
+    | map(tostring | gsub("[\u0000-\u001f\u007f]"; "")) | join("\u001f")' "$seq" 2>/dev/null)" || return 1
+  while IFS=$'\x1f' read -r n email alias; do
+    case "$n" in ''|*[!0-9]*) continue;; esac
+    d=""; src="none"
+    # The active account's live item is the one Claude Code keeps current; cswap's
+    # backup of it can lag. A custom CLAUDE_CONFIG_DIR keys the live item differently.
+    if [ "$n" = "$active" ] && [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then
+      d="$(_logins_item "Claude Code-credentials" "${USER:-$(id -un)}")"
+      [ -n "$d" ] && src="live"
+      if [ -z "$d" ] && [ -r "$HOME/.claude/.credentials.json" ]; then
+        d="$(jq -r "$LOGINS_JQ_DATES" "$HOME/.claude/.credentials.json" 2>/dev/null)"; [ -n "$d" ] && src="file"
+      fi
+    fi
+    if [ -z "$d" ] && [ -n "$email" ]; then
+      d="$(_logins_item claude-swap "account-$n-$email")"; [ -n "$d" ] && src="backup"
+    fi
+    # Nothing read (locked keychain, timeout, a session over SSH): keep the last date
+    # this account had rather than forget it — the date never moves without a new sign-in.
+    if [ -z "$d" ]; then
+      d="$(printf '%s' "$prev" | jq -r --arg n "$n" --arg e "$email" 'first(.[] | select(.slot == $n and .email == $e)) | "\(.endsAt * 1000) "' 2>/dev/null)"
+      [ -n "$d" ] && src="previous"
+    fi
+    r="${d%% *}"; a="${d#* }"; ends=null
+    case "$r" in
+      ''|*[!0-9]*) ;;
+      *) ends=$(( r / 1000 ))
+         # Claude Code's own rule: an access token that outlives the date by days means no real deadline.
+         case "$a" in ''|*[!0-9]*) ;; *) [ $(( a / 1000 )) -gt $(( ends + LOGINS_SOON )) ] && ends=null;; esac;;
+    esac
+    act=false; [ "$n" = "$active" ] && act=true
+    out="$out$(jq -cn --arg n "$n" --arg e "$email" --arg al "$alias" --argjson act "$act" \
+      --argjson ends "$ends" --arg src "$src" \
+      '{slot:$n, email:$e, alias:(if $al == "" then null else $al end),
+        label:(if $al != "" then $al elif $e != "" then ($e | split("@")[0]) else "account " + $n end),
+        active:$act, endsAt:$ends, source:$src}')"$'\n'
+  done <<EOF
+$rows
+EOF
+  out="$(printf '%s' "$out" | jq -sc --argjson now "$now" '{checkedAt:$now, accounts:.}' 2>/dev/null)" || return 1
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null
+  printf '%s\n' "$out" > "$LOGINS_CACHE.tmp.$$" && mv "$LOGINS_CACHE.tmp.$$" "$LOGINS_CACHE"
+  printf '%s\n' "$out"
+}
+
+_logins_json() { # [--refresh|--cached] — the cache, refreshed when older than LOGINS_TTL
+  local mode="${1:-}" m now
+  now="$(date +%s)"; m="$(stat -f %m "$LOGINS_CACHE" 2>/dev/null || echo 0)"
+  if [ "$mode" = --refresh ] || { [ "$mode" != --cached ] && [ $(( now - m )) -ge "$LOGINS_TTL" ]; }; then
+    _logins_refresh && return 0
+  fi
+  [ -s "$LOGINS_CACHE" ] && jq -c . "$LOGINS_CACHE" 2>/dev/null
+}
+
+_logins_blocked() { # JSON array of slots never to switch to: the login ends within LOGINS_MIN
+  local j b mode
+  for mode in "" --refresh; do
+    j="$(_logins_json $mode 2>/dev/null)" || { echo '[]'; return 0; }
+    b="$(printf '%s' "$j" | jq -c --argjson now "$(date +%s)" --argjson min "$LOGINS_MIN" \
+      '[.accounts[]? | select(.endsAt != null and .endsAt - $now < $min) | .slot]' 2>/dev/null)" || b='[]'
+    # Blocking on a cached date? Read again first: a renewal since then moved it.
+    [ "$b" = '[]' ] && break
+  done
+  printf '%s\n' "${b:-[]}"
+}
+
+_logins_fix() { # _logins_fix <slot> <active:true|false> — how to start a new login for that account
+  if [ "$2" = true ]; then printf '/login in Claude Code with the same account, then: cswap add'
+  else printf 'swap-guard login %s' "$1"; fi
+}
+
+_logins_left() { # _logins_left <seconds> — "25d 7h" / "5h 12m" / "8m"
+  local l="$1"
+  if [ "$l" -ge 86400 ]; then printf '%dd %dh' $(( l / 86400 )) $(( l % 86400 / 3600 ))
+  elif [ "$l" -ge 3600 ]; then printf '%dh %dm' $(( l / 3600 )) $(( l % 3600 / 60 ))
+  else printf '%dm' $(( l / 60 )); fi
+}
+
+cmd_logins() {
+  local mode="" text=0 j now n label act ends st fix
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --refresh|--cached) mode="$1";;
+      --text) text=1;;
+      *) echo "usage: swap-guard logins [--refresh|--cached] [--text]" >&2; exit 2;;
+    esac
+    shift
+  done
+  j="$(_logins_json $mode)" || {
+    jq -cn '{error:"no-data", detail:"could not read any login (needs jq and cswap'"'"'s sequence.json)"}'; exit 1; }
+  now="$(date +%s)"
+  j="$(printf '%s' "$j" | jq -c --argjson now "$now" --argjson soon "$LOGINS_SOON" --argjson min "$LOGINS_MIN" '
+    .accounts |= map(. + {secondsLeft:(if .endsAt == null then null else .endsAt - $now end)}
+      | .state = (if .endsAt == null then "unknown" elif .secondsLeft <= 0 then "ended"
+                  elif .secondsLeft < $min then "critical" elif .secondsLeft < $soon then "soon" else "ok" end))')"
+  if [ "$text" -eq 0 ]; then printf '%s\n' "$j"; exit 0; fi
+  printf '%s' "$j" | jq -r '.accounts[] | [.slot, .label, (.active | tostring), (.endsAt // "" | tostring), .state] | map(tostring | gsub("[\u0000-\u001f\u007f]"; "")) | join("\u001f")' |
+  while IFS=$'\x1f' read -r n label act ends st; do
+    case "$n" in ''|*[!0-9]*) continue;; esac
+    case "$ends" in ''|*[!0-9]*) ends=""; st=unknown;; esac
+    fix="$(_logins_fix "$n" "$act")"
+    [ "$act" = true ] && label="$label, active"
+    case "$st" in
+      unknown) printf 'account %s (%s): no end date recorded\n' "$n" "$label";;
+      ended)   printf 'account %s (%s): login ENDED %s — sign in again: %s\n' "$n" "$label" "$(date -r "$ends" '+%a %b %-d %H:%M')" "$fix";;
+      ok)      printf 'account %s (%s): login ends %s (%s left)\n' "$n" "$label" "$(date -r "$ends" '+%a %b %-d %H:%M')" "$(_logins_left $(( ends - now )))";;
+      *)       printf 'account %s (%s): login ends %s (%s left) — renew now: %s\n' "$n" "$label" "$(date -r "$ends" '+%a %b %-d %H:%M')" "$(_logins_left $(( ends - now )))" "$fix";;
+    esac
+  done
+  exit 0
 }
 
 # --- token: long-lived tokens for headless jobs ---------------------------------
@@ -920,7 +1108,7 @@ try:
             for m in URL.finditer(text):
                 if m.end() < len(text) and m.group(0) not in shown:
                     shown.add(m.group(0))
-                    say("Sign-in page (opens by itself; if not, open it): " + m.group(0))
+                    say("Sign-in page (opens by itself; if not, open it): " + SECRETISH.sub("[hidden]", m.group(0)))
             if not hinted and re.search(r"(?i)paste.{0,40}code", text):
                 hinted = True
                 say("If the browser shows a code, paste it here and press Enter.")
@@ -986,7 +1174,8 @@ if len(maximal) == 1 and not cancelled:
     # answer but 401 means the bearer authenticated; 401 means a wrong/truncated
     # token; no answer means unverified, and nothing is saved.
     def accepted(c):
-        want = os.environ.get("SWAP_TOKEN_TEST_VALID")  # tests only: no network
+        # tests only (both set): no network
+        want = os.environ.get("SWAP_TOKEN_TEST_VALID") if os.environ.get("SWAP_TOKEN_TEST") else None
         if want is not None:
             return c == want
         body = json.dumps({"model": "claude-haiku-5-5", "max_tokens": 1,
@@ -1114,10 +1303,16 @@ _token_list() {
 }
 
 _token_rm() {
-  local label tmp
+  local label tmp rc
   [ -n "${1:-}" ] || { echo "usage: swap-guard token rm <slot|alias|email>" >&2; return 2; }
   label="$(_token_label "$1")" || return 1
-  security delete-generic-password -s "$TOKEN_SERVICE" -a "$label" >/dev/null 2>&1
+  security delete-generic-password -s "$TOKEN_SERVICE" -a "$label" >/dev/null 2>&1; rc=$?
+  # 44 = no such item (already gone). Anything else (locked keychain, denied): the
+  # token is still there, so keep listing it rather than orphan a live token.
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 44 ]; then
+    jq -cn --arg l "$label" --argjson rc "$rc" '{error:"delete-failed", account:$l, securityExit:$rc, fix:"unlock the login keychain, then retry"}'
+    return 1
+  fi
   if [ -f "$TOKENS_JSON" ]; then
     tmp="$(mktemp "$STATE_ROOT/tokens.XXXXXX")" && jq --arg l "$label" 'del(.[$l])' "$TOKENS_JSON" > "$tmp" && mv "$tmp" "$TOKENS_JSON"
   fi
@@ -1235,11 +1430,16 @@ _fleet_follow() {
   done
   _fleet_valid_email "$from" && _fleet_valid_email "$to" || { echo '{"switched":false,"reason":"bad-arguments"}'; return 1; }
   command -v cswap >/dev/null 2>&1 || { echo '{"switched":false,"reason":"cswap-not-found"}'; return 1; }
+  # `swap-guard auto instant off` on this Mac means no automatic switching here,
+  # whichever Mac asks.
+  [ -f "$INSTANT_OFF" ] && { echo '{"switched":false,"reason":"instant-swap-off"}'; return 0; }
   mkdir -p "$STATE_ROOT" || return 1
   lock="$STATE_ROOT/ratelimit.lock"
+  # This Mac's own instant swap may hold the lock through a usage fetch and a switch;
+  # waiting it out lets the check below see what it did.
   until mkdir "$lock" 2>/dev/null; do
     if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null; continue; fi
-    i=$((i + 1)); [ "$i" -lt 10 ] || { echo '{"switched":false,"reason":"lock-busy"}'; return 1; }
+    i=$((i + 1)); [ "$i" -lt "${SWAP_FOLLOW_LOCK_WAIT:-45}" ] || { echo '{"switched":false,"reason":"lock-busy"}'; return 1; }
     sleep 1
   done
   # The path is baked in now: at EXIT this function's locals are out of scope.
@@ -1252,6 +1452,9 @@ _fleet_follow() {
   to_n="$(printf '%s' "$list" | jq -r --arg e "$to" 'first(.accounts[]? | select((.email // "" | ascii_downcase) == ($e | ascii_downcase))) | .number // empty' 2>/dev/null)"
   from_n="$(printf '%s' "$list" | jq -r '.activeAccountNumber // empty' 2>/dev/null)"
   [ -n "$to_n" ] || { echo '{"switched":false,"reason":"target-not-logged-in-here"}'; return 1; }
+  if _logins_blocked | jq -e --arg n "$to_n" 'index($n) != null' >/dev/null 2>&1; then
+    echo '{"switched":false,"reason":"target-login-ending"}'; return 1
+  fi
   sw="$(cswap switch "$to_n" --json 2>/dev/null)" &&
     [ "$(printf '%s' "$sw" | jq -r '.switched // false' 2>/dev/null)" = true ] ||
     { jq -cn --arg d "$(printf '%s' "$sw" | tail -c 200)" '{switched:false, reason:"switch-failed", detail:$d}'; return 1; }
@@ -1917,12 +2120,14 @@ _rl_model() { # the model a cap message names ("reached your Fable limit" -> Fab
 
 # _rl_pick <cswap-list-json> <model> <now> — best OTHER account with room, as JSON.
 # Room = every relevant window under 100% (a window whose reset passed counts as 0).
-# Skips disabled accounts, dead tokens and API-key accounts (those bill per use).
+# Skips disabled accounts, dead tokens, API-key accounts (those bill per use) and
+# logins within hours of their end date (_logins_blocked).
 RL_CAPPED="$STATE_ROOT/ratelimit-capped.json"   # [{slot, model, until}] — accounts that hit a cap
 _rl_pick() {
   local capped; capped="$(jq -c 'if type == "array" then . else [] end' "$RL_CAPPED" 2>/dev/null)" || capped="[]"
   [ -n "$capped" ] || capped="[]"
-  printf '%s' "$1" | jq -c --arg model "$2" --argjson now "$3" --argjson capped "$capped" "$JQ_EPOCH"'
+  local blocked; blocked="$(_logins_blocked)"
+  printf '%s' "$1" | jq -c --arg model "$2" --argjson now "$3" --argjson capped "$capped" --argjson blocked "$blocked" "$JQ_EPOCH"'
     def pct($w): if $w == null then 0
       elif (($w.resetsAt // "") | ep) as $r | ($r != null and $r <= $now) then 0
       else ($w.pct // 0) end;
@@ -1930,6 +2135,7 @@ _rl_pick() {
     | [.accounts[]?
        | select(.number != $act and ((.disabled // false) | not))
        | (.number | tostring) as $n
+       | select($blocked | index($n) | not)
        | select([$capped[] | select(.slot == $n and .until > $now
                  and (.model == "" or (.model | ascii_downcase) == ($model | ascii_downcase)))] | length == 0)
        | select(.usageStatus as $s | ["ok", "token_expired", "unavailable"] | index($s))
@@ -1979,6 +2185,12 @@ cmd_ratelimit() {
     [ "$dry" -eq 1 ] || _auto_log "$1"; [ "$print" -eq 1 ] && printf '%s\n' "$1"; return 0
   }
   [ "$err" = rate_limit ] || exit 0
+  # A `swap-guard token run` job bills its token's account, not the one logged in
+  # here: its cap says nothing about the live account, so never switch (or move other
+  # Macs) on it.
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    _rl_out "$(jq -cn --argjson ts "$now" '{ts:($ts|todate), source:"ratelimit", action:"skipped", reason:"token-session"}')"; exit 0
+  fi
   if [ -f "$INSTANT_OFF" ]; then
     _rl_out "$(jq -cn --argjson ts "$now" '{ts:($ts|todate), source:"ratelimit", action:"skipped", reason:"instant-swap-off"}')"; exit 0
   fi
@@ -2087,7 +2299,7 @@ SR_ON="$STATE_ROOT/server-retry.on"
 SR_MAX=3
 
 cmd_server_retry() {
-  local input sid err f now n=0 t delays d keep=""
+  local input sid err f now n=0 t delays d keep="" tp m0
   case "${1:-}" in
     on)  mkdir -p "$STATE_ROOT" && touch "$SR_ON"; jq -cn '{serverRetry:true}'; exit 0;;
     off) rm -f "$SR_ON"; jq -cn '{serverRetry:false}'; exit 0;;
@@ -2124,7 +2336,19 @@ cmd_server_retry() {
   shift "$n" 2>/dev/null || true
   d="${1:-300}"; case "$d" in ''|*[!0-9]*) d=300;; esac
   _auto_log "$(jq -cn --argjson ts "$now" --arg e "$err" --arg s "$sid" --argjson try "$((n + 1))" --argjson d "$d" '{ts:($ts|todate), source:"server-retry", action:"retrying", error:$e, try:$try, waitSec:$d, session:$s}')"
+  tp="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  # Baseline: the later of the transcript's last write and now plus a grace period,
+  # so Claude Code's own writes right after the failure (the error entry, hook
+  # records) never count as the user moving on.
+  m0="$(stat -f %m "$tp" 2>/dev/null || echo 0)"
+  t="$(( now + ${SWAP_RETRY_GRACE:-15} ))"; [ "$t" -gt "$m0" ] && m0="$t"
   sleep "$d"
+  # The transcript grew while we waited: the user (or something else) moved the
+  # session on, and a late "continue" would land in the middle of new work.
+  if [ -n "$tp" ] && [ "$(stat -f %m "$tp" 2>/dev/null || echo 0)" -gt "$m0" ]; then
+    _auto_log "$(jq -cn --argjson ts "$(date +%s)" --arg s "$sid" '{ts:($ts|todate), source:"server-retry", action:"skipped", reason:"session-moved-on", session:$s}')"
+    exit 0
+  fi
   # Only the last try says to stop: earlier ones are retried by this hook, not by Claude.
   local last=""
   [ $((n + 1)) -ge "$SR_MAX" ] && last=" This is the last automatic retry: if it fails again, stop and tell the user."
@@ -2262,6 +2486,8 @@ EOF
   fi
   exec 2>/dev/null
   input="$(cat)" || input=""
+  # A token job (swap-guard token run) bills another account: these numbers aren't its.
+  [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || exit 0
   sid="$(printf '%s' "$input" | jq -r '.session_id // empty' | tr -cd 'A-Za-z0-9_-')"
   [ -n "$sid" ] || exit 0
   line="$(_budget_eval)" || exit 0
@@ -2569,6 +2795,12 @@ cmd_login() {
   fi
   echo "4/4 re-anchoring cswap on the live account and cleaning up…" >&2
   local reanchored=true
+  # A new sign-in starts a new login: that account's cached end date is wrong now
+  # (only that one — the others' dates still stand if a later keychain read fails).
+  if [ -n "${slot:-}" ] && [ -f "$LOGINS_CACHE" ]; then
+    jq -c --arg n "$slot" '.accounts |= map(select(.slot != $n))' "$LOGINS_CACHE" > "$LOGINS_CACHE.tmp.$$" 2>/dev/null &&
+      mv "$LOGINS_CACHE.tmp.$$" "$LOGINS_CACHE" || rm -f "$LOGINS_CACHE.tmp.$$"
+  fi
   if [ -n "$live" ] && ! cswap add </dev/null >/dev/null 2>&1; then reanchored=false; fi
   [ -z "$live" ] && reanchored=false
   jq -cn --arg s "${slot:-new}" --arg e "${email:-$got}" --arg l "${live:-}" --argjson r "$reanchored" \
@@ -3146,6 +3378,7 @@ main() {
     restore)       cmd_restore "$@";;
     auto)          cmd_auto "$@";;
     keepalive)     cmd_keepalive "$@";;
+    logins)        cmd_logins "$@";;
     token)         cmd_token "$@";;
     remote)        cmd_remote "$@";;
     fleet)         cmd_fleet "$@";;

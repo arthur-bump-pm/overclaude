@@ -38,8 +38,10 @@ EOF
 chmod +x "$STUB"/*
 export PATH="$STUB:$PATH"
 
+echo '{"checkedAt":1,"accounts":[{"slot":"1","endsAt":5},{"slot":"2","endsAt":9}]}' > "$HOME/.claude-swap-backup/cache/logins.json"
 out="$("$SG" login work 2>/dev/null)"; rc=$?
 assert_eq "$rc" "0" "re-login succeeds"
+assert_eq "$(jq -c '[.accounts[].slot]' "$HOME/.claude-swap-backup/cache/logins.json")" '["2"]' "a new sign-in drops that account's cached end date (only that one)"
 assert_eq "$(printf '%s' "$out" | jq -r .liveUntouched)" "true" "result says the live login was untouched"
 assert_eq "$(sed -n 1p "$LOG")" "cswap add cfg=default" "step 1: the live account's token is captured first"
 assert_contains "$(sed -n 2p "$LOG")" "claude auth login --email work@example.com cfg=$HOME/.claude-swap-backup/login." "step 2: sign-in happens in a throwaway profile"

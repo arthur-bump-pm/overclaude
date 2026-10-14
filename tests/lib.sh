@@ -18,6 +18,11 @@ new_home() {
   mkdir -p "$TH/.claude/sessions" "$TH/.claude/projects" "$TH/.claude-swap-backup/cache"
   export HOME="$TH"
   export SWAP_NO_REFRESH=1
+  # A default `security` that finds nothing: the real keychain is never read (logins,
+  # preflight). Tests that need one put their own stub earlier on PATH.
+  mkdir -p "$TH/.stub-security"
+  printf '#!/bin/bash\nexit 44\n' > "$TH/.stub-security/security"; chmod +x "$TH/.stub-security/security"
+  export PATH="$TH/.stub-security:$PATH"
 }
 
 strip_ansi() { LC_ALL=C sed $'s/\x1b\\[[0-9;]*m//g'; }

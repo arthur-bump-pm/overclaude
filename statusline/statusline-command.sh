@@ -281,10 +281,39 @@ fmt_left() {
   elif [ "$h" -gt 0 ]; then printf '%dh %dm' "$h" "$m"
   else printf '%dm' "$m"; fi
 }
+# --- login end dates (swap-guard logins) ---
+# Every login has a fixed end date (a refresh never moves it). Within 3 days of it:
+# "⚠ login ends 2d 4h" (red inside a day); past it: "⚠ login ended". A render only
+# reads the cache; a background `swap-guard logins --refresh` keeps it under an hour old.
+login_ends=""
+load_login_ends() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" m lock
+  command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/logins.json"; m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( $(date +%s) - m )) -ge 3600 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/logins.lock"
+    if [ -z "$(find "$lock" -mmin -10 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" logins --refresh >/dev/null 2>&1 & )
+    fi
+  fi
+  login_ends=$(jq -r '.accounts[]? | select(.endsAt != null) | "\(.slot) \(.endsAt)"' "$cache" 2>/dev/null) || login_ends=""
+}
+load_login_ends 2>/dev/null
+# login_warn <slot> -> "" or a colored warning
+login_warn() {
+  local e l
+  e=$(printf '%s\n' "$login_ends" | awk -v s="$1" '$1 == s { print $2; exit }')
+  case "$e" in ''|*[!0-9]*) return 0 ;; esac
+  l=$(( e - $(date +%s) ))
+  if [ "$l" -le 0 ]; then printf '%s⚠ login ended%s' "$RED" "$RESET"
+  elif [ "$l" -lt 86400 ]; then printf '%s⚠ login ends %s%s' "$RED" "$(fmt_left "$l")" "$RESET"
+  elif [ "$l" -lt 259200 ]; then printf '%s⚠ login ends %s%s' "$YELLOW" "$(fmt_left "$l")" "$RESET"
+  fi
+}
 other_accounts_lines() {
   local seq_json="${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}"
   local cache="${SWAP_USAGE_JSON:-$HOME/.claude-swap-backup/cache/usage.json}"
-  local now rows label slot p5 r5 p7 r7 pf rf dead fetched seg part out=""
+  local now rows label slot p5 r5 p7 r7 pf rf dead fetched seg part lw out=""
   command -v jq >/dev/null 2>&1 && [ -r "$seq_json" ] || return 0
   [ -r "$cache" ] || cache=/dev/null
   now=$(date +%s)
@@ -332,7 +361,8 @@ other_accounts_lines() {
            seg="$seg ↻ $(date -r "$r7" '+%a %b %-d %H:%M') ${DIM}($(fmt_left $(( r7 - now ))))${RESET}"
          fi ;;
     esac
-    [ -n "$dead" ] && seg="$seg ${RED}⚠ relogin${RESET}"
+    if [ -n "$dead" ]; then seg="$seg ${RED}⚠ relogin${RESET}"
+    else lw=$(login_warn "$slot"); [ -n "$lw" ] && seg="$seg $lw"; fi
     case "$fetched" in
       ''|*[!0-9]*) [ -z "$p7$p5" ] && seg="$seg ${DIM}(no usage data)${RESET}" ;;
       *) [ $(( now - fetched )) -gt 900 ] && seg="$seg ${DIM}($(fmt_left $(( now - fetched ))) old)${RESET}" ;;
@@ -397,6 +427,11 @@ if [ -n "$account_seg" ]; then
   line1="$line1 | ${BOLD}${account_seg}${RESET}"
   reset_seg=$(week_reset_segment 2>/dev/null) || reset_seg=""
   [ -n "$reset_seg" ] && line1="$line1 ${reset_seg}"
+  active_slot=$(jq -r '.activeAccountNumber // empty' "${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}" 2>/dev/null) || active_slot=""
+  if [ -n "$active_slot" ]; then
+    lw=$(login_warn "$active_slot" 2>/dev/null) || lw=""
+    [ -n "$lw" ] && line1="$line1 ${lw}"
+  fi
 fi
 
 # --- Line 2: usage bars, all on one line ---
