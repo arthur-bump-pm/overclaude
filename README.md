@@ -23,7 +23,8 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
-| **1.5.1** | ✅ released 2026-10-14 | Login end dates: every login ends about 30 days after sign-in, whatever keepalive does — overclaude now shows each account's date (statusline, doctor, `swap-guard logins`), warns 3 days ahead, and never swaps onto a login with under 6 hours left. QA fixes for 1.5: a token job's limit no longer switches the logged-in account, fleet swap leaves a Mac with instant swap off alone, a late "continue" after a server error is dropped once you've moved on, `token rm` reports a keychain that refused, doctor flags a Claude Code too old for keepalive |
+| **1.6.0** | 🚧 in progress | Run-out forecast and "use this account first", start an idle account's 5-hour window early (opt-in), re-login in the right Chrome profile; later, re-login on a worker Mac and a job queue — see [docs/plan-1.6.md](docs/plan-1.6.md) |
+| 1.5.1 | ✅ released 2026-10-14 | Login end dates: every login ends about 30 days after sign-in, whatever keepalive does — overclaude now shows each account's date (statusline, doctor, `swap-guard logins`), warns 3 days ahead, and never swaps onto a login with under 6 hours left. QA fixes for 1.5: a token job's limit no longer switches the logged-in account, fleet swap leaves a Mac with instant swap off alone, a late "continue" after a server error is dropped once you've moved on, `token rm` reports a keychain that refused, doctor flags a Claude Code too old for keepalive |
 | 1.5.0 | ✅ released 2026-10-14 | Logins that stay alive (keepalive, dead-login alert), resume after server errors, loop guard, instruction-size check. Experimental: long-lived tokens for headless jobs (not yet run against a real sign-in), and, not yet tested on real Macs, your other Macs over Tailscale (fleet status, moving them off a capped account), sessions on another Mac that you drive from claude.ai/code, `/handoff <mac>`. Re-login on another Mac and the job queue moved to 1.6 — see [docs/plan-1.5.md](docs/plan-1.5.md) |
 | 1.4.0 | released 2026-10-09 | Codex as a fallback and a reviewer (`/handoff codex`, Codex limits on the statusline, `swap-guard codex-review`), model-routing guard for subagents, spend report with API-price value of your usage, works with overcodex 0.3 (Codex skills) |
 | 1.3.1 | released 2026-10-09 | QA fixes for 1.3: `/swap` from plain requests (behind a consent gate), artifact links, terminal y/N during re-login, accurate token status in doctor |
@@ -290,14 +291,11 @@ A plain `git push` updates git installs only — **PyPI users get changes only v
 
 ## Roadmap
 
-1.6: re-login on another Mac and a job queue (from [docs/plan-1.5.md](docs/plan-1.5.md)), once the multi-Mac features have been tried on real Macs. Also on the list:
+1.6 is in progress: [docs/plan-1.6.md](docs/plan-1.6.md) — a run-out forecast with "use this account first", starting an idle account's 5-hour window early (opt-in) and re-login in the right Chrome profile now; re-login on a worker Mac and a job queue once the multi-Mac features have been tried on real Macs. Also on the list:
 
-1. **Weekly pace forecast** on the statusline — cswap 0.26 already computes the projection (`expectedPct`, `projectedExhaustionAt`); add a "use this account first" hint (the one whose week resets soonest).
-2. **Start an idle account's 5-hour window early** (opt-in) — one tiny message starts its clock while you work on another account, so it refills sooner.
-3. **Re-login in the right Chrome profile** — `swap-guard login N` opens the sign-in page in the Chrome profile that belongs to that account (you still approve it yourself).
-4. **Titled relaunch after handoff** — `claude -n "↪ <goal>" "Continue from the handoff"`.
-5. **Compaction awareness** — re-inject handoff state and artifact links after `/compact`.
-6. **Per-directory accounts** via cswap `map`/`run` (needs every component to honor `CLAUDE_CONFIG_DIR`).
+1. **Titled relaunch after handoff** — `claude -n "↪ <goal>" "Continue from the handoff"`.
+2. **Compaction awareness** — re-inject handoff state and artifact links after `/compact`.
+3. **Per-directory accounts** via cswap `map`/`run` (needs every component to honor `CLAUDE_CONFIG_DIR`).
 
 ## License
 
