@@ -52,6 +52,15 @@ bash "$REPO/install.sh" > "$HOME/i3.log" 2>&1
 assert_eq "$([ -f "$KA" ] && echo yes || echo no)" "no" "a re-install respects keepalive off"
 assert_contains "$(cat "$HOME/i3.log")" "keepalive agent is off" "and says how to turn it back on"
 "$HOME/.local/bin/swap-guard" keepalive on >/dev/null
+# Upgrade from 1.4: its settings had no server-retry or loop-guard hooks.
+jq '.hooks.StopFailure |= map(select([.hooks[]?.command // "" | contains("server-retry")] | any | not))
+    | del(.hooks.PostToolUseFailure)' "$S" > "$S.tmp" && mv "$S.tmp" "$S"
+bash "$REPO/install.sh" >/dev/null 2>&1
+for pair in "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard"; do
+  ev="${pair%%:*}"; hk="${pair#*:}"
+  assert_eq "$(jq --arg e "$ev" --arg h "$hk" '[.hooks[$e][]?.hooks[]?.command // "" | select(contains($h))] | length' "$S")" "1" "upgrade from 1.4: $ev → $hk registered once"
+done
+assert_eq "$(jq -S . "$S")" "$AFTER1" "and the result equals a fresh install"
 
 bash "$REPO/uninstall.sh" >/dev/null 2>&1
 assert_eq "$?" "0" "uninstall exits 0"

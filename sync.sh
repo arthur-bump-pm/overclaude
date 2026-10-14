@@ -17,9 +17,19 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=yes ;;
     --release) RELEASE=yes ;;
+    -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "sync: unknown option $arg (see --help)" >&2; exit 2 ;;
     *) MSG="$arg" ;;
   esac
 done
+# A release is cut from main only: gh tags the commit given by --target below, and
+# CI's Tests run (which publish.yml reuses) only runs for pushes to main.
+if [ "$RELEASE" = yes ]; then
+  BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$BR" = main ] || {
+    echo "release: you are on '$BR' — release from main (git checkout main && git merge --ff-only $BR)." >&2
+    exit 1; }
+fi
 [ -n "$MSG" ] || MSG="sync: update from live setup ($(date +%Y-%m-%d))"
 
 BEGIN_MARKER='# --- claude-swap integration (begin) ---'
@@ -214,7 +224,7 @@ if [ "$NEW" != "$CUR" ]; then
 fi
 # Manual bump: the version is already committed, so there is no bump commit — just push.
 git push || { echo "release: push failed" >&2; exit 1; }
-gh release create "v$NEW" --title "overclaude v$NEW" --notes "$NOTES" || {
+gh release create "v$NEW" --target "$(git rev-parse HEAD)" --title "overclaude v$NEW" --notes "$NOTES" || {
   echo "release: gh release create failed — the version bump IS committed; re-run: gh release create v$NEW" >&2
   exit 1
 }

@@ -1,6 +1,6 @@
 # overclaude 1.5 plan — logins that stay alive, and a fleet of Macs
 
-Status: 🚧 in progress (plan written 2026-10-12).
+Status: ✅ 1.5.0 released 2026-10-14 (plan written 2026-10-12). Phases 1–4 and the smaller items shipped; the multi-Mac parts (Phases 2–4) are experimental, tested with a stub `ssh` only, until they are tried on real Macs. Moved to 1.6: worker re-login from the hub (Phase 3) and the job queue (Phase 5).
 
 Two goals:
 
@@ -58,10 +58,10 @@ Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on
 - Doctor: `fleet` section (SSH, versions behind the hub, a worker with a dead login).
 - Setup per worker, done once by you: turn on Remote Login, run `ssh-copy-id <mac>` from the hub (Tailscale SSH works on macOS only with the open-source `tailscaled`), `pipx install overclaude && overclaude install`, then log in to the accounts that Mac should use.
 
-## Phase 3: accounts across the fleet: partly built (fleet swap, broadcast and `/swap fleet` done; remote re-login waits on S4)
+## Phase 3: accounts across the fleet: built except remote re-login (fleet swap, broadcast and `/swap fleet` done; remote re-login moved to 1.6)
 
 - **The hub is where usage is read.** Limits are per account, so the hub's cswap figures cover every Mac. Workers do not need to fetch usage, and workers on setup-tokens cannot.
-- **Worker re-login from the hub.** ⏳ waits on S4 (needs SSH to a worker). `swap-guard login N --host <mac>` starts the login on the worker over SSH, shows you the URL, and passes back the code you paste (depends on S4). A dead login on a worker shows up in `fleet status` and the alert from 1c.
+- **Worker re-login from the hub.** ⏳ moved to 1.6; waits on S4 (needs SSH to a worker). `swap-guard login N --host <mac>` starts the login on the worker over SSH, shows you the URL, and passes back the code you paste (depends on S4). A dead login on a worker shows up in `fleet status` and the alert from 1c.
 - **Capped account, all Macs.** ✅ `swap-guard fleet swap [--from <email>] [--dry-run]` moves every worker whose active account is capped (by the hub's numbers) to the account with the most room among those logged in there. Ties go to the account whose week resets soonest; dead logins and accounts the hub has no numbers for are never targets. The instant-swap hook runs it in the background after switching the hub. `/swap fleet swap` shows the dry run and asks first. Each worker switches with its own cswap: nothing copies logins.
 - `fleet status` lists which Mac is on which account. ✅
 
@@ -73,12 +73,12 @@ Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on
 - Found while building: `claude --bg` refuses a folder that was never trusted on that Mac (trust is not saved for every folder, e.g. the home folder), so `remote start` reports `untrusted` with the folder to trust, and takes `--dir`.
 - Requires a `/login` login on the worker (Remote Control does not accept setup-tokens). The keepalive from Phase 1 runs on workers too, so Remote Control sessions do not die from an idle login.
 
-## Phase 5: job queue
+## Phase 5: job queue (moved to 1.6)
 
 - `overclaude job "<prompt>" [--repo <git url or path>] [--mac <name>]`: runs a headless `claude -p` on the Mac with the most room, judged by free memory, running sessions and the hub's usage figures for that Mac's account. It uses that Mac's setup-token for an account with room (from 1d), so it needs no browser and never touches the interactive login.
 - Results come back to `~/.claude/overclaude/jobs/<id>/` on the hub (output, exit code, branch or diff). `overclaude job list|logs|cancel`.
 - A cap on jobs running at once per account, so a batch cannot eat the week's limit. It is off by default when the account is above its auto-swap threshold.
-- This is the phase most likely to slip to 1.6 if Phases 1–4 take longer than expected.
+- Moved to 1.6 (2026-10-14): it is mainly useful with several Macs, which are not set up yet.
 
 ## Phase 6: overcodex (separate release, overcodex 0.4)
 
@@ -99,8 +99,8 @@ Tests: `tests/test_keepalive.sh` (26: one `cswap list` per tick, daily alert, on
 
 ## Release slicing
 
-- **1.5.0**: Phases 1–4 and the smaller items. Phase 1 can ship first as 1.4.1 if a login dies again before 1.5 is ready.
-- **1.5.x / 1.6**: Phase 5, depending on how Phases 1–4 go.
+- **1.5.0** ✅ (2026-10-14): Phases 1–4 (except worker re-login) and the smaller items; Phases 2–4 experimental.
+- **1.6**: worker re-login, Phase 5, and fixes from the first real multi-Mac use.
 - **overcodex 0.4**: Phase 6.
 
 Every phase adds tests to `tests/` (fleet tests use a stub `ssh`), and keeps the release gate and scrub gate unchanged.

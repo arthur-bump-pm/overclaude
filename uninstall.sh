@@ -199,5 +199,7 @@ echo "  warnings: ${#WARNED[@]}"
 echo
 echo "NOTE: runtime state under ~/.claude-swap-backup/ was left in place (user data)."
 echo "      To remove it as well, run:  rm -rf ~/.claude-swap-backup"
+echo "      One-year tokens from 'swap-guard token add' stay in the keychain (service overclaude-token);"
+echo "      revoke them on claude.ai and remove them with:  security delete-generic-password -s overclaude-token -a <label>"
 echo "      Timestamped .bak-$EPOCH backups of edited files were kept alongside them."
 echo "Done."
