@@ -7,6 +7,10 @@ new_home
 write_seq 1
 
 STUB="$HOME/stubbin"; mkdir -p "$STUB"
+# The hung hosts' sleep gets a duration unique to this run, so the stray-process
+# check (and the cleanup) only ever sees this test's own processes.
+export STRAY="30.$$$RANDOM"
+FD="3.$$"   # the status deadline: unique too, so the watchdog check sees only ours
 # Fake Macs: each host gets a home with its own fake cswap/swap-guard/claude.
 mkhost() { # mkhost <name> <accounts-json> <kit-version|"">
   local h="$HOME/hosts/$1"; mkdir -p "$h/.local/bin" "$h/.claude-swap-backup"
@@ -31,8 +35,8 @@ while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done; shift
 h="$1"; shift
 case "$h" in
   offline) exit 255;;
-  hung)    sleep 30; exit 255;;
-  partial) printf 'host\tp\nkit\t1.5.0\n'; sleep 30; exit 255;;
+  hung)    sleep "$STRAY"; exit 255;;
+  partial) printf 'host\tp\nkit\t1.5.0\n'; sleep "$STRAY"; exit 255;;
 esac
 [ -d "$HOME/hosts/$h" ] || exit 255
 [ "$*" = "bash -s" ] || cat > /dev/null
@@ -68,7 +72,7 @@ assert_absent "$(cat "$B/fleet.json")" "@example.com" "fleet.json holds host nam
 # status: this Mac + workers in parallel; an offline and a hung host don't block.
 jq '.hosts += [{name:"offline"},{name:"hung"},{name:"partial"}]' "$B/fleet.json" > "$B/f.tmp" && mv "$B/f.tmp" "$B/fleet.json"
 t0=$(date +%s)
-st="$(SWAP_FLEET_DEADLINE=3 "$SG" fleet status)"
+st="$(SWAP_FLEET_DEADLINE="$FD" "$SG" fleet status)"
 assert_le "$(( $(date +%s) - t0 ))" "8" "a hung host does not hold the answer"
 assert_eq "$(printf '%s' "$st" | jq -r '.macs[0].self')" "true" "this Mac comes first"
 assert_eq "$(printf '%s' "$st" | jq '.macs | length')" "6" "one row per Mac"
@@ -80,7 +84,7 @@ assert_eq "$(printf '%s' "$w" | jq -r .claude)" "2.1.296" "the worker's Claude C
 assert_eq "$(printf '%s' "$st" | jq -r '.macs[] | select(.name == "offline") | .online')" "false" "an unreachable Mac is offline"
 assert_eq "$(printf '%s' "$st" | jq -r '.macs[] | select(.name == "hung") | .online')" "false" "a hung Mac is offline"
 assert_eq "$(jq '.macs | length' "$B/cache/fleet.json")" "6" "status is cached for the statusline and doctor"
-txt="$(SWAP_FLEET_DEADLINE=3 "$SG" fleet status --text)"
+txt="$(SWAP_FLEET_DEADLINE="$FD" "$SG" fleet status --text)"
 assert_contains "$txt" "worker1 (" "text view names each Mac"
 assert_contains "$txt" "personal ⚠ relogin" "and flags dead logins"
 assert_contains "$txt" "offline: offline" "and offline Macs"
@@ -91,9 +95,9 @@ assert_contains "$sl" "⚠ relogin on worker1" "and Macs with a dead login"
 assert_absent "$(echo '{"model":{"display_name":"M"}}' | SWAP_NO_REFRESH=1 SWAP_HIDE_FLEET=1 bash "$SL" | strip_ansi)" "fleet" "SWAP_HIDE_FLEET hides it"
 "$SG" fleet rm hung >/dev/null; "$SG" fleet rm offline >/dev/null; "$SG" fleet rm partial >/dev/null
 assert_eq "$("$SG" fleet list)" '["bare","worker1"]' "fleet rm removes a Mac"
-assert_eq "$(pgrep -f "sleep 30" | wc -l | tr -d ' ')" "0" "the deadline leaves no stray processes"
-assert_eq "$(pgrep -f "sleep 3$" | wc -l | tr -d ' ')" "0" "and neither does the watchdog"
-pkill -f "sleep 30" 2>/dev/null
+assert_eq "$(pgrep -f "sleep $STRAY" | wc -l | tr -d ' ')" "0" "the deadline leaves no stray processes"
+assert_eq "$(pgrep -f "sleep $FD\$" | wc -l | tr -d ' ')" "0" "and neither does the watchdog"
+pkill -f "sleep $STRAY" 2>/dev/null
 "$SG" fleet add worker2 >/dev/null 2>&1
 
 # fleet swap: worker1 and worker2 are on work (1), which the hub sees capped. extra (3)
