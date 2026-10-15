@@ -25,7 +25,7 @@
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
 #                                   $STATE_ROOT/handoff-artifacts/<sid>/ + manifest.json; prints manifest
-#   artifacts find|list [words] [--account X] | link <old> <new> | index
+#   artifacts find|list [words] [--account X] | link <old> <new> | index | carry
 #                                   the artifact registry (every publish, with its owning account)
 #   artifact-log                    PostToolUse hook (Artifact): append one publish to the registry
 #   ratelimit [--dry-run]           StopFailure hook (rate_limit): instant swap on a usage cap
@@ -81,6 +81,8 @@ usage: swap-guard <subcommand> [args]
                                   snapshot this session's artifacts (sources + manifest) for handoff
   artifacts find|list [words] [--account X]   search every artifact you have published
   artifacts link <old> <new>      record that <new> is a republished copy of <old>
+  artifacts carry [--session <id>]
+                                  this session's artifacts owned by another account, with saved sources
   artifacts index                 backfill the registry from past transcripts
   ratelimit [--dry-run] [--print] StopFailure hook: switch accounts the moment a usage cap hits
   auto instant on|off|status      enable/disable that instant swap (default: on)
@@ -2500,7 +2502,16 @@ _label_for() { # _label_for <slot> — alias, else the email's local part, else 
   printf '%s\n' "${l:-account $1}"
 }
 
-_rl_wake() { # _rl_wake <sid> <text> — print text for Claude and return 0 if this session may be woken
+_rl_art_note() { # _rl_art_note <sid> <from slot> <to slot> — " <artifact note>" for a wake
+  # text, or nothing when this session left no artifacts behind
+  local n
+  [ -n "${1:-}" ] && [ -n "${3:-}" ] || return 0
+  n="$(_art_switch_note "$1" "$(_label_for "$2")" "$(_label_for "$3")" \
+    "$(jq -r --arg n "$3" '.accounts[$n].email // empty' "$STATE_ROOT/sequence.json" 2>/dev/null)")" && printf ' %s' "$n"
+  return 0
+}
+
+_rl_wake() { # _rl_wake <sid> <text> [<to slot>] — print text for Claude and return 0 if this session may be woken
   local sid="$1" f last now
   [ -n "$sid" ] || return 1
   now="$(date +%s)"; f="$CTX_DIR/$sid.rlwake"
@@ -2509,6 +2520,8 @@ _rl_wake() { # _rl_wake <sid> <text> — print text for Claude and return 0 if t
   [ $(( now - last )) -ge "$RL_WAKE_GAP" ] || return 1
   mkdir -p "$CTX_DIR" 2>/dev/null && printf '%s\n' "$now" > "$f"
   printf '%s\n' "$2" >&2
+  # The session now knows which account it is on: its next prompt needn't repeat it.
+  [ -n "${3:-}" ] && printf '%s\n' "$3" > "$CTX_DIR/$sid.acct"
   return 0
 }
 
@@ -2556,7 +2569,7 @@ cmd_ratelimit() {
       # Another hook held the lock the whole time (slow cswap): if it switched, wake onto that.
       local lt; lt="$(jq -r '.ts // 0' "$RL_LAST" 2>/dev/null)"; case "$lt" in ''|*[!0-9]*) lt=0;; esac
       [ $(( $(date +%s) - lt )) -lt "$RL_COOLDOWN" ] && [ "$dry" -eq 0 ] &&
-        _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was just switched to $(_label_for "$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)"). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying." && exit 2
+        _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was just switched to $(_label_for "$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)"). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying.$(_rl_art_note "$sid" "$(jq -r '.from // empty' "$RL_LAST" 2>/dev/null)" "$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)")" "$(jq -r '.to // empty' "$RL_LAST" 2>/dev/null)" && exit 2
       exit 0
     fi
     sleep 1
@@ -2571,7 +2584,7 @@ cmd_ratelimit() {
       '{ts:($ts|todate), source:"ratelimit", action:"reused", to:$to, session:$s}')"
     rmdir "$lock" 2>/dev/null; trap - EXIT
     [ "$dry" -eq 1 ] && exit 0
-    _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was already switched to $(_label_for "$last_to") moments ago. Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying." && exit 2
+    _rl_wake "$sid" "overclaude: the ${model:-usage} limit stopped this session; the account was already switched to $(_label_for "$last_to") moments ago. Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying.$(_rl_art_note "$sid" "$(jq -r '.from // empty' "$RL_LAST" 2>/dev/null)" "$last_to")" "$last_to" && exit 2
     exit 0
   fi
 
@@ -2629,7 +2642,9 @@ cmd_ratelimit() {
     [ -n "$from_e" ] && ( "$0" fleet swap --from "$from_e" --model "$model" $([ "$notify" -eq 1 ] && echo --notify) >/dev/null 2>&1 & )
   fi
   wake_txt="overclaude: the ${model:-usage} limit stopped this session, so the account was switched from $from_l to $to_l (now $(printf '%s' "$pick" | jq -r --arg m "$model" '"5h \(.h5)% · week \(.d7)%" + (if $m != "" then " · \($m) \(.m)%" else "" end)')). Continue the task from where it stopped. If the same limit error comes back, stop and tell the user instead of retrying."
-  _rl_wake "$sid" "$wake_txt" && exit 2
+  local to_slot; to_slot="$(printf '%s' "$pick" | jq -r '.number // empty')"
+  wake_txt="$wake_txt$(_rl_art_note "$sid" "$from" "$to_slot")"
+  _rl_wake "$sid" "$wake_txt" "$to_slot" && exit 2
   exit 0
 }
 
@@ -2833,6 +2848,19 @@ EOF
   [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || exit 0
   sid="$(printf '%s' "$input" | jq -r '.session_id // empty' | tr -cd 'A-Za-z0-9_-')"
   [ -n "$sid" ] || exit 0
+  # The account changed since this session's last prompt (instant swap elsewhere,
+  # /swap, auto-swap, cswap switch): tell it which of its artifacts stay behind.
+  local acct now_slot now_email prev_slot af
+  acct="$(_active_account_json)"; now_slot="$(printf '%s' "$acct" | jq -r '.slot // empty')"
+  now_email="$(printf '%s' "$acct" | jq -r '.email // empty')"
+  af="$CTX_DIR/$sid.acct"; prev_slot="$(cat "$af" 2>/dev/null)"
+  if [ -n "$now_slot" ]; then
+    if [ -n "$prev_slot" ] && [ "$prev_slot" != "$now_slot" ]; then
+      _art_switch_note "$sid" "$(_label_for "$prev_slot")" "$(_label_for "$now_slot")" "$now_email"
+    fi
+    # Rewritten every prompt: the 7-day pruning must not forget a long-lived session.
+    mkdir -p "$CTX_DIR" && printf '%s\n' "$now_slot" > "$af"
+  fi
   line="$(_budget_eval)" || exit 0
   [ -n "$line" ] || exit 0
   IFS=$'\x1f' read -r key msg clr <<EOF
@@ -2840,7 +2868,7 @@ $line
 EOF
   f="$CTX_DIR/$sid.budget"
   # Per-session state for sessions long gone is pruned as we go.
-  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' \) -mtime +7 -delete 2>/dev/null
+  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' -o -name '*.acct' \) -mtime +7 -delete 2>/dev/null
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
@@ -2954,6 +2982,70 @@ _art_catalog() {
           | del(.slug))
     | sort_by(-.ts)' 2>/dev/null || printf '[]\n'
 }
+
+# --- carry: this session's artifacts after an account change (copy when needed) -----
+# An artifact belongs to the account that published it: after a switch the session
+# can't update it in place. Nothing is copied up front (most artifacts are scratch
+# work): the session is told which of ITS artifacts belong to the old account, and
+# only when it needs to change one again does it publish that as a new artifact on
+# the account it is on now, from the saved source, and link old → new. Artifacts from
+# other sessions are never touched.
+_art_session_foreign() { # _art_session_foreign <sid> <active email> — JSON array to carry
+  local sid="$1" me ids
+  me="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+  [ -n "$sid" ] && [ -s "$ART_INDEX" ] || { echo '[]'; return 0; }
+  ids="$(jq -R 'fromjson? // empty' "$ART_INDEX" 2>/dev/null |
+    jq -sc --arg s "$sid" '[.[] | select(.kind == "publish" and .sessionId == $s) | .artifact_id] | unique' 2>/dev/null)"
+  [ -n "$ids" ] || ids='[]'
+  # Most sessions published nothing: skip the catalog (it folds the whole index).
+  [ "$ids" = '[]' ] && { echo '[]'; return 0; }
+  _art_catalog | jq -c --argjson ids "$ids" --arg me "$me" \
+    --argjson acc "$(jq -c '[.accounts // {} | to_entries[] | {key: ((.value.email // "") | ascii_downcase), value: (.value.alias // null)}] | from_entries' "$STATE_ROOT/sequence.json" 2>/dev/null || echo '{}')" '
+    [ .[] | select(.artifact_id as $a | $ids | index($a) != null)
+      # An owner the backfill could not infer is not "another account".
+      | select((.account | type) == "string" and $me != "" and ((.account | ascii_downcase) != $me))
+      | select(.republishedAs == null)
+      | {url, title: (.title // null), saved: (.saved // null), path: (.path // null),
+         owner: ($acc[(.account | ascii_downcase)] // .alias // .account)} ]' 2>/dev/null || echo '[]'
+}
+
+_art_switch_note() { # _art_switch_note <sid> <from label> <to label> <to email> — the note, or nothing (rc 1)
+  local list n shown owners
+  list="$(_art_session_foreign "$1" "$4")"
+  n="$(printf '%s' "$list" | jq 'length' 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ] 2>/dev/null || return 1
+  shown="$(printf '%s' "$list" | jq -r '[.[:6][] | "\(.title // "untitled" | gsub("[\u0000-\u001f\u007f\u2028\u2029]"; "")) (\(.url))"] | join("; ")')"
+  [ "$n" -gt 6 ] && shown="$shown; and $(( n - 6 )) more"
+  # Usually the account just left; with 3+ accounts some may belong to another one.
+  owners="$(printf '%s' "$list" | jq -r '[.[].owner | tostring | gsub("[\u0000-\u001f\u007f\u2028\u2029]"; "")] | unique | join(", ")')"
+  printf 'overclaude: this session moved from %s to %s. %s artifact(s) this session published belong to %s and cannot be updated from %s: %s. Do not copy them now. Only if you need to change one of them again: run `swap-guard artifacts carry` (it lists each with its saved source), publish that source as a NEW artifact on %s, then run `swap-guard artifacts link <old-url> <new-url>` and give the user the new link. Never publish to the old URL.\n' \
+    "$2" "$3" "$n" "${owners:-$2}" "$3" "$shown" "$3"
+}
+
+_art_carry() { # [--session <id>] — this session's artifacts owned by another account, with sources
+  local sid="" acct list out="[]" row url src
+  while [ $# -gt 0 ]; do case "$1" in --session) sid="${2:-}"; shift;; esac; shift; done
+  [ -n "$sid" ] || sid="$(whoami_json 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null)"
+  sid="$(printf '%s' "$sid" | tr -cd 'A-Za-z0-9_-')"
+  [ -n "$sid" ] || { jq -cn '{error:"no-session", detail:"run it from inside a Claude Code session, or pass --session <id>"}'; return 1; }
+  acct="$(_active_account_json)"
+  list="$(_art_session_foreign "$sid" "$(printf '%s' "$acct" | jq -r '.email // empty')")"
+  # The source to republish from: the copy saved at its last publish, else the
+  # original file if it is still there.
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    src=""
+    for url in "$(printf '%s' "$row" | jq -r '.saved // empty')" "$(printf '%s' "$row" | jq -r '.path // empty')"; do
+      [ -n "$url" ] && [ -f "$url" ] && { src="$url"; break; }
+    done
+    out="$(printf '%s' "$out" | jq -c --argjson r "$row" --arg s "$src" '. + [($r | {url, title, owner})
+      + (if $s != "" then {source: $s} else {source: null, note: "no saved source: rebuild it from the conversation"} end)]')"
+  done <<EOF
+$(printf '%s' "$list" | jq -c '.[]' 2>/dev/null)
+EOF
+  jq -cn --argjson a "$acct" --argjson l "$out" '{account: ($a.alias // $a.email), artifacts: $l}'
+}
+
 
 _art_id() { printf '%s' "$1" | sed 's|.*/artifact/||; s|[?#].*||' | tr -cd 'A-Za-z0-9_-'; }
 
@@ -3758,6 +3850,7 @@ main() {
         find|list) shift; _art_find "$@"; exit $?;;
         link)      shift; _art_link "$@"; exit $?;;
         index)     _art_backfill; exit $?;;
+        carry)     shift; _art_carry "$@"; exit $?;;
         *)         cmd_artifacts "$@";;
       esac;;
     artifact-log)  cmd_artifact_log "$@";;

@@ -119,6 +119,20 @@ out=$(printf '{"session_id":"s1","error":"rate_limit","last_assistant_message":"
 assert_eq "$(printf '%s' "$out" | jq -r .action)" "would-switch" "dry run reports the decision"
 assert_eq "$(switches)" "" "dry run never switches"
 
+# The stopped session is told which of its artifacts stay on the account it left.
+reset_state
+mkdir -p "$HOME/.claude-swap-backup/artifacts"
+jq -cn '{ts:1, kind:"publish", artifact_id:"zz1", url:"https://claude.ai/code/artifact/zz1", title:"Scratch analysis",
+  account:"personal@example.com", slot:"2", sessionId:"s5"}' > "$HOME/.claude-swap-backup/artifacts/index.jsonl"
+hit s5 "$CAP"
+assert_contains "$(cat "$HOME/stderr")" "this session moved from personal to work" "the wake names the account change"
+assert_contains "$(cat "$HOME/stderr")" "Scratch analysis" "and the artifact left behind"
+assert_eq "$(cat "$HOME/.claude-swap-backup/ctx/s5.acct")" "1" "and marks it told, so the next prompt doesn't repeat it"
+write_seq 1   # what the real cswap switch records (the .acct mark exists: asserted above)
+assert_absent "$(printf '{"session_id":"s5"}' | "$SG" budget --hook 2>/dev/null)" "moved from" "the next prompt stays quiet"
+write_seq 2
+rm -f "$HOME/.claude-swap-backup/artifacts/index.jsonl"
+
 # A `swap-guard token run` job bills its token's account: its cap never moves the login here.
 reset_state
 printf '{"session_id":"t1","error":"rate_limit","last_assistant_message":"%s"}' "$CAP" | CLAUDE_CODE_OAUTH_TOKEN=x "$SG" ratelimit --no-notify 2>/dev/null

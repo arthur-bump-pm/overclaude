@@ -59,6 +59,10 @@ Several ideas here were prompted by [claude-cockpit](https://github.com/christia
 - `scrub.sh --self-test` (proves the gate still catches a planted path, email and username) and `scrub.sh --history` (scans every commit), plus an optional pre-push hook.
 - 1.5 leftovers: `SWAP_NO_FLEET_SWAP` as a remembered setting instead of an environment variable (`swap-guard fleet auto on|off`).
 
+### A5. Artifacts after an account change (1.6.1) ✅
+
+Artifacts belong to the account that published them. After any switch, each session is told once (instant-swap wake, or its next prompt) which artifacts it published stay on the old account; nothing is copied up front. It republishes one on the new account from the saved source, and links old → new, only when it needs to change it. `swap-guard artifacts carry` / `/swap artifacts carry` lists or copies them all. Other sessions' artifacts are never touched.
+
 ## Part B — worker Macs (moved to 1.7; waits for real Macs)
 
 - **Re-login on a worker** (`swap-guard login N --host <mac>`): the worker prints the sign-in link, you open it here, the code is pasted back over SSH. Needs test S4 from the 1.5 plan on a real worker.

@@ -44,6 +44,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap guard [on\|off\|status]` | the routing guard that blocks un-routed subagents on Fable (default on) | — |
 | `/swap fleet [swap\|auto on\|off]` | your other Macs: sessions, accounts, dead logins; `swap` moves Macs on a capped account to the one with the most room; `auto off` stops the instant swap here from moving them | Macs added with `overclaude fleet add` |
 | `/swap remote <mac> [goal]` | start a Claude session on another Mac that you drive from claude.ai/code or the app; `remote list\|logs\|stop <mac>` | a /login login on that Mac |
+| `/swap artifacts carry` | after an account change, copy this session's artifacts to the account you are on now (new links) | only this session's artifacts |
 | `/swap artifacts [words] [account X]` | search every artifact you published, with its owning account | — |
 | `/swap doctor [fix]` | health check of the whole kit, with fixes; `fix` applies the safe ones | — |
 | `/handoff ...` | same-account handoff, `status`, `cancel`, `history`, `restore` — owned by the handoff skill, never duplicated here | — |
@@ -53,7 +54,7 @@ Edge rulings:
 - `/swap handoff` (no target) → error: "did you mean /handoff? For an account aliased 'handoff' use slot number/email."
 - `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`/`retry`/`loop`/`prewarm`, `threshold <50-99.9>`, `model <names>`), never a target.
 - `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
-- `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target.
+- `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target; `artifacts carry` is the carry command, not a search.
 - `relogin` takes the target account as its argument; it never switches.
 - `fleet` takes an optional `swap`, or `auto on|off` (alone → status); it never has a target. `fleet auto off` → `swap-guard fleet auto off`: an instant swap here no longer moves the other Macs (remembered).
 - `remote` is followed either by `list`/`logs`/`stop`/`attach` and then the Mac (and a session name), or by the Mac and then free goal text; it never has an account target. A goal whose first word is one of those four words still works when the Mac comes first (`/swap remote mini stop the flaky test`).
@@ -166,6 +167,10 @@ A Claude session on another Mac (registered with `overclaude fleet add`), starte
 - `/swap remote <mac> <goal>` → `swap-guard remote start <mac> [--dir <folder>] -- '<goal>'`: put the goal in SINGLE quotes, writing each `'` inside it as `'\''`, so this shell never expands it. Add `--dir` only when the user names a folder on that Mac (relative paths are from its home). The session gets the goal as `Task: <goal>`. Report `name` and `next`. On an error relay `fix` (and `detail`): `untrusted` → the folder needs a one-time trust prompt on that Mac (or another `--dir`; the home folder often is untrusted); `failed` → usually no `/login` login there; `unreachable` → SSH (Remote Login, `ssh-copy-id`); `timeout` → it may have started anyway, so run `remote list` before retrying.
 - `/swap remote <mac> handoff` (or `/handoff <mac>`) continues THIS conversation there: follow the handoff skill's "/handoff <mac>" section.
 - `/swap remote list <mac>` → `swap-guard remote list <mac> --text`. `logs <name>` → `swap-guard remote logs <mac> <name>`. `stop <name>` → `swap-guard remote stop <mac> <name>` (Claude Code keeps the conversation; `ambiguous` → show the `ids` and ask which). `attach <name>` needs a terminal: give the user the `command` it prints, to run in their own terminal.
+
+## `/swap artifacts carry`
+
+After an account change, artifacts this session published still belong to the account it left; the new account cannot update them in place. Default is copy-when-needed (most are scratch work): when you next need to change one of them, run `swap-guard artifacts carry`, publish that artifact's `source` as a NEW artifact (no `url`), run `swap-guard artifacts link <old-url> <new-url>`, and give the user the new link. Never publish to the old URL. `/swap artifacts carry` does this for every listed artifact at once and reports old → new links. An entry with a `note` has no saved source: rebuild it from the conversation if the user wants it. Only the page source is saved; shared data (database rows, comments) and supporting files of multi-file artifacts don't come along — say so when one had them. Empty `artifacts` → nothing to carry.
 
 ## `/swap artifacts [words] [account X]`
 
