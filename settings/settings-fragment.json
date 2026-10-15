@@ -80,6 +80,15 @@
             "timeout": 20
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/swap-guard checkpoint --hook",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [

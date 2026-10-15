@@ -81,10 +81,16 @@ assert_eq "$?" "1" "non-numeric threshold refused"
 assert_eq "$?" "1" "out-of-range threshold refused"
 "$SG" auto install --model '</string><string>--strategy' >/dev/null 2>&1
 assert_eq "$?" "1" "XML-injecting model name refused"
-r=$("$SG" auto install --interval 300 --threshold 85 --model Fable,Opus)
+"$SG" auto install --strategy fastest >/dev/null 2>&1
+assert_eq "$?" "1" "bad --strategy refused"
+"$SG" auto install --stratgy consume-first >/dev/null 2>&1
+assert_eq "$?" "2" "a misspelled option is refused, never silently dropped"
+r=$("$SG" auto install --interval 300 --threshold 85 --model Fable,Opus --strategy consume-first --cooldown 600)
 plist=$(printf '%s' "$r" | jq -r .plist)
 plutil -lint "$plist" >/dev/null 2>&1 && pass || fail "generated plist lints" "$plist"
 assert_contains "$(cat "$plist")" "<string>Fable,Opus</string>" "model arg in ProgramArguments"
+assert_contains "$(tr -d ' \n\t' < "$plist")" "<string>--strategy</string><string>consume-first</string>" "the strategy reaches the agent (it was dropped before 1.6.2)"
+assert_contains "$(tr -d ' \n\t' < "$plist")" "<string>--cooldown</string><string>600</string>" "and the cooldown"
 assert_contains "$(cat "$plist")" "<string>/dev/null</string>" "launchd stdout discarded (tick logs itself)"
 first=$(plutil -extract EnvironmentVariables.PATH raw "$plist" | cut -d: -f1)
 assert_eq "$first" "$STUB" "managed cswap dir is first on the agent PATH"

@@ -31,6 +31,7 @@
 #   ratelimit [--dry-run]           StopFailure hook (rate_limit): instant swap on a usage cap
 #   server-retry on|off|status|--hook  StopFailure hook (server_error|overloaded): capped auto-resume, opt-in
 #   loop-guard on|off|status|--hook    PostToolUseFailure hook: same call failing the same way, opt-in
+#   checkpoint on|off|status|--hook    PostToolUse hook: wrap up once when the account nears its limit
 #   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
 #   browser list | set <account> <profile> | clear <account>  the Chrome profile a re-login opens in
 #   login <slot|alias|email> | --new
@@ -58,9 +59,10 @@ usage: swap-guard <subcommand> [args]
   history [--cwd <dir>] [--all]   list archived handoff packages (newest first)
   restore [<n>|<path>] [--cwd <dir>] [--force]
                                   re-arm an archived package (default: newest for cwd)
-  auto tick [--threshold PCT] [--model NAMES] [--no-notify]
+  auto tick [--threshold PCT] [--model NAMES] [--strategy best|consume-first] [--cooldown SEC] [--no-notify]
                                   one busy-aware auto-switch evaluation (JSON line; exit = cswap's)
-  auto install [--interval SEC] [--threshold PCT] [--model NAMES] [--no-notify]
+  auto install [--interval SEC] [--threshold PCT] [--model NAMES] [--strategy best|consume-first]
+               [--cooldown SEC] [--no-notify]
   auto uninstall | auto status    manage the LaunchAgent that runs `auto tick` periodically
   keepalive on [--interval SEC] | off | status | tick
                                   keep every account's login alive while no session runs (every 2 h),
@@ -88,6 +90,7 @@ usage: swap-guard <subcommand> [args]
   auto instant on|off|status      enable/disable that instant swap (default: on)
   server-retry on|off|status      resume a session after a temporary server error (opt-in; max 3 tries/hour)
   loop-guard on|off|status        tell Claude to rethink when one call keeps failing the same way (opt-in)
+  checkpoint on|off|status        tell a running session to wrap up once when the account nears its limit (on)
   budget [--hook]                 usage bands the model should know about (hook: inject on change)
   login <slot|alias|email> [--profile P]
                                   re-login a dead account WITHOUT killing the live one's token
@@ -647,8 +650,9 @@ _auto_install() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --interval) interval="${2:-180}"; shift;;
-      --threshold|--model) targs+=("$1" "${2:-}"); shift;;
+      --threshold|--model|--strategy|--cooldown) targs+=("$1" "${2:-}"); shift;;
       --no-notify) targs+=("$1");;
+      *) echo "auto install: unknown option '$1' (--interval --threshold --model --strategy --cooldown --no-notify)" >&2; return 2;;
     esac
     shift
   done
@@ -668,6 +672,14 @@ _auto_install() {
         v="${targs[$((i + 1))]:-}"
         printf '%s' "$v" | grep -Eq '^[A-Za-z0-9_,.-]+$' ||
           { echo "auto install: --model must be names like Fable or 'Fable,Opus' (got '$v')" >&2; return 1; }
+        i=$((i + 2));;
+      --strategy)
+        v="${targs[$((i + 1))]:-}"
+        case "$v" in best|consume-first) ;; *) echo "auto install: --strategy must be best or consume-first (got '$v')" >&2; return 1;; esac
+        i=$((i + 2));;
+      --cooldown)
+        v="${targs[$((i + 1))]:-}"
+        case "$v" in ''|*[!0-9]*) echo "auto install: --cooldown must be whole seconds (got '$v')" >&2; return 1;; esac
         i=$((i + 2));;
       *) i=$((i + 1));;
     esac
@@ -2774,6 +2786,83 @@ cmd_loop_guard() {
   exit 0
 }
 
+# --- checkpoint: wrap up before the account runs out (PostToolUse hook) -------------
+# The budget note reaches a session only when the user types; a long autonomous run
+# never sees it. This hook runs after every tool call and, the first time the active
+# account crosses its line (5-hour window 90%, week 95%, any per-model limit like
+# Fable 90%), tells that agent once to finish the step it is on and save progress, so
+# a switch at the limit (instant swap) or at 95% (auto-swap) loses nothing half-done.
+# Cheap when nothing is near a limit: the band is recomputed only when cswap's usage
+# cache or the active account changes. On by default; `checkpoint off` to silence.
+CKPT_OFF="$STATE_ROOT/checkpoint.off"
+CKPT_STATE="$STATE_ROOT/cache/checkpoint.state"
+
+_ckpt_band() { # "<slot>|<window>|<reset epoch>|<pct>|<label>|<reset hh:mm>" of the window past its line, or nothing
+  local u="$STATE_ROOT/cache/usage.json" q="$STATE_ROOT/sequence.json" mu mq line
+  # Sub-second time + inode: cswap rewrites usage.json (atomic replace) several times
+  # within a second during one refresh.
+  mu="$(stat -f '%Fm:%i' "$u" 2>/dev/null || echo 0)"; mq="$(stat -f '%Fm:%i' "$q" 2>/dev/null || echo 0)"
+  line="$(cat "$CKPT_STATE" 2>/dev/null)"
+  case "$line" in "$mu $mq "*) printf '%s' "${line#"$mu $mq "}"; return 0;; esac
+  line="$(jq -rn --slurpfile s "$q" --slurpfile c "$u" --argjson now "$(date +%s)" "$JQ_EPOCH"'
+    ($s[0] // {}) as $seq | ((($c[0] // {}).accounts // {})) as $acc
+    | (($seq.activeAccountNumber // "") | tostring) as $n
+    | (($acc[$n].lastGood) // {}) as $g
+    | ($seq.accounts[$n] // {}) as $a
+    | ((($a.alias // "") | tostring) | if . == "" then (($a.email // "account") | tostring | split("@")[0]) else . end
+       | gsub("[\u0000-\u001f\u007f|]"; "")) as $lbl
+    | [ {name: "5h", w: $g.five_hour, line: 90}, {name: "week", w: $g.seven_day, line: 95} ]
+      + [ $g.scoped[]? | {name: (.name | tostring | gsub("[^A-Za-z0-9._-]"; "")), w: ., line: 90} | select(.name != "") ]
+    | map(((.w.resets_at // "") | ep) as $r | ((.w.pct // 0) | tonumber? // 0) as $p
+          | select(.w != null and ($r == null or $r > $now) and $p >= .line)
+          | {name, pct: ($p | floor), r: ($r // 0)})
+    | sort_by(-.pct) | first
+    | if . == null or $n == "" then "" else
+        "\($n)|\(.name)|\(.r)|\(.pct)|\($lbl)|\(if .r > 0 then (.r | strflocaltime("%a %H:%M")) else "" end)" end' 2>/dev/null)"
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null && printf '%s %s %s\n' "$mu" "$mq" "$line" > "$CKPT_STATE.tmp.$$" &&
+    mv -f "$CKPT_STATE.tmp.$$" "$CKPT_STATE"
+  printf '%s' "$line"
+}
+
+cmd_checkpoint() {
+  local input sid aid band key f slot win reset pct lbl when msg
+  case "${1:-}" in
+    on)  rm -f "$CKPT_OFF"; jq -cn '{checkpoint:true}'; exit 0;;
+    off) mkdir -p "$STATE_ROOT" && touch "$CKPT_OFF"; jq -cn '{checkpoint:false}'; exit 0;;
+    status|"") jq -cn --argjson on "$([ -f "$CKPT_OFF" ] && echo false || echo true)" '{checkpoint:$on}'; exit 0;;
+    --hook) :;;
+    *) echo "usage: swap-guard checkpoint on|off|status" >&2; exit 2;;
+  esac
+  input="$(cat 2>/dev/null)" || input=""
+  [ -f "$CKPT_OFF" ] && exit 0
+  # A token job (swap-guard token run) bills another account.
+  [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  band="$(_ckpt_band)"; [ -n "$band" ] || exit 0
+  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-')"
+  [ -n "$sid" ] || exit 0
+  aid="$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-64)"
+  IFS='|' read -r slot win reset pct lbl when <<EOF
+$band
+EOF
+  case "$slot$reset$pct" in ''|*[!0-9]*) exit 0;; esac
+  # Once per agent per account and window (a new window or account can nudge again).
+  key="$slot|$win|$reset"; f="$CTX_DIR/$sid${aid:+.$aid}.ckpt"
+  [ "$(cat "$f" 2>/dev/null)" = "$key" ] && exit 0
+  # Can't record it (unwritable state)? Then stay silent rather than repeat on every call.
+  { mkdir -p "$CTX_DIR" && printf '%s\n' "$key" > "$f"; } 2>/dev/null || exit 0
+  msg="overclaude: account $lbl is at $win $pct%${when:+ (resets $when)}, close to its limit. "
+  if [ -n "$aid" ]; then
+    msg="${msg}You are a subagent: finish the task you are on and return your result now, without starting more work."
+  else
+    msg="${msg}Wrap up before it runs out: finish the step you are on, save progress so the work can resume (write results to files, commit if this is a repo, and for a long task keep a short notes file of where you are and what is next), and do not start a new batch of subagents or a long workflow right now. If the limit is reached, the account switches automatically and you will be told to continue."
+  fi
+  _auto_log "$(jq -cn --argjson ts "$(date +%s)" --arg s "$sid" --arg a "$aid" --arg w "$win" --argjson p "$pct" \
+    '{ts:($ts|todate), source:"checkpoint", action:"nudged", window:$w, pct:$p, session:$s} + (if $a != "" then {agent:$a} else {} end)')"
+  jq -cn --arg m "$msg" '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$m}}'
+  exit 0
+}
+
 # --- budget: tell the model when usage crosses a band (UserPromptSubmit hook) ------
 # ULTRACODE's budget-pressure rules key off "Fable ~75%+", a number the model cannot
 # see. `budget --hook` injects one line when the active account crosses a band
@@ -2868,7 +2957,7 @@ $line
 EOF
   f="$CTX_DIR/$sid.budget"
   # Per-session state for sessions long gone is pruned as we go.
-  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' -o -name '*.acct' \) -mtime +7 -delete 2>/dev/null
+  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' -o -name '*.acct' -o -name '*.ckpt' \) -mtime +7 -delete 2>/dev/null
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
@@ -3857,6 +3946,7 @@ main() {
     ratelimit)     cmd_ratelimit "$@";;
     server-retry)  cmd_server_retry "$@";;
     loop-guard)    cmd_loop_guard "$@";;
+    checkpoint)    cmd_checkpoint "$@";;
     budget)        cmd_budget "$@";;
     login)         cmd_login "$@";;
     version-check) cmd_version_check "$@";;

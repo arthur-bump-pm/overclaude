@@ -63,6 +63,10 @@ Several ideas here were prompted by [claude-cockpit](https://github.com/christia
 
 Artifacts belong to the account that published them. After any switch, each session is told once (instant-swap wake, or its next prompt) which artifacts it published stay on the old account; nothing is copied up front. It republishes one on the new account from the saved source, and links old → new, only when it needs to change it. `swap-guard artifacts carry` / `/swap artifacts carry` lists or copies them all. Other sessions' artifacts are never touched.
 
+### A6. Checkpoint before the limit (1.6.2) ✅
+
+The budget note only reaches a session when the user types. A PostToolUse hook now tells a running session (and each subagent) once, mid-run, to finish its step and save progress when the active account crosses 5h 90% / week 95% / per-model 90%, so an auto-swap at 95% (between tasks) or an instant swap at 100% loses nothing half-done. Also fixed: `auto install` dropped `--strategy`/`--cooldown`.
+
 ## Part B — worker Macs (moved to 1.7; waits for real Macs)
 
 - **Re-login on a worker** (`swap-guard login N --host <mac>`): the worker prints the sign-in link, you open it here, the code is pasted back over SSH. Needs test S4 from the 1.5 plan on a real worker.

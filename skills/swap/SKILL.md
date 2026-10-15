@@ -36,6 +36,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap auto [on\|off\|status] [threshold N] [model X]` | busy-aware auto-switching LaunchAgent (opt-in) | defers proactive switches while sessions are busy |
 | `/swap auto retry [on\|off]` | resume a session automatically after a temporary server error (opt-in; at most 3 tries per session per hour) | auth/limit errors never retried |
 | `/swap auto prewarm [on\|off]` | start an idle account's 5-hour window early with one tiny message, so it refills sooner (opt-in; uses long-lived tokens) | never the active account; once per 5 h |
+| `/swap auto checkpoint [on\|off]` | tell a running session once to wrap up and save progress when the account nears its limit (default on) | once per agent per window |
 | `/swap auto loop [on\|off]` | tell Claude to rethink when the same tool call fails the same way 3 times in a row (opt-in) | silent otherwise |
 | `/swap auto instant [on\|off]` | instant swap the moment a usage cap stops a session (default on) | dead/disabled/API-key accounts never targeted |
 | `/swap codex` | continue this work in the Codex CLI (delegates to `/handoff codex`) | Codex CLI + overcodex installed, Codex account has room |
@@ -52,7 +53,7 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 Edge rulings:
 - `/swap <target> now` without `handoff`/`restart` → error: `now` only modifies handoff/restart.
 - `/swap handoff` (no target) → error: "did you mean /handoff? For an account aliased 'handoff' use slot number/email."
-- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`/`retry`/`loop`/`prewarm`, `threshold <50-99.9>`, `model <names>`), never a target.
+- `auto` present → the remaining tokens are auto arguments (`on`/`off`/`status`/`instant`/`retry`/`loop`/`prewarm`/`checkpoint`, `threshold <50-99.9>`, `model <names>`), never a target.
 - `doctor` present → the only other meaningful token is `fix`; nothing after `doctor` is ever a target.
 - `artifacts` present → the remaining tokens are search words (and `account <X>`), never a target; `artifacts carry` is the carry command, not a search.
 - `relogin` takes the target account as its argument; it never switches.
@@ -116,6 +117,10 @@ Independent of the LaunchAgent and ON by default: a StopFailure hook (`swap-guar
 ### Server-error retry (`/swap auto retry [on|off]`)
 Off by default. A StopFailure hook (`swap-guard server-retry --hook`, matcher `server_error|overloaded`) waits 30 s, then 2 min, then 5 min and wakes the stopped session to continue, at most 3 times per session per hour; after that it gives up and logs it. Rate limits (instant swap's job), auth and billing errors are never retried.
 - `retry on` / `retry off` → `swap-guard server-retry on|off`; `retry` alone → `swap-guard server-retry status`.
+
+### Checkpoint before the limit (`/swap auto checkpoint [on|off]`)
+On by default. A PostToolUse hook (`swap-guard checkpoint --hook`) tells a running session once, mid-run, when the active account crosses its line (5-hour window 90%, week 95%, a per-model limit such as Fable 90%): finish the current step, save progress so the work can resume, and don't start a new batch of subagents; a subagent is told to return its result. Paired with the auto-swap at a 95% threshold (`swap-guard auto install --threshold 95`), switches land between tasks, and the instant swap still catches anything that reaches 100%.
+- `checkpoint on` / `checkpoint off` → `swap-guard checkpoint on|off`; `checkpoint` alone → `swap-guard checkpoint status`.
 
 ### Loop guard (`/swap auto loop [on|off]`)
 Off by default. A PostToolUseFailure hook (`swap-guard loop-guard --hook`, every tool) notices when the same tool call (same input, ignoring its description) fails with the same error (digits and spacing ignored) 3 times in a row, and tells Claude to stop repeating it and rethink; at 6 it says to stop and tell the user. Successful calls in between don't reset the count; a different failure does, and so does a gap of more than 30 min. Each subagent keeps its own count. `SWAP_LOOP_MAX` changes the 3.

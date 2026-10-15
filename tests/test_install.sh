@@ -25,7 +25,7 @@ assert_contains "$(cat "$HOME/i1.log")" "Instant swap is ON" "the installer says
 assert_contains "$(cat "$HOME/i1.log")" "Routing guard is ON" "and when it turns the routing guard on"
 for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "UserPromptSubmit:swap-guard budget --hook" \
             "Stop:ctx-notify.sh" "StopFailure:swap-guard ratelimit" "PostToolUse:swap-guard artifact-log" \
-            "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard"; do
+            "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" "PostToolUse:swap-guard checkpoint"; do
   ev="${pair%%:*}"; hk="${pair#*:}"
   assert_eq "$(jq --arg e "$ev" --arg h "$hk" '[.hooks[$e][]?.hooks[]?.command // "" | select(contains($h))] | length' "$S")" "1" "$ev hook → $hk registered once"
 done
@@ -56,7 +56,7 @@ assert_contains "$(cat "$HOME/i3.log")" "keepalive agent is off" "and says how t
 jq '.hooks.StopFailure |= map(select([.hooks[]?.command // "" | contains("server-retry")] | any | not))
     | del(.hooks.PostToolUseFailure)' "$S" > "$S.tmp" && mv "$S.tmp" "$S"
 bash "$REPO/install.sh" >/dev/null 2>&1
-for pair in "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard"; do
+for pair in "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" "PostToolUse:swap-guard checkpoint"; do
   ev="${pair%%:*}"; hk="${pair#*:}"
   assert_eq "$(jq --arg e "$ev" --arg h "$hk" '[.hooks[$e][]?.hooks[]?.command // "" | select(contains($h))] | length' "$S")" "1" "upgrade from 1.4: $ev → $hk registered once"
 done

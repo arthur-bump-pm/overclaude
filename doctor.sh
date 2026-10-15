@@ -103,7 +103,7 @@ elif ! jq -e . "$SETTINGS" >/dev/null 2>&1; then
 else
   for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "Stop:ctx-notify.sh" \
               "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" \
-              "PostToolUse:swap-guard artifact-log" "PreToolUse:swap-guard route-guard"; do
+              "PostToolUse:swap-guard artifact-log" "PostToolUse:swap-guard checkpoint" "PreToolUse:swap-guard route-guard"; do
     ev="${pair%%:*}"; hk="${pair#*:}"
     if jq -e --arg ev "$ev" --arg hk "$hk" '[.hooks[$ev][]?.hooks[]?.command // ""] | any(contains($hk))' "$SETTINGS" >/dev/null 2>&1; then
       ok "$ev hook → $hk"
