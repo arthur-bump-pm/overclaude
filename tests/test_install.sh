@@ -38,6 +38,10 @@ assert_eq "$([ -x "$HOME/.local/bin/swap-guard" ] && echo yes)" "yes" "swap-guar
 KA="$HOME/Library/LaunchAgents/com.overclaude.keepalive.plist"
 assert_eq "$([ -f "$KA" ] && echo yes)" "yes" "install turns the keepalive agent on"
 assert_contains "$(cat "$HOME/i1.log")" "keepalive agent on" "and says so"
+MW="$HOME/Library/LaunchAgents/com.overclaude.memwatch.plist"
+assert_eq "$([ -f "$MW" ] && echo yes)" "yes" "install turns the memory watcher on"
+assert_contains "$(cat "$MW")" "<string>tick</string>" "…running mem tick"
+assert_eq "$(jq '[.hooks.PreToolUse[]? | select(.matcher == "Agent|Task|Workflow") | .hooks[]?.command // "" | select(contains("swap-guard mem --gate"))] | length' "$S")" "1" "the memory gate hook is registered once, on Agent|Task|Workflow"
 
 AFTER1="$(jq -S . "$S")"
 bash "$REPO/install.sh" > "$HOME/i2.log" 2>&1
@@ -52,6 +56,11 @@ bash "$REPO/install.sh" > "$HOME/i3.log" 2>&1
 assert_eq "$([ -f "$KA" ] && echo yes || echo no)" "no" "a re-install respects keepalive off"
 assert_contains "$(cat "$HOME/i3.log")" "keepalive agent is off" "and says how to turn it back on"
 "$HOME/.local/bin/swap-guard" keepalive on >/dev/null
+"$HOME/.local/bin/swap-guard" mem watch off >/dev/null
+bash "$REPO/install.sh" > "$HOME/i4.log" 2>&1
+assert_eq "$([ -f "$MW" ] && echo yes || echo no)" "no" "a re-install respects mem watch off"
+assert_contains "$(cat "$HOME/i4.log")" "memory watcher is off" "and says how to turn it back on"
+"$HOME/.local/bin/swap-guard" mem watch on >/dev/null
 # Upgrade from 1.4: its settings had no server-retry or loop-guard hooks.
 jq '.hooks.StopFailure |= map(select([.hooks[]?.command // "" | contains("server-retry")] | any | not))
     | del(.hooks.PostToolUseFailure)' "$S" > "$S.tmp" && mv "$S.tmp" "$S"

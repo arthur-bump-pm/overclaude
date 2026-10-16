@@ -496,6 +496,33 @@ forecast_segment() {
 fc_seg=$(forecast_segment 2>/dev/null) || fc_seg=""
 [ -n "$fc_seg" ] && line2="$line2 | ${RED}${fc_seg}${RESET}"
 
+# Memory: how much of this Mac's memory is in use, and swap once it passes 1 GB
+# (swap-guard mem's cache; the memwatch agent refreshes it every minute, and without
+# it a render refreshes it in the background at most once a minute). Dim when fine,
+# yellow ⚠ when tight, red ⚠ when critical. SWAP_HIDE_MEM=1 hides it.
+mem_segment() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock
+  [ -z "${SWAP_HIDE_MEM:-}" ] && command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/mem.json"; now=$(date +%s); m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( now - m )) -ge 90 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/mem.lock"
+    if [ -z "$(find "$lock" -mmin -1 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" mem >/dev/null 2>&1 & )
+    fi
+  fi
+  # A sample older than 10 minutes says nothing about now.
+  [ -s "$cache" ] && [ $(( now - m )) -lt 600 ] || return 0
+  jq -r --arg y "$YELLOW" --arg r "$RED" --arg d "$DIM" --arg x "$RESET" '
+    def gb: "\((. / 1024 * 10 | round) / 10)G";
+    ("mem " + (if .usedPct == null then "?" else "\(.usedPct)%" end)
+     + (if (.swapUsedMB // 0) >= 1024 then " · swap \(.swapUsedMB | gb)" else "" end)) as $t
+    | if .level == "critical" then "\($r)⚠ \($t) critical\($x)"
+      elif .level == "warn" then "\($y)⚠ \($t)\($x)"
+      else "\($d)\($t)\($x)" end' "$cache" 2>/dev/null
+}
+mem_seg=$(mem_segment 2>/dev/null) || mem_seg=""
+[ -n "$mem_seg" ] && line2="$line2 | ${mem_seg}"
+
 printf "%s\n" "$line1"
 printf "%s\n" "$line2"
 # SWAP_HIDE_OTHERS=1 hides the other-accounts line(s).

@@ -40,7 +40,7 @@ echo "   epoch: $EPOCH"
 echo
 
 # ---------------------------------------------------------------------------
-# 0. LaunchAgents (auto-swap, keepalive; must go before swap-guard is removed).
+# 0. LaunchAgents (auto-swap, keepalive, memwatch; must go before swap-guard is removed).
 # ---------------------------------------------------------------------------
 AUTO_PLIST="$HOME/Library/LaunchAgents/com.overclaude.autoswap.plist"
 # SWAP_GUARD_NO_LAUNCHCTL (tests): a throwaway $HOME must never touch the real
@@ -57,6 +57,13 @@ if [ -f "$KA_PLIST" ] || $LCTL print "gui/$(id -u)/com.overclaude.keepalive" >/d
   echo "-- keepalive agent --"
   $LCTL bootout "gui/$(id -u)/com.overclaude.keepalive" >/dev/null 2>&1
   rm -f "$KA_PLIST" && note_did "removed keepalive LaunchAgent" || note_warn "could not remove $KA_PLIST"
+fi
+
+MW_PLIST="$HOME/Library/LaunchAgents/com.overclaude.memwatch.plist"
+if [ -f "$MW_PLIST" ] || $LCTL print "gui/$(id -u)/com.overclaude.memwatch" >/dev/null 2>&1; then
+  echo "-- memory watcher --"
+  $LCTL bootout "gui/$(id -u)/com.overclaude.memwatch" >/dev/null 2>&1
+  rm -f "$MW_PLIST" && note_did "removed memory watcher LaunchAgent" || note_warn "could not remove $MW_PLIST"
 fi
 
 # ---------------------------------------------------------------------------

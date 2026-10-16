@@ -364,6 +364,29 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
+# Memory watcher: samples this Mac's memory every minute for the statusline and
+# the hooks, cleans up orphaned helper processes and warns when memory gets tight.
+# On by default; `swap-guard mem watch off` is remembered here.
+# ---------------------------------------------------------------------------
+echo "-- memory watcher --"
+MW_PLIST="$HOME/Library/LaunchAgents/com.overclaude.memwatch.plist"
+if [ -f "$HOME/.claude-swap-backup/memwatch.off" ]; then
+  note_skip "memory watcher is off (turn on: swap-guard mem watch on)"
+else
+  mw_had=no; [ -f "$MW_PLIST" ] && mw_had=yes
+  mw_int=$(plutil -extract StartInterval raw "$MW_PLIST" 2>/dev/null)
+  case "$mw_int" in ''|*[!0-9]*) mw_int=60;; esac
+  if mw_out=$("$LOCALBIN/swap-guard" mem watch on --interval "$mw_int" 2>&1); then
+    if [ "$mw_had" = yes ]; then note_skip "memory watcher already on (reloaded)"
+    else note_did "memory watcher on: memory is checked every minute; orphaned helpers are cleaned and sessions warned when it gets tight (off: swap-guard mem watch off)"; fi
+  else
+    note_warn "memory watcher not installed: $(printf '%s' "$mw_out" | tail -n 1)"
+    note_warn "  retry later with: swap-guard mem watch on"
+  fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # Summary.
 # ---------------------------------------------------------------------------
 echo "== summary =="

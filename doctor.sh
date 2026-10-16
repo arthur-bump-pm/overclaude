@@ -103,7 +103,8 @@ elif ! jq -e . "$SETTINGS" >/dev/null 2>&1; then
 else
   for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "Stop:ctx-notify.sh" \
               "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" \
-              "PostToolUse:swap-guard artifact-log" "PostToolUse:swap-guard checkpoint" "PreToolUse:swap-guard route-guard"; do
+              "PostToolUse:swap-guard artifact-log" "PostToolUse:swap-guard checkpoint" "PreToolUse:swap-guard route-guard" \
+              "PreToolUse:swap-guard mem --gate"; do
     ev="${pair%%:*}"; hk="${pair#*:}"
     if jq -e --arg ev "$ev" --arg hk "$hk" '[.hooks[$ev][]?.hooks[]?.command // ""] | any(contains($hk))' "$SETTINGS" >/dev/null 2>&1; then
       ok "$ev hook → $hk"
@@ -273,6 +274,19 @@ elif [ -f "$STATE_ROOT/keepalive.off" ]; then
   _warn "keepalive is off — an account you don't use for a while can lose its login" "swap-guard keepalive on"
 else
   _warn "keepalive agent not installed" "swap-guard keepalive on"
+fi
+MW_PLIST="$HOME/Library/LaunchAgents/com.overclaude.memwatch.plist"
+if [ -f "$MW_PLIST" ]; then
+  if launchctl print "gui/$(id -u)/com.overclaude.memwatch" >/dev/null 2>&1; then
+    last=$(jq -r '"\(.level), \(.usedPct // "?")% in use, swap \((.swapUsedMB // 0) / 1024 * 10 | round / 10) GB"' "$STATE_ROOT/cache/mem.json" 2>/dev/null)
+    ok "memory watcher loaded${last:+ — memory: $last}"
+  else
+    _warn "memory watcher plist exists but the agent is not loaded" "swap-guard mem watch on"
+  fi
+elif [ -f "$STATE_ROOT/memwatch.off" ]; then
+  ok "memory watcher is off (optional: swap-guard mem watch on)"
+else
+  _warn "memory watcher not installed" "swap-guard mem watch on"
 fi
 if [ -f "$STATE_ROOT/prewarm.on" ]; then
   ntok=$(jq 'length' "$STATE_ROOT/tokens.json" 2>/dev/null || echo 0)

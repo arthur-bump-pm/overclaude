@@ -23,6 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
+| 1.7.0 | 🚧 in progress | Memory guard: this Mac's memory on the statusline (`mem 48% · swap 3.6G`, ⚠ when tight), `/swap mem` (what is using it, per session with its tests and builds, what to close), a watcher that cleans up orphaned helper processes (MCP servers, test runners whose session is gone) and notifies when memory gets tight, every session told to hold back, and new subagents refused while memory is critical. Re-login on a worker Mac and the job queue move to 1.8 |
 | **1.6.2** | ✅ released 2026-10-15 | Checkpoint before the limit: a running session is told once, mid-run, to wrap up and save progress when the account nears its limit (week 95%, 5h/Fable 90%). Fix: `auto install` silently dropped `--strategy` and `--cooldown` |
 | 1.6.1 | ✅ released 2026-10-15 | Artifacts follow you only when needed: after an account change each session is told which of its own artifacts stay on the old account, and copies one to the new account (from its saved source, linked old → new) only when it needs to change it; `/swap artifacts carry` copies them all at once |
 | 1.6.0 | ✅ released 2026-10-14 | Run-out forecast with "use this account first" (`/swap forecast`, statusline `⏳ use first`), re-login in the right Chrome profile (`swap-guard browser`), start idle accounts' 5-hour windows early (opt-in, experimental: needs long-lived tokens), `fleet auto on\|off`, scrub self-test / history scan / pre-push hook. Re-login on a worker Mac and the job queue moved to 1.7 — see [docs/plan-1.6.md](docs/plan-1.6.md) |
@@ -175,6 +176,25 @@ The display at the top. Line 1 ends with the active account and when its **weekl
 
 Usage numbers come from cswap's per-account cache, kept ≤ ~5 min fresh by a debounced background refresh (the render itself never waits on the network). It is also the kit's data spine: it publishes each session's context % to a relay the threshold hooks read. **Skip the kit's statusline and handoff offers never fire.**
 
+### Memory guard — many sessions, one Mac *(1.7)*
+Several sessions, each with its own test runs, builds and MCP servers, can push a Mac into heavy swapping, and then every session stops responding at once. A small background agent checks memory every minute (`swap-guard mem watch on|off`, on by default; it reads `sysctl`, `memory_pressure` and `vm_stat`, which takes milliseconds):
+
+- **Statusline:** `mem 48% · swap 3.6G`, turning into a yellow `⚠` when memory is tight and a red `⚠ … critical`. `SWAP_HIDE_MEM=1` hides it.
+- **`/swap mem`** (or `swap-guard mem --text`): memory in use, swap, the biggest apps, each Claude session with what its child processes use, orphaned helpers, and what to close.
+- **When it gets tight** (warn: kernel pressure raised or under 20% free; critical: kernel pressure critical or under 10% free, or, while memory is tight, swap over half of RAM. Swap alone never counts, because macOS keeps it allocated for hours after the pressure is gone):
+  - **Cleanup** (`mem autoclean`, on): stops *orphaned helpers* whose session is provably gone. A process counts only when all of these hold:
+    - it is your own, its parent is now launchd, and it is not a launchd job or a Claude session;
+    - it looks like something a session starts: an MCP server, `npx`/`uvx`, a test runner, `esbuild`, `ffmpeg-static`, a headless browser;
+    - **its stdin was a pipe or socket from whatever started it, and nothing holds the other end any more** (how a session talks to a stdio MCP server). A live session's own `cmd &` has stdin `/dev/null`, so it never qualifies;
+    - it is idle, at least 10 minutes old, and not listening on a port.
+
+    An idle orphaned MCP server can hold hundreds of MB in compressed memory while showing 15 MB.
+  - **A notification** with the reason, what was freed, the biggest users and the top suggestion; it repeats every 15 minutes while memory stays critical (a level flapping around a line notifies once), and says when memory has been back to normal for 5 minutes.
+  - **Every session is told once** (`mem nudge`, on) to hold back: no new subagents, workflows or parallel test runs, and save progress. Subagents are told to finish and return.
+  - **At critical, new subagents and workflows are refused** (`mem gate`, on; `OVERCLAUDE_MEM_GATE=off` for one session), so one session's fan-out can't freeze the rest.
+
+It never quits an app or ends a live session: those stay suggestions. Orphans it can't prove dead (a dev server on a port, something still working, a background job a live session may own) are only listed, with `swap-guard mem clean --pid N` to stop one. `swap-guard mem clean --dry-run` shows what a cleanup would stop.
+
 ### `ULTRACODE.md` — model routing for multi-agent workflows
 A policy loaded into every session: bulk work rides cheap models, verification rides opus, only final judgment spends the top tier. Routing table, hard floors, escalation rules included.
 
@@ -207,6 +227,8 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `/swap auto checkpoint on\|off` | Tell a running session to wrap up once when the account nears its limit (default on) *(1.6.2)* |
 | `/swap artifacts carry` | Copy this session's artifacts to the account you're on now, after a switch *(1.6.1)* |
 | `/swap forecast` | When your accounts run out at this pace, and which one to use first *(1.6)* |
+| `/swap mem [clean]` | This Mac's memory: what is using it, sessions with their tests and builds, what to close; `clean` stops orphaned helpers *(1.7)* |
+| `swap-guard mem watch\|autoclean\|nudge\|gate on\|off` *(shell)* | The memory watcher and what it does when memory gets tight (all on by default) *(1.7)* |
 | `swap-guard logins [--text]` *(shell)* | Each account's login end date (a new sign-in starts a new one) *(1.5.1)* |
 | `overclaude fleet [add <mac>\|rm <mac>\|list\|swap\|auto on\|off]` *(shell)* | Your other Macs over Tailscale: sessions, accounts, dead logins, load; `swap` moves them off a capped account; `auto off` stops the instant swap here from moving them *(1.5, experimental)* |
 | `/swap remote <mac> [goal]` | Start a Claude session on another Mac, driven from claude.ai/code; `overclaude remote list\|logs\|stop\|attach` *(1.5, experimental)* |
@@ -231,6 +253,7 @@ Or skip memorizing and **paste a prompt**:
 | "My work account says relogin — fix it" | `/swap relogin work` |
 | "Where's that villa comparison artifact?" | `/swap artifacts villa` |
 | "My handoff expired — bring it back" | `/handoff restore` |
+| "My Mac is slow — what's eating memory?" | `/swap mem` |
 | "Install overclaude on this machine" | the whole install flow (works before the kit exists) |
 | "Upgrade overclaude and refresh the hooks" | `overclaude update` |
 
@@ -305,7 +328,7 @@ A plain `git push` updates git installs only — **PyPI users get changes only v
 
 ## Roadmap
 
-1.7: re-login on a worker Mac and a job queue (Part B of [docs/plan-1.6.md](docs/plan-1.6.md)), once the multi-Mac features have been tried on real Macs. Also on the list:
+1.8: re-login on a worker Mac and a job queue (Part B of [docs/plan-1.6.md](docs/plan-1.6.md)), once the multi-Mac features have been tried on real Macs. Also on the list:
 
 1. **Titled relaunch after handoff** — `claude -n "↪ <goal>" "Continue from the handoff"`.
 2. **Compaction awareness** — re-inject handoff state and artifact links after `/compact`.

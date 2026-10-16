@@ -33,6 +33,8 @@
 #   loop-guard on|off|status|--hook    PostToolUseFailure hook: same call failing the same way, opt-in
 #   checkpoint on|off|status|--hook    PostToolUse hook: wrap up once when the account nears its limit
 #   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
+#   mem [--text] | clean | watch | autoclean | nudge | gate | --gate
+#                                   this Mac's memory: report, orphan cleanup, watcher, session notes, agent gate
 #   browser list | set <account> <profile> | clear <account>  the Chrome profile a re-login opens in
 #   login <slot|alias|email> | --new
 #                                   safe re-login / add that never overwrites the live account's token
@@ -92,6 +94,12 @@ usage: swap-guard <subcommand> [args]
   loop-guard on|off|status        tell Claude to rethink when one call keeps failing the same way (opt-in)
   checkpoint on|off|status        tell a running session to wrap up once when the account nears its limit (on)
   budget [--hook]                 usage bands the model should know about (hook: inject on change)
+  mem [--text] [--footprint]      this Mac's memory: in use, swap, biggest apps, sessions, orphans, suggestions
+  mem clean [--dry-run] [--pid N] stop orphaned helper processes (MCP servers, test runners… whose session is gone)
+  mem watch on|off|status         the agent that checks memory every minute and acts when it gets tight (on)
+  mem autoclean|nudge|gate on|off|status
+                                  when tight: clean up orphans / tell every session to hold back /
+                                  (critical only) refuse new subagents and workflows — all on by default
   login <slot|alias|email> [--profile P]
                                   re-login a dead account WITHOUT killing the live one's token
                                   (the sign-in page opens in that account's Chrome profile)
@@ -2834,32 +2842,621 @@ cmd_checkpoint() {
     *) echo "usage: swap-guard checkpoint on|off|status" >&2; exit 2;;
   esac
   input="$(cat 2>/dev/null)" || input=""
-  [ -f "$CKPT_OFF" ] && exit 0
-  # A token job (swap-guard token run) bills another account.
-  [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || exit 0
   command -v jq >/dev/null 2>&1 || exit 0
-  band="$(_ckpt_band)"; [ -n "$band" ] || exit 0
-  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-')"
+  # Memory (mem nudge): the cached level, read without jq while it is "ok".
+  local mlvl="" mmsg=""
+  [ -f "$MEM_NUDGE_OFF" ] || mlvl="$(_mem_fresh_level)"
+  # A token job (swap-guard token run) bills another account: its usage isn't this one's.
+  band=""
+  [ -f "$CKPT_OFF" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || band="$(_ckpt_band)"
+  [ -n "$band$mlvl" ] || exit 0
+  # Runs on every tool call while a line is crossed: read the two ids without jq when
+  # that is unambiguous, else fall back to jq. Only the part before the tool payload is
+  # searched (a tool's own input or output can carry "session_id"/"agent_id" keys), and
+  # any "agent_id" after it (where the top-level one may sit) means jq decides.
+  sid=""; aid=""
+  local pre rest re_s='"session_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"' re_a='"agent_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"'
+  pre="${input%%\"tool_input\"*}"; rest="${input#"$pre"}"
+  if [[ $pre =~ $re_s ]] && { sid="${BASH_REMATCH[1]}"; [[ $pre =~ $re_a ]] && aid="${BASH_REMATCH[1]}"
+       [[ $rest != *'"agent_id"'* ]] && { [ -n "$aid" ] || [[ $pre != *'"agent_id"'* ]]; }; }; then
+    :
+  else
+    aid=""
+    IFS=$'\x1f' read -r sid aid <<EOF
+$(printf '%s' "$input" | jq -r '[(.session_id // ""), (.agent_id // "")] | map(tostring | gsub("[^A-Za-z0-9_-]"; "")) | join("\u001f")' 2>/dev/null)
+EOF
+  fi
   [ -n "$sid" ] || exit 0
-  aid="$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-64)"
+  aid="$(printf '%s' "$aid" | cut -c1-64)"
+  [ -n "$mlvl" ] && mmsg="$(_mem_note "$sid" "$aid" "$mlvl")"
+  msg=""
   IFS='|' read -r slot win reset pct lbl when <<EOF
 $band
 EOF
-  case "$slot$reset$pct" in ''|*[!0-9]*) exit 0;; esac
+  case "$slot$reset$pct" in ''|*[!0-9]*) band="";; esac
   # Once per agent per account and window (a new window or account can nudge again).
   key="$slot|$win|$reset"; f="$CTX_DIR/$sid${aid:+.$aid}.ckpt"
-  [ "$(cat "$f" 2>/dev/null)" = "$key" ] && exit 0
+  [ -n "$band" ] && [ "$(cat "$f" 2>/dev/null)" = "$key" ] && band=""
   # Can't record it (unwritable state)? Then stay silent rather than repeat on every call.
-  { mkdir -p "$CTX_DIR" && printf '%s\n' "$key" > "$f"; } 2>/dev/null || exit 0
-  msg="overclaude: account $lbl is at $win $pct%${when:+ (resets $when)}, close to its limit. "
-  if [ -n "$aid" ]; then
-    msg="${msg}You are a subagent: finish the task you are on and return your result now, without starting more work."
-  else
-    msg="${msg}Wrap up before it runs out: finish the step you are on, save progress so the work can resume (write results to files, commit if this is a repo, and for a long task keep a short notes file of where you are and what is next), and do not start a new batch of subagents or a long workflow right now. If the limit is reached, the account switches automatically and you will be told to continue."
+  if [ -n "$band" ] && { mkdir -p "$CTX_DIR" && printf '%s\n' "$key" > "$f"; } 2>/dev/null; then
+    msg="overclaude: account $lbl is at $win $pct%${when:+ (resets $when)}, close to its limit. "
+    if [ -n "$aid" ]; then
+      msg="${msg}You are a subagent: finish the task you are on and return your result now, without starting more work."
+    else
+      msg="${msg}Wrap up before it runs out: finish the step you are on, save progress so the work can resume (write results to files, commit if this is a repo, and for a long task keep a short notes file of where you are and what is next), and do not start a new batch of subagents or a long workflow right now. If the limit is reached, the account switches automatically and you will be told to continue."
+    fi
+    _auto_log "$(jq -cn --argjson ts "$(date +%s)" --arg s "$sid" --arg a "$aid" --arg w "$win" --argjson p "$pct" \
+      '{ts:($ts|todate), source:"checkpoint", action:"nudged", window:$w, pct:$p, session:$s} + (if $a != "" then {agent:$a} else {} end)')"
   fi
-  _auto_log "$(jq -cn --argjson ts "$(date +%s)" --arg s "$sid" --arg a "$aid" --arg w "$win" --argjson p "$pct" \
-    '{ts:($ts|todate), source:"checkpoint", action:"nudged", window:$w, pct:$p, session:$s} + (if $a != "" then {agent:$a} else {} end)')"
+  [ -n "$mmsg" ] && msg="${msg:+$msg }$mmsg"
+  [ -n "$msg" ] || exit 0
   jq -cn --arg m "$msg" '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$m}}'
+  exit 0
+}
+
+# --- mem: this Mac's memory — show it, clean up what is dead, warn every session ----
+# Several sessions plus their test runs, builds and MCP servers can push a Mac into
+# heavy swapping, and then every session stops responding at once. A LaunchAgent (on
+# by default, every 60 s) samples memory pressure, free %, swap and the compressor
+# (sysctl, memory_pressure, vm_stat: milliseconds) into cache/mem.json. The statusline
+# shows it and the hooks read it. Levels: warn at kernel pressure "warn" or free below
+# 20%; critical at pressure "critical" or free below 10% — or, while memory is tight
+# either way, swap above 25% (warn) / 50% (critical) of RAM. At warn or critical the tick:
+#   - cleans up orphans (auto-clean, on by default) and notifies with what is using
+#     the memory and what to close;
+#   - every session is told once (PostToolUse, via the checkpoint hook) to hold back:
+#     no new subagents, workflows or parallel test runs, and to save progress;
+#   - at critical the agent gate (PreToolUse on Agent|Task|Workflow) refuses new agents.
+# It never closes an app or a live session. An orphan is cleaned only when its session
+# is provably gone: your own process, reparented to launchd, not a launchd job and not
+# a Claude process, that looks like a helper a session starts (MCP servers, npx/uvx,
+# test runners, esbuild, ffmpeg-static, headless browsers), whose stdin pipe/socket has
+# lost its other end (see _mem_procs), older than 10 min, idle (CPU < 1%) and not
+# listening on a port. Anything else is only listed and suggested.
+MEM_CACHE="$STATE_ROOT/cache/mem.json"
+MEM_STATE="$STATE_ROOT/cache/mem.state"
+MEM_LOG="$STATE_ROOT/mem.log"
+MEM_LABEL="com.overclaude.memwatch"
+MEM_OFF="$STATE_ROOT/memwatch.off"
+MEM_CLEAN_OFF="$STATE_ROOT/mem-autoclean.off"
+MEM_GATE_OFF="$STATE_ROOT/mem-gate.off"
+MEM_NUDGE_OFF="$STATE_ROOT/mem-nudge.off"
+MEM_INTERVAL=60
+MEM_FRESH=180      # hooks act on a sample at most this old (seconds)
+MEM_RENOTIFY=900   # while critical, notify again at most this often
+MEM_CALM=300       # memory must stay fine this long before "back to normal" (and a new alert)
+MEM_RENUDGE=1800   # a session is reminded again at most this often at the same level
+
+_mem_num() { # _mem_num <value> <default> — the value if it is a whole number, else the default
+  case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2";; *) printf '%s' "$1";; esac
+}
+
+_mem_log() { # _mem_log <json> — append + keep the last 500 lines
+  mkdir -p "$STATE_ROOT" 2>/dev/null || return 0
+  printf '%s\n' "$1" >> "$MEM_LOG"
+  if [ "$(wc -l < "$MEM_LOG" 2>/dev/null || echo 0)" -gt 600 ]; then
+    tail -n 500 "$MEM_LOG" > "$MEM_LOG.tmp.$$" && mv "$MEM_LOG.tmp.$$" "$MEM_LOG"
+  fi
+}
+
+# _mem_sys — one JSON object: the system numbers and the level they add up to.
+_mem_sys() {
+  local ram lvl sw free comp swu swt wf cf
+  ram="$(sysctl -n hw.memsize 2>/dev/null)"
+  case "$ram" in ''|*[!0-9]*) return 1;; esac
+  lvl="$(_mem_num "$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)" 0)"
+  sw="$(sysctl -n vm.swapusage 2>/dev/null)"
+  free="$(memory_pressure -Q 2>/dev/null | sed -n 's/.*free percentage: *\([0-9][0-9]*\)%.*/\1/p' | head -n 1)"
+  free="$(_mem_num "$free" -1)"
+  comp="$(vm_stat 2>/dev/null | awk '
+    /page size of/ { for (i = 1; i <= NF; i++) if ($i == "of") ps = $(i + 1) + 0 }
+    /occupied by compressor/ { v = $NF; sub(/\.$/, "", v); c = v + 0 }
+    END { if (ps > 0) printf "%d", c * ps / 1048576; else printf "0" }')"
+  # "total = 5120.00M  used = 3800.19M  free = 1319.81M  (encrypted)"
+  read -r swt swu <<EOF
+$(printf '%s' "$sw" | awk '
+  function mb(v,  n) { n = v + 0; if (v ~ /G$/) n *= 1024; else if (v ~ /K$/) n /= 1024; return int(n) }
+  { for (i = 1; i + 2 <= NF; i++) { if ($i == "total" && $(i + 1) == "=") t = mb($(i + 2)); if ($i == "used" && $(i + 1) == "=") u = mb($(i + 2)) } }
+  END { printf "%d %d\n", t, u }')
+EOF
+  wf="$(_mem_num "${SWAP_MEM_WARN_FREE:-}" 20)"; cf="$(_mem_num "${SWAP_MEM_CRIT_FREE:-}" 10)"
+  jq -cn --argjson ram "$(( ram / 1048576 ))" --argjson lvl "$lvl" --argjson free "$free" \
+    --argjson su "$(_mem_num "$swu" 0)" --argjson st "$(_mem_num "$swt" 0)" --argjson comp "$(_mem_num "$comp" 0)" \
+    --argjson wf "$wf" --argjson cf "$cf" '
+    def gb: (. / 1024 * 10 | round) / 10 | tostring + " GB";
+    # macOS keeps swap allocated for hours after pressure ends, so swap alone never
+    # raises the level: it only counts while memory is actually tight.
+    ($lvl >= 2 or ($free >= 0 and $free < $wf)) as $tight
+    | [ (if $lvl >= 4 then "kernel memory pressure is critical" else empty end),
+      (if $free >= 0 and $free < $cf then "only \($free)% of memory is free" else empty end),
+      (if $tight and $su > $ram * 0.5 then "\($su | gb) of swap in use" else empty end) ] as $crit
+    | [ (if $lvl == 2 then "kernel memory pressure is raised" else empty end),
+        (if $free >= 0 and $free < $wf then "only \($free)% of memory is free" else empty end),
+        (if $tight and $su > $ram * 0.25 then "\($su | gb) of swap in use" else empty end) ] as $warn
+    | {level: (if ($crit | length) > 0 then "critical" elif ($warn | length) > 0 then "warn" else "ok" end),
+       reasons: (if ($crit | length) > 0 then $crit else $warn end),
+       ramMB: $ram, freePct: (if $free < 0 then null else $free end),
+       usedPct: (if $free < 0 then null else 100 - $free end),
+       pressure: (if $lvl >= 4 then "critical" elif $lvl == 2 then "warn" elif $lvl == 1 then "normal" else "unknown" end),
+       swapUsedMB: $su, swapTotalMB: $st, compressedMB: $comp}'
+}
+
+# _mem_procs [--footprint] — JSON {basis, apps, sessions, orphans}. Memory is RSS from
+# ps (cheap), or with --footprint the footprint top reports (includes compressed
+# pages: an idle orphan can show 15 MB RSS but hold 700 MB; top costs ~1.5 s).
+_mem_procs() {
+  local fp=0 tmp me self orphan_min only now
+  [ "${1:-}" = "--footprint" ] && fp=1
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/swap-guard-mem.XXXXXX")" || return 1
+  me="$(id -u)"; self="$$"
+  orphan_min="$(_mem_num "${SWAP_MEM_ORPHAN_MIN:-}" 600)"
+  # Tests only: consider nothing but processes matching this, so a test run can never
+  # touch the developer's real processes.
+  only="${SWAP_MEM_TEST_ONLY:-}"
+  ps -axwwo pid=,ppid=,uid=,rss=,%cpu=,etime=,command= > "$tmp/ps" 2>/dev/null
+  now="$(date +%s)"   # after ps: start times are now - elapsed, and ps can take a while
+  : > "$tmp/fp"
+  [ "$fp" -eq 1 ] && top -l 1 -stats pid,mem -n 5000 2>/dev/null | awk '
+    function mb(v,  n) { sub(/[+-]$/, "", v); n = v + 0
+      if (v ~ /G$/) n *= 1024; else if (v ~ /K$/) n /= 1024; else if (v ~ /B$/) n /= 1048576; return n }
+    go && $1 ~ /^[0-9]+$/ { printf "%s\t%.1f\n", $1, mb($2) }
+    $1 == "PID" { go = 1 }' > "$tmp/fp"
+  : > "$tmp/sess"
+  local f
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.cwd // ""), (.status // "")]
+      | map(gsub("[\t\n\r]"; " ")) | @tsv' "$f" 2>/dev/null >> "$tmp/sess"
+  done
+  launchctl list 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $1 }' > "$tmp/ld"
+  awk -F'\t' -v me="$me" -v self="$self" -v omin="$orphan_min" -v only="$only" -v now="$now" '
+    function secs(e,  d, a, n) {
+      d = 0; if (index(e, "-")) { d = substr(e, 1, index(e, "-") - 1); e = substr(e, index(e, "-") + 1) }
+      n = split(e, a, ":")
+      if (n == 3) return d * 86400 + a[1] * 3600 + a[2] * 60 + a[3]
+      if (n == 2) return d * 86400 + a[1] * 60 + a[2]
+      return a[1] + 0 }
+    function app(c, p,   n, t, q) {
+      if (p in sess || c ~ /\/claude\/versions\//) return "Claude Code"
+      if (match(c, /\/[^\/]*\.app\//)) { bundle = 1; return substr(c, RSTART + 1, RLENGTH - 6) }
+      split(c, t, " "); n = split(t[1], q, "/"); q[n] = (n > 0 ? q[n] : t[1])
+      if (q[n] == "claude") return "Claude Code"
+      return q[n] }
+    function helper(c) {
+      c = tolower(c)
+      # Apps and the OS are never helpers, except an interpreter that ships inside one
+      # (the python3 inside Xcode, an app-bundled node) running a script, e.g. an MCP server.
+      if ((c ~ /^\/(applications|system)\// || c ~ /^\/library\/apple\//) && c !~ /\/(python[0-9.]*|node|ruby|bun|deno) /) return 0
+      if (c ~ /^\/usr\/(libexec|sbin)\//) return 0
+      return (c ~ /(^|\/)(npm|pnpm|yarn|bun) (exec|dlx|x) / || c ~ /(^|\/)(npx|uvx|bunx)( |$)/ || c ~ /\/_npx\// ||
+              c ~ /(^|[ \/@_.-])mcp([ \/@_.:-]|$)/ || c ~ /mcp-server|server-mcp/ || c ~ /node_modules\/\.bin\// ||
+              c ~ /(^|[ \/(])vitest/ || c ~ /esbuild --service/ || c ~ /(^|\/)tsx( |$)/ || c ~ /(^|\/)jest( |$)/ ||
+              c ~ /ffmpeg-static/ || c ~ /chrome-headless-shell|ms-playwright/) }
+    FILENAME == ARGV[1] { if ($2 != "") fpm[$1] = $2 + 0; next }
+    FILENAME == ARGV[2] { if ($1 ~ /^[0-9]+$/) { sess[$1] = 1; sid[$1] = $2; scwd[$1] = $3; sst[$1] = $4 }; next }
+    FILENAME == ARGV[3] { ld[$1] = 1; next }
+    {
+      # ps: "  pid ppid uid rss %cpu etime command..." (space-separated; command keeps its spaces)
+      line = $0; sub(/^ +/, "", line)
+      n = split(line, w, / +/)
+      if (n < 7 || w[1] !~ /^[0-9]+$/) next
+      p = w[1]; pp[p] = w[2]; uid[p] = w[3]; cpu[p] = w[5] + 0; age[p] = secs(w[6])
+      c = line; for (i = 1; i <= 6; i++) sub(/^[^ ]+ +/, "", c)
+      cmd[p] = c
+      m[p] = (p in fpm) ? fpm[p] : w[4] / 1024
+      pids[++np] = p
+    }
+    END {
+      for (i = 1; i <= np; i++) {
+        p = pids[i]
+        bundle = 0; a = app(cmd[p], p); am[a] += m[p]; ac[a]++; if (bundle) ab[a] = 1
+        # A Claude Code process is a session (maybe a background one: claude --bg / -p),
+        # never an orphan, even when its argv mentions mcp or npx.
+        if (pp[p] == 1 && uid[p] == me && p != self && !(p in ld) && !(p in sess) &&
+            cmd[p] !~ /(^|\/)claude( |$)|\/claude\/versions\// &&
+            (only != "" ? (cmd[p] ~ only) : helper(cmd[p]))) { root[p] = 1; tp[p] = p ":" (now - age[p]) }
+      }
+      # An orphan with a session or any Claude process below it (an npx wrapper around
+      # claude, registered or not) is no orphan.
+      for (i = 1; i <= np; i++) {
+        q = pids[i]
+        if (!(q in sess) && cmd[q] !~ /(^|\/)claude( |$)|\/claude\/versions\//) continue
+        r = pp[q]; for (k = 0; k < 64 && r != "" && (r + 0) > 1; k++) { if (r in root) delete root[r]; r = pp[r] }
+      }
+      # Attribute every process to the session or orphan above it (walk up the parents).
+      for (i = 1; i <= np; i++) {
+        p = pids[i]; q = p
+        for (k = 0; k < 64 && q != "" && (q + 0) > 1; k++) {
+          if (q in sess) { tree[q] += m[p]; break }
+          if (q in root) { tree[q] += m[p]; tcpu[q] += cpu[p]; if (p != q) tp[q] = tp[q] " " p ":" (now - age[p]); break }
+          q = pp[q]
+        }
+      }
+      for (a in am) printf "A\t%s\t%.0f\t%d\t%d\n", a, am[a], ac[a], (a in ab ? 1 : 0)
+      for (q in sess) if ((q in m) && (cmd[q] ~ /claude/)) printf "S\t%s\t%.0f\t%.0f\t%s\t%s\t%s\n", q, m[q], tree[q], sid[q], scwd[q], sst[q]
+      for (q in root) printf "O\t%s\t%.0f\t%d\t%.1f\t%s\t%d\t%s\n", q, tree[q], age[q], tcpu[q], tp[q], (age[q] >= omin ? 1 : 0), substr(cmd[q], 1, 300)
+    }' "$tmp/fp" "$tmp/sess" "$tmp/ld" "$tmp/ps" > "$tmp/out" 2>/dev/null
+  # Orphan trees listening on a TCP port are dev servers someone may want: never auto-cleaned.
+  local opids roots
+  opids="$(awk -F'\t' '$1 == "O" { gsub(/:[0-9]+/, "", $6); gsub(/ /, ",", $6); printf "%s%s", (n++ ? "," : ""), $6 }' "$tmp/out")"
+  roots="$(awk -F'\t' '$1 == "O" { printf "%s%s", (n++ ? "," : ""), $2 }' "$tmp/out")"
+  : > "$tmp/listen"; : > "$tmp/stdin"
+  [ -n "$opids" ] && lsof -nP -a -iTCP -sTCP:LISTEN -p "$opids" -Fpn 2>/dev/null |
+    awk '/^p/ { p = substr($0, 2) } /^n/ { n = substr($0, 2); sub(/.*:/, "", n); print p "\t" n }' > "$tmp/listen"
+  # The proof a helper's session is gone: its stdin AND stdout were a pipe or socket to
+  # whatever started it (how a session talks to a stdio MCP server), and nothing holds
+  # the other end any more (lsof: a pipe with an empty name, a socket "->(none)"; a live
+  # one shows "->0x…"). A session's own `cmd &` (even `producer | cmd &`) writes stdout to
+  # a file or /dev/null, so it never qualifies. No lsof → nothing qualifies.
+  [ -n "$roots" ] && lsof -nP -a -p "$roots" -d 0,1 -Ffptn 2>/dev/null |
+    awk 'function done() { if (p != "" && gone[p, "0"] && gone[p, "1"]) print p }
+         /^p/ { done(); p = substr($0, 2); f = ""; t = "" }
+         /^f/ { f = substr($0, 2); t = "" }
+         /^t/ { t = substr($0, 2) }
+         /^n/ { n = substr($0, 2); if ((t == "PIPE" && n == "") || (t == "unix" && n == "->(none)")) gone[p, f] = 1 }
+         END { done() }' > "$tmp/stdin"
+  # Idle time of each session: its transcript's last write.
+  awk -F'\t' '$1 == "S" { print $2 "\t" $5 "\t" $6 }' "$tmp/out" | while IFS="$(printf '\t')" read -r p s c; do
+    t="$HOME/.claude/projects/$(printf '%s' "$c" | sed 's/[^A-Za-z0-9]/-/g')/$s.jsonl"
+    mt="$(stat -f %m "$t" 2>/dev/null)"; mt="$(_mem_num "$mt" "")"
+    printf '%s\t%s\n' "$p" "${mt:+$(( now - mt ))}"
+  done > "$tmp/idle"
+  jq -Rn --argjson fp "$fp" --rawfile listen "$tmp/listen" --rawfile idle "$tmp/idle" --rawfile dead "$tmp/stdin" '
+    ($listen | split("\n") | map(select(. != "") | split("\t")) | group_by(.[0])
+      | map({key: .[0][0], value: (map(.[1]) | unique)}) | from_entries) as $ports
+    | ($idle | split("\n") | map(select(. != "") | split("\t")) | map({key: .[0], value: (.[1] | tonumber? // null)}) | from_entries) as $idl
+    | ($dead | split("\n") | map(select(. != ""))) as $dead
+    | [inputs | split("\t")] as $rows
+    | {basis: (if $fp == 1 then "footprint" else "rss" end),
+       apps: ([$rows[] | select(.[0] == "A") | {name: .[1], mb: (.[2] | tonumber), procs: (.[3] | tonumber), app: (.[4] == "1")}]
+              | sort_by(-.mb) | .[:10]),
+       sessions: ([$rows[] | select(.[0] == "S") | {pid: (.[1] | tonumber), mb: (.[2] | tonumber), treeMB: (.[3] | tonumber),
+                   sessionId: .[4], cwd: .[5], status: (if .[6] == "" then null else .[6] end), idleSec: $idl[.[1]]}]
+                  | sort_by(-.treeMB)),
+       orphans: ([$rows[] | select(.[0] == "O")
+                  | (.[5] | split(" ") | map(split(":") | map(tonumber))) as $procs
+                  | ([$procs[] | (.[0] | tostring) as $k | ($ports[$k] // empty)[]] | unique) as $pt
+                  | (.[1] as $p | $dead | index([$p]) != null) as $gone
+                  | {pid: (.[1] | tonumber), mb: (.[2] | tonumber), ageSec: (.[3] | tonumber), cpu: (.[4] | tonumber),
+                     pids: [$procs[] | .[0]], starts: [$procs[] | .[1]], ports: $pt, cmd: .[7], sessionGone: $gone,
+                     auto: ($gone and .[6] == "1" and (.[4] | tonumber) < 1 and ($pt | length) == 0)}]
+                 | sort_by(-.mb))}' < "$tmp/out"
+  rm -rf "$tmp"
+}
+
+# _mem_snapshot [--footprint] — sample everything, write the cache, print it.
+_mem_snapshot() {
+  local sys procs out
+  sys="$(_mem_sys)" || { printf '%s\n' '{"error":"cannot read memory (sysctl)"}'; return 1; }
+  procs="$(_mem_procs "$@")"; printf '%s' "$procs" | jq -e '.apps' >/dev/null 2>&1 || procs='{"basis":"none","apps":[],"sessions":[],"orphans":[]}'
+  out="$(jq -cn --argjson s "$sys" --argjson p "$procs" --argjson at "$(date +%s)" '{at: $at, level: $s.level} + $s + $p')" || return 1
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null && printf '%s\n' "$out" > "$MEM_CACHE.tmp.$$" && mv -f "$MEM_CACHE.tmp.$$" "$MEM_CACHE"
+  printf '%s\n' "$out"
+}
+
+# What to do about it, most useful first (shared by the text report and notifications).
+MEM_JQ_TIPS='
+  def gb: if . >= 1024 then "\((. / 1024 * 10 | round) / 10) GB" else "\(. | round) MB" end;
+  def ago: if . == null then "?" elif . >= 86400 then "\(. / 86400 | floor)d \(. % 86400 / 3600 | floor)h"
+           elif . >= 3600 then "\(. / 3600 | floor)h \(. % 3600 / 60 | floor)m" else "\(. / 60 | floor)m" end;
+  def pad($n): . + (if $n - length > 0 then " " * ($n - length) else "" end);
+  def dir: (.cwd // "" | split("/") | last) as $d | if $d == "" then "?" else $d end;
+  def tips:
+    [ (.orphans[] | select((.auto | not) and .ageSec >= 600 and .cpu < 1 and .mb >= 50)
+        | "Orphaned \(.cmd | split(" ") | .[0:3] | join(" ") | .[0:60]) (pid \(.pid), \(.mb | gb)\(if (.ports | length) > 0 then ", listening on :\(.ports | join(",:"))" else "" end)): stop it if nothing uses it: swap-guard mem clean --pid \(.pid)"),
+      (.sessions[] | select((.treeMB - .mb) >= 1024)
+        | "The session in \(dir) is running \((.treeMB - .mb) | gb) of child processes (tests, builds): let them finish, and run fewer at once"),
+      (.sessions[] | select((.idleSec // 0) >= 7200 and .status != "busy")
+        | "The session in \(dir) has been idle \(.idleSec | ago) (\(.mb | gb)): /exit it if you are done"),
+      (.apps[] | select(.app and .name != "Claude Code" and .mb >= 2048)
+        | "\(.name) uses \(.mb | gb)\(if .name | test("Chrome|Safari|Arc|Firefox|Edge|Brave") then ": close tabs you do not need" else ": quit it if you are not using it" end)") ];'
+
+_mem_text() { # _mem_text <snapshot json>
+  printf '%s' "$1" | jq -r --argjson clean "$([ -f "$MEM_CLEAN_OFF" ] && echo false || echo true)" \
+    --argjson gate "$([ -f "$MEM_GATE_OFF" ] && echo false || echo true)" \
+    --argjson nudge "$([ -f "$MEM_NUDGE_OFF" ] && echo false || echo true)" \
+    --argjson watch "$([ -f "$HOME/Library/LaunchAgents/$MEM_LABEL.plist" ] && echo true || echo false)" "$MEM_JQ_TIPS"'
+    . as $s
+    | "Memory: \(.ramMB | gb) · \(if .usedPct == null then "?" else "\(.usedPct)%" end) in use · swap \(.swapUsedMB | gb) · compressed \(.compressedMB | gb) · pressure \(.pressure) → \(.level | ascii_upcase)"
+      + (if (.reasons | length) > 0 then "\n  (" + (.reasons | join("; ")) + ")" else "" end),
+      "",
+      "Biggest apps\(if .basis == "rss" then " (resident memory; run with --footprint for compressed too)" else "" end):",
+      (.apps[:8][] | "  \(.name | .[0:28] | pad(28)) \(.mb | gb)  (\(.procs) proc\(if .procs == 1 then "" else "s" end))"),
+      "",
+      "Claude sessions: \(.sessions | length)\(if (.sessions | length) > 0 then ", \([.sessions[].treeMB] | add | gb) with their child processes" else "" end)",
+      (.sessions[] | "  pid \(.pid | tostring | pad(6)) \(dir | .[0:24] | pad(24)) \(.mb | gb)"
+         + (if (.treeMB - .mb) >= 50 then " (+\((.treeMB - .mb) | gb) children)" else "" end)
+         + "  \(.status // "?")" + (if .idleSec != null then ", last active \(.idleSec | ago) ago" else "" end)),
+      (if (.orphans | length) > 0 then "", "Orphaned helper processes (their session is gone):",
+        (.orphans[] | "  pid \(.pid | tostring | pad(6)) \(.mb | gb)  \(.ageSec | ago) old  \(.cmd | .[0:70])"
+           + (if .auto then "  → cleaned automatically when memory gets tight (now: swap-guard mem clean)"
+              elif (.ports | length) > 0 then "  → listening on :\(.ports | join(",:")), left alone"
+              elif .cpu >= 1 then "  → still working (\(.cpu)% CPU), left alone"
+              elif (.sessionGone | not) then "  → may still belong to a live session, left alone"
+              else "  → under 10 min old, left alone" end))
+       else empty end),
+      (tips as $t | if ($t | length) > 0 then "", "Suggestions:", ($t[] | "  - " + .) else empty end),
+      "",
+      "Watcher: \(if $watch then "on (every minute)" else "off (swap-guard mem watch on)" end) · auto-clean: \(if $clean then "on" else "off" end) · session notes: \(if $nudge then "on" else "off" end) · agent gate at critical: \(if $gate then "on" else "off" end)"'
+}
+
+# _mem_started <pid> — when the process started (epoch, from its elapsed time), or nothing.
+_mem_started() {
+  local e
+  e="$(ps -o etime= -p "$1" 2>/dev/null | tr -d ' ')"
+  [ -n "$e" ] || return 0
+  printf '%s' "$e" | awk -v now="$(date +%s)" '{ d = 0; e = $0
+    if (index(e, "-")) { d = substr(e, 1, index(e, "-") - 1); e = substr(e, index(e, "-") + 1) }
+    n = split(e, a, ":"); s = (n == 3 ? a[1] * 3600 + a[2] * 60 + a[3] : (n == 2 ? a[1] * 60 + a[2] : a[1]))
+    print now - (d * 86400 + s) }'
+}
+
+# _mem_kill "<pid>:<start> ..." — the orphan first, then its children. Each process is
+# signalled only if it is still the one the snapshot saw (same pid AND start time within
+# 2 s), and the orphan only while its parent is still launchd — a reused pid is never
+# hit. TERM, then KILL whatever is left after 3 s. Returns 1 if the orphan itself is
+# no longer the same process.
+_mem_kill() {
+  local spec p st cur ok="" i left first=1
+  for spec in $1; do
+    p="${spec%%:*}"; st="${spec#*:}"
+    case "$p$st" in ''|*[!0-9]*) [ "$first" -eq 1 ] && return 1; continue;; esac
+    cur="$(_mem_started "$p")"
+    if [ -z "$cur" ] || [ "$(( cur > st ? cur - st : st - cur ))" -gt 2 ]; then [ "$first" -eq 1 ] && return 1; continue; fi
+    if [ "$first" -eq 1 ]; then [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" = 1 ] || return 1; fi
+    ok="$ok $p"; first=0
+  done
+  [ -n "$ok" ] || return 1
+  for p in $ok; do kill -TERM "$p" 2>/dev/null; done
+  for i in 1 2 3 4 5 6; do
+    left=""
+    for p in $ok; do kill -0 "$p" 2>/dev/null && left="$left $p"; done
+    [ -n "$left" ] || return 0
+    sleep 0.5
+  done
+  for p in $left; do kill -KILL "$p" 2>/dev/null; done
+  return 0
+}
+
+# _mem_clean <snapshot json> [--dry-run] [--pid N]... — stop the auto-cleanable orphans,
+# or exactly the ones --pid names (any listed orphan). JSON {cleaned, notStopped, freedMB, dryRun}.
+_mem_clean() {
+  local snap="$1" dry=0 only="" sel pid spec stopped="" failed="" v
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1;;
+      --pid) v="$(_mem_num "${2:-}" x)"; [ "$v" = x ] && { printf '%s\n' '{"error":"--pid needs a process id"}'; return 2; }
+             only="$only $v"; shift;;
+      --pid=*) v="$(_mem_num "${1#--pid=}" x)"; [ "$v" = x ] && { printf '%s\n' '{"error":"--pid needs a process id"}'; return 2; }
+               only="$only $v";;
+      *) jq -cn --arg a "$1" '{error: ("unknown argument: " + $a + " (use: swap-guard mem clean [--dry-run] [--pid N]...)")}'; return 2;;
+    esac
+    shift
+  done
+  sel="$(printf '%s' "$snap" | jq -c --arg only "$only" '
+    ($only | split(" ") | map(select(. != "") | tonumber)) as $want
+    | [.orphans[] | select(if ($want | length) == 0 then .auto else (.pid as $p | $want | index([$p]) != null) end)]')"
+  if [ -n "$only" ]; then
+    for pid in $only; do
+      printf '%s' "$sel" | jq -e --argjson p "$pid" 'any(.[]; .pid == $p)' >/dev/null 2>&1 ||
+        { jq -cn --arg p "$pid" '{error: ("pid " + $p + " is not an orphaned helper process (see: swap-guard mem --text)")}'; return 1; }
+    done
+  fi
+  while IFS="$(printf '\t')" read -r pid spec; do
+    case "$pid" in ''|*[!0-9]*) continue;; esac
+    if [ "$dry" -eq 1 ] || _mem_kill "$spec"; then stopped="$stopped $pid"; else failed="$failed $pid"; fi
+  done <<EOF
+$(printf '%s' "$sel" | jq -r '.[] | "\(.pid)\t\([.pids, .starts] | transpose | map("\(.[0]):\(.[1])") | join(" "))"')
+EOF
+  local out
+  out="$(printf '%s' "$sel" | jq -c --arg s "$stopped" --arg f "$failed" --argjson d "$dry" '
+    ($s | split(" ") | map(select(. != "") | tonumber)) as $ok | ($f | split(" ") | map(select(. != "") | tonumber)) as $no
+    | [.[] | select(.pid as $p | $ok | index([$p]) != null) | {pid, mb, cmd: (.cmd | .[0:120])}] as $c
+    | {cleaned: $c, notStopped: [.[] | select(.pid as $p | $no | index([$p]) != null) | {pid, reason: "no longer the same process"}],
+       freedMB: ([$c[].mb] | add // 0), dryRun: ($d == 1)}')"
+  if [ "$dry" -eq 0 ] && [ -n "$stopped" ]; then
+    _mem_log "$(printf '%s' "$out" | jq -c --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{ts: $ts, action: "cleaned"} + .')"
+  fi
+  printf '%s\n' "$out"
+}
+
+_mem_notify() { # _mem_notify <message>
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$(printf '%s' "$1" | tr -d '"\\' | cut -c1-400)\" with title \"overclaude memory\"" >/dev/null 2>&1 || true
+}
+
+_mem_rank() { case "${1:-}" in critical) echo 2;; warn) echo 1;; *) echo 0;; esac; }
+
+_mem_tick() {
+  local notify=1 probe=0 sys level fp=0 snap last_fp cleaned='{"cleaned":[],"freedMB":0}' prev_rank rank now msg notified=false
+  while [ $# -gt 0 ]; do
+    case "$1" in --no-notify) notify=0;; --probe) probe=1;; esac
+    shift
+  done
+  now="$(date +%s)"
+  sys="$(_mem_sys)" || {
+    msg="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{ts: $ts, action: "error", detail: "cannot read memory (sysctl)"}')"
+    [ "$probe" -eq 1 ] || _mem_log "$msg"; printf '%s\n' "$msg"; return 1; }
+  if [ "$probe" -eq 1 ]; then jq -cn '{action: "probe-ok"}'; return 0; fi
+  level="$(printf '%s' "$sys" | jq -r '.level')"
+  # The full footprint (top, ~1.5 s) only when memory is tight, or every 10 min for the report.
+  last_fp="$(jq -r 'if .basis == "footprint" then .at else 0 end' "$MEM_CACHE" 2>/dev/null)"
+  [ "$level" != ok ] || [ $(( now - $(_mem_num "$last_fp" 0) )) -ge 600 ] && fp=1
+  if [ "$fp" -eq 1 ]; then snap="$(_mem_snapshot --footprint)"; else snap="$(_mem_snapshot)"; fi
+  printf '%s' "$snap" | jq -e '.level' >/dev/null 2>&1 || return 1
+  if [ "$level" != ok ] && [ ! -f "$MEM_CLEAN_OFF" ]; then
+    cleaned="$(_mem_clean "$snap")"
+  fi
+  rank="$(_mem_rank "$level")"
+  # State: the rank last notified (kept until memory has been fine for MEM_CALM, so a
+  # level flapping around a line notifies once), when, and since when it has been ok.
+  local nrank nat oks
+  { read -r nrank nat oks < "$MEM_STATE"; } 2>/dev/null
+  nrank="$(_mem_num "${nrank:-}" 0)"; nat="$(_mem_num "${nat:-}" 0)"; oks="$(_mem_num "${oks:-}" 0)"
+  prev_rank="$nrank"
+  if [ "$rank" -gt 0 ]; then oks=0; elif [ "$oks" -eq 0 ]; then oks="$now"; fi
+  if [ "$rank" -gt "$nrank" ] || { [ "$rank" -eq 2 ] && [ $(( now - nat )) -ge "$MEM_RENOTIFY" ]; }; then
+    if [ "$notify" -eq 1 ]; then
+      msg="$(printf '%s' "$snap" | jq -r --argjson c "$cleaned" "$MEM_JQ_TIPS"'
+        "Memory \(.level): \(.reasons | join(", "))."
+        + (if ($c.cleaned | length) > 0 then " Freed \($c.freedMB | gb) by stopping \($c.cleaned | length) orphaned process\(if ($c.cleaned | length) == 1 then "" else "es" end)." else "" end)
+        + " Biggest: " + ([.apps[:2][] | "\(.name) \(.mb | gb)"] | join(", ")) + "."
+        + (tips as $t | if ($t | length) > 0 then " " + $t[0] + "." else "" end)
+        + " More: swap-guard mem --text"')"
+      _mem_notify "$msg"; notified=true
+    fi
+    nrank="$rank"; nat="$now"
+  elif [ "$rank" -eq 0 ] && [ "$nrank" -gt 0 ] && [ $(( now - oks )) -ge "$MEM_CALM" ]; then
+    [ "$notify" -eq 1 ] && { _mem_notify "Memory is back to normal."; notified=true; }
+    nrank=0; nat="$now"
+  elif [ "$notify" -eq 1 ] && [ "$(printf '%s' "$cleaned" | jq '.cleaned | length')" -gt 0 ]; then
+    _mem_notify "$(printf '%s' "$cleaned" | jq -r '"Freed \(.freedMB | round) MB by stopping \(.cleaned | length) orphaned process\(if (.cleaned | length) == 1 then "" else "es" end) (memory is tight)."')"
+    notified=true
+  fi
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null && printf '%s %s %s\n' "$nrank" "$nat" "$oks" > "$MEM_STATE"
+  msg="$(printf '%s' "$snap" | jq -c --argjson c "$cleaned" --argjson n "$notified" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{ts: $ts, action: "tick", level, freePct, swapUsedMB, reasons, cleaned: ($c.cleaned | map(.pid)), freedMB: $c.freedMB, notified: $n}')"
+  # Log what matters: a tight tick, a level change, a cleanup.
+  if [ "$level" != ok ] || [ "$nrank" -ne "$prev_rank" ]; then _mem_log "$msg"; fi
+  printf '%s\n' "$msg"
+  return 0
+}
+
+_mem_watch_on() {
+  local interval="$MEM_INTERVAL" path_env probe
+  while [ $# -gt 0 ]; do
+    case "$1" in --interval) interval="${2:-}"; shift;; esac
+    shift
+  done
+  case "$interval" in ''|*[!0-9]*) echo "mem watch on: --interval must be whole seconds" >&2; return 1;; esac
+  [ "$interval" -ge 30 ] || interval=30
+  path_env="$(_launchd_path_env)"
+  probe="$(PATH="$path_env" _mem_tick --probe --no-notify 2>/dev/null | tail -n 1)"
+  if [ "$(printf '%s' "$probe" | jq -r '.action // "error"' 2>/dev/null)" != "probe-ok" ]; then
+    echo "mem watch on: a test tick failed, not installing: $probe" >&2; return 1
+  fi
+  rm -f "$MEM_OFF"
+  _launchd_install "$MEM_LABEL" "$interval" "$path_env" "$STATE_ROOT/memwatch-launchd.err" mem tick
+}
+
+_mem_watch_off() {
+  local plist uid removed=false
+  plist="$HOME/Library/LaunchAgents/$MEM_LABEL.plist"; uid="$(id -u)"
+  if [ -z "${SWAP_GUARD_NO_LAUNCHCTL:-}" ]; then
+    launchctl bootout "gui/$uid/$MEM_LABEL" >/dev/null 2>&1 && removed=true
+  fi
+  [ -f "$plist" ] && rm -f "$plist" && removed=true
+  mkdir -p "$STATE_ROOT" && touch "$MEM_OFF"
+  jq -cn --argjson r "$removed" '{memWatch: false, removed: $r}'
+}
+
+_mem_watch_status() {
+  local plist uid loaded=false
+  plist="$HOME/Library/LaunchAgents/$MEM_LABEL.plist"; uid="$(id -u)"
+  [ -z "${SWAP_GUARD_NO_LAUNCHCTL:-}" ] && launchctl print "gui/$uid/$MEM_LABEL" >/dev/null 2>&1 && loaded=true
+  jq -cn --argjson loaded "$loaded" --argjson exists "$([ -f "$plist" ] && echo true || echo false)" \
+    --argjson off "$([ -f "$MEM_OFF" ] && echo true || echo false)" \
+    --argjson clean "$([ -f "$MEM_CLEAN_OFF" ] && echo false || echo true)" \
+    --argjson gate "$([ -f "$MEM_GATE_OFF" ] && echo false || echo true)" \
+    --argjson nudge "$([ -f "$MEM_NUDGE_OFF" ] && echo false || echo true)" \
+    --arg plist "$plist" --arg log "$MEM_LOG" \
+    '{loaded: $loaded, plistExists: $exists, turnedOff: $off, autoClean: $clean, agentGate: $gate, sessionNotes: $nudge, plist: $plist, log: $log}'
+}
+
+# _mem_fresh_level — the cached level if the sample is fresh, else nothing. Cheap on
+# the common path: the level sits near the start of the file, so "ok" needs no jq.
+_mem_fresh_level() {
+  local head at lvl
+  [ -f "$MEM_CACHE" ] || return 0
+  head="$(head -c 200 "$MEM_CACHE" 2>/dev/null)"
+  case "$head" in *'"level":"ok"'*) return 0;; esac
+  at="$(printf '%s' "$head" | sed -n 's/^{"at":\([0-9][0-9]*\),.*/\1/p')"
+  at="$(_mem_num "$at" 0)"
+  [ $(( $(date +%s) - at )) -le "$MEM_FRESH" ] || return 0
+  lvl="$(printf '%s' "$head" | sed -n 's/.*"level":"\([a-z]*\)".*/\1/p')"
+  case "$lvl" in warn|critical) printf '%s' "$lvl";; esac
+}
+
+# _mem_note <sid> <aid> <level> — this agent's memory note, or nothing: once per level,
+# again after MEM_RENUDGE. Called from the checkpoint PostToolUse hook (one process
+# per tool call, not two).
+_mem_note() {
+  local sid="$1" aid="$2" lvl="$3" rank f prank pat now line
+  case "$lvl" in warn|critical) :;; *) return 0;; esac
+  rank="$(_mem_rank "$lvl")"; now="$(date +%s)"
+  f="$CTX_DIR/$sid${aid:+.$aid}.mem"
+  { read -r prank pat < "$f"; } 2>/dev/null
+  prank="$(_mem_num "${prank:-}" 0)"; pat="$(_mem_num "${pat:-}" 0)"
+  [ "$rank" -gt "$prank" ] || [ $(( now - pat )) -ge "$MEM_RENUDGE" ] || return 0
+  { mkdir -p "$CTX_DIR" && printf '%s %s\n' "$rank" "$now" > "$f"; } 2>/dev/null || return 0
+  line="$(jq -r '"\(.reasons | join(", ")); \(.sessions | length) Claude session\(if (.sessions | length) == 1 then "" else "s" end) open"' "$MEM_CACHE" 2>/dev/null)"
+  _mem_log "$(jq -cn --argjson ts "$now" --arg s "$sid" --arg a "$aid" --arg l "$lvl" \
+    '{ts: ($ts | todate), action: "nudged", level: $l, session: $s} + (if $a != "" then {agent: $a} else {} end)')"
+  if [ -n "$aid" ]; then
+    printf 'overclaude: this Mac is %s on memory (%s). You are a subagent: finish your task with as few new processes as possible, stop any background process you started, and return your result.' \
+      "$([ "$lvl" = critical ] && echo critically low || echo getting low)" "$line"
+  elif [ "$lvl" = critical ]; then
+    printf 'overclaude: this Mac is critically low on memory (%s); if it keeps climbing, every session on it can freeze. Until it recovers: do not start subagents, workflows, parallel test runs or builds; run tests one file at a time or with few workers (e.g. --maxWorkers=2); stop background processes you started and no longer need; finish the step you are on and save progress (files, a commit). Tell the user, and point them at `swap-guard mem --text` for what is using the memory.' "$line"
+  else
+    printf 'overclaude: memory on this Mac is getting tight (%s). Keep fan-out small (at most 2 subagents at a time), avoid running test suites or builds in parallel, and stop background processes you no longer need.' "$line"
+  fi
+}
+
+# mem --gate: PreToolUse on Agent|Task|Workflow. At critical, refuse new agents.
+_mem_gate() {
+  local input lvl tool
+  if [ -t 0 ]; then jq -cn --argjson on "$([ -f "$MEM_GATE_OFF" ] && echo false || echo true)" '{agentGate: $on}'; return 0; fi
+  exec 2>/dev/null
+  input="$(cat)" || return 0
+  [ -f "$MEM_GATE_OFF" ] && return 0
+  [ "${OVERCLAUDE_MEM_GATE:-}" = off ] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  lvl="$(_mem_fresh_level)"; [ "$lvl" = critical ] || return 0
+  tool="$(printf '%s' "$input" | jq -r '.tool_name // empty' | tr -cd 'A-Za-z0-9_')"; tool="${tool:-subagent}"
+  _mem_log "$(jq -cn --argjson ts "$(date +%s)" --arg t "$tool" '{ts: ($ts | todate), action: "gated", tool: $t}')"
+  jq -cn --arg r "overclaude memory guard: this Mac is critically low on memory ($(jq -r '.reasons | join(", ")' "$MEM_CACHE" 2>/dev/null)), so starting a $tool now could freeze every session on it. Do this step yourself in this session, one thing at a time, or wait a few minutes and try again; if it cannot wait, tell the user (they can see what uses the memory with: swap-guard mem --text, and turn this gate off with: swap-guard mem gate off)." \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
+}
+
+cmd_mem() {
+  local sub="${1:-}" snap text=0 fp=0 a
+  case "$sub" in
+    tick) shift; _mem_tick "$@"; exit $?;;
+    --gate) _mem_gate; exit 0;;
+    clean)
+      shift
+      snap="$(_mem_snapshot --footprint)" || { printf '%s\n' "$snap"; exit 1; }
+      _mem_clean "$snap" "$@"; exit $?;;
+    watch)
+      case "${2:-status}" in
+        on) shift 2; _mem_watch_on "$@"; exit $?;;
+        off) _mem_watch_off; exit 0;;
+        status) _mem_watch_status; exit 0;;
+        *) echo "usage: swap-guard mem watch on|off|status" >&2; exit 2;;
+      esac;;
+    autoclean|gate|nudge)
+      local off="$MEM_CLEAN_OFF" key=autoClean
+      [ "$sub" = gate ] && { off="$MEM_GATE_OFF"; key=agentGate; }
+      [ "$sub" = nudge ] && { off="$MEM_NUDGE_OFF"; key=sessionNotes; }
+      case "${2:-status}" in
+        on) rm -f "$off";;
+        off) mkdir -p "$STATE_ROOT" && touch "$off";;
+        status) :;;
+        *) echo "usage: swap-guard mem $sub on|off|status" >&2; exit 2;;
+      esac
+      jq -cn --arg k "$key" --argjson on "$([ -f "$off" ] && echo false || echo true)" '{($k): $on}'; exit 0;;
+  esac
+  for a in "$@"; do
+    case "$a" in
+      --text) text=1; fp=1;;
+      --footprint) fp=1;;
+      --refresh) :;;
+      *) echo "usage: swap-guard mem [--text] [--footprint] | clean [--dry-run] [--pid N] | watch on|off|status | autoclean|nudge|gate on|off|status" >&2; exit 2;;
+    esac
+  done
+  if [ "$fp" -eq 1 ]; then snap="$(_mem_snapshot --footprint)"; else snap="$(_mem_snapshot)"; fi || { printf '%s\n' "$snap"; exit 1; }
+  if [ "$text" -eq 1 ]; then _mem_text "$snap"; else printf '%s\n' "$snap"; fi
   exit 0
 }
 
@@ -2957,7 +3554,7 @@ $line
 EOF
   f="$CTX_DIR/$sid.budget"
   # Per-session state for sessions long gone is pruned as we go.
-  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' -o -name '*.acct' -o -name '*.ckpt' \) -mtime +7 -delete 2>/dev/null
+  find "$CTX_DIR" -maxdepth 1 \( -name '*.budget' -o -name '*.rlwake' -o -name '*.retry' -o -name '*.loop' -o -name '*.acct' -o -name '*.ckpt' -o -name '*.mem' \) -mtime +7 -delete 2>/dev/null
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
@@ -3948,6 +4545,7 @@ main() {
     loop-guard)    cmd_loop_guard "$@";;
     checkpoint)    cmd_checkpoint "$@";;
     budget)        cmd_budget "$@";;
+    mem)           cmd_mem "$@";;
     login)         cmd_login "$@";;
     version-check) cmd_version_check "$@";;
     codex-usage)   cmd_codex_usage "$@";;
