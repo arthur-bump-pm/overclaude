@@ -4098,8 +4098,31 @@ cmd_codex_review() {
     echo "usage: swap-guard codex-review [--dir D] [--model M] [--effort E] [--schema F] [--timeout S] [--raw] <prompt> [--stdin < input]" >&2; exit 2
   fi
   home="$(_codex_active_home)"
+  # A review only reads code: no MCP servers, plugins, connectors, browser or computer use.
+  # Codex merges `-c mcp_servers={}` into the config instead of replacing it, so every
+  # server it would load (user and project config) is switched off by name. Fails closed
+  # when the list can't be read or a name can't be passed safely as a config key.
+  local mcp_json names n feats f lock=()
+  mcp_json="$(cd "$dir" && CODEX_HOME="$home" codex mcp list --json 2>/dev/null)"
+  printf '%s' "$mcp_json" | jq -e 'type == "array"' >/dev/null 2>&1 || {
+    [ -n "$stdin_f" ] && rm -f "$stdin_f"
+    jq -cn '{ok:false, error:"mcp-lock-failed", detail:"could not list Codex MCP servers to switch them off"}'; exit 1; }
+  names="$(printf '%s' "$mcp_json" | jq -r '.[].name')"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    case "$n" in *[!A-Za-z0-9_-]*)
+      [ -n "$stdin_f" ] && rm -f "$stdin_f"
+      jq -cn --arg n "$n" '{ok:false, error:"mcp-lock-failed", detail:"MCP server name \($n) cannot be switched off safely"}'; exit 1;;
+    esac
+    lock+=(-c "mcp_servers.$n.enabled=false")
+  done <<< "$names"
+  # Only features this Codex knows: an unknown name makes Codex exit with an error.
+  feats="$(CODEX_HOME="$home" codex features list 2>/dev/null | awk '{print $1}')"
+  for f in plugins apps remote_plugin browser_use browser_use_external computer_use in_app_browser; do
+    printf '%s\n' "$feats" | grep -qx "$f" && lock+=(--disable "$f")
+  done
   out="$(mktemp)"; err="$(mktemp)"
-  local args=(exec -s read-only --ephemeral --skip-git-repo-check --color never -C "$dir" -o "$out")
+  local args=(exec -s read-only --ephemeral --skip-git-repo-check --color never -C "$dir" -o "$out" ${lock[@]+"${lock[@]}"})
   [ -n "$model" ] && args+=(-m "$model")
   [ -n "$effort" ] && args+=(-c "model_reasoning_effort=\"$effort\"")
   [ -n "$schema" ] && args+=(--output-schema "$schema")
