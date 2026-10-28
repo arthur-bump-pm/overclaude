@@ -4117,7 +4117,11 @@ cmd_codex_review() {
     lock+=(-c "mcp_servers.$n.enabled=false")
   done <<< "$names"
   # Only features this Codex knows: an unknown name makes Codex exit with an error.
+  # No list means nothing can be switched off, so the review doesn't run.
   feats="$(CODEX_HOME="$home" codex features list 2>/dev/null | awk '{print $1}')"
+  [ -n "$feats" ] || {
+    [ -n "$stdin_f" ] && rm -f "$stdin_f"
+    jq -cn '{ok:false, error:"mcp-lock-failed", detail:"could not list Codex features to switch off plugins and connectors"}'; exit 1; }
   for f in plugins apps remote_plugin browser_use browser_use_external computer_use in_app_browser; do
     printf '%s\n' "$feats" | grep -qx "$f" && lock+=(--disable "$f")
   done

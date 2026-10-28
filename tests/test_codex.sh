@@ -46,6 +46,11 @@ STUB="$HOME/stubbin"; mkdir -p "$STUB"
 cat > "$STUB/codex" <<'EOF'
 #!/bin/bash
 # stub: record args + CODEX_HOME; write the -o file; optional slow mode for the timeout test
+if [ "$1 $2" = "mcp list" ]; then
+  [ -n "${STUB_MCP_FAIL:-}" ] && exit 1
+  def='[{"name":"playwright"},{"name":"refero"}]'; printf '%s\n' "${STUB_MCP-$def}"; exit 0
+fi
+if [ "$1 $2" = "features list" ]; then [ -n "${STUB_FEAT_FAIL:-}" ] && exit 1; printf 'plugins  stable  true\napps  stable  true\nhooks  stable  true\n'; exit 0; fi
 echo "CODEX_HOME=$CODEX_HOME $*" >> "$HOME/codex-calls"
 [ -n "${STUB_SLOW:-}" ] && { sleep 5 & wait; }
 out=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done
@@ -83,6 +88,22 @@ assert_eq "$(pgrep -f "$STUB/codex" | wc -l | tr -d ' ')" "0" "and leaves no Cod
 "$SG" codex-review --dir "$HOME" "--dangerously-bypass-approvals-and-sandbox" >/dev/null
 assert_contains "$(tail -n 1 "$HOME/codex-calls")" "-s read-only --ephemeral --skip-git-repo-check --color never -C $HOME -o" "flags come first"
 assert_contains "$(tail -n 1 "$HOME/codex-calls")" " -- --dangerously-bypass" "a prompt starting with - is passed after --, never as a flag"
+# Reviews only read code: every MCP server is switched off by name, plus plugins and
+# connectors this Codex knows about; unknown feature names are never passed.
+"$SG" codex-review --dir "$HOME" "lock" >/dev/null
+c="$(tail -n 1 "$HOME/codex-calls")"
+assert_contains "$c" "-c mcp_servers.playwright.enabled=false -c mcp_servers.refero.enabled=false" "each MCP server is switched off"
+assert_contains "$c" "--disable plugins --disable apps" "plugins and connectors are switched off"
+assert_absent "$c" "--disable computer_use" "features this Codex doesn't list are not passed"
+n0="$(wc -l < "$HOME/codex-calls")"
+assert_eq "$(STUB_MCP_FAIL=1 "$SG" codex-review --dir "$HOME" "x" | jq -r .error)" "mcp-lock-failed" "fails closed when the MCP list can't be read"
+assert_eq "$(STUB_MCP='[{"name":"a.b"}]' "$SG" codex-review --dir "$HOME" "x" | jq -r .error)" "mcp-lock-failed" "fails closed on a name that isn't a safe config key"
+assert_eq "$(STUB_FEAT_FAIL=1 "$SG" codex-review --dir "$HOME" "x" | jq -r .error)" "mcp-lock-failed" "fails closed when the feature list can't be read"
+n1="$(ls "${TMPDIR:-/tmp}" | wc -l)"
+printf 'diff' | STUB_MCP_FAIL=1 "$SG" codex-review --stdin --dir "$HOME" "x" >/dev/null
+assert_eq "$(ls "${TMPDIR:-/tmp}" | wc -l)" "$n1" "a refused review leaves no stdin temp file behind"
+assert_eq "$(wc -l < "$HOME/codex-calls")" "$n0" "and Codex is never started in any of these cases"
+assert_eq "$(STUB_MCP='[]' "$SG" codex-review --dir "$HOME" "x" | jq -r .ok)" "true" "no MCP servers configured is fine"
 assert_eq "$("$SG" codex-review --timeout 0 "x" | jq -r .error)" "bad-timeout" "--timeout 0 (no timeout) is refused"
 assert_eq "$("$SG" codex-review --effort extreme "x" | jq -r .error)" "bad-effort" "unknown effort refused"
 

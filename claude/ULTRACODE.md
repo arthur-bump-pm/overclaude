@@ -1,7 +1,7 @@
 # ULTRACODE.md — Model & Effort Routing (v2, audited 2026-07 against Anthropic multi-agent research, MAST, router-collapse, solve-to-judge-gap literature)
 
 ## 1. Core principle
-Spend fable only where judgment is the bottleneck, never where volume is: fable draws from a separate, much smaller rate-limit bucket, and omitting `opts.model` silently inherits it — every un-annotated `agent()` call is a fable spend.
+Spend fable only where judgment is the bottleneck, never where volume is: fable counts against the same weekly limit as everything else and may use at most half of it (Max plans), so every fable call shrinks what the rest of your work can spend. Omitting `opts.model` silently inherits fable — every un-annotated `agent()` call is a fable spend.
 Explicit down-routing is your default posture, not an optimization.
 Route each agent by one question: "if this agent is quietly wrong, who catches it?" — a downstream check means you may downgrade; nobody means top tier.
 
@@ -50,7 +50,7 @@ Escalation rule (what makes cheap-first safe):
 - Cross-family voter: when a verdict matters and the Codex CLI is installed, make ONE panel voter a Codex run — `swap-guard codex-review --timeout 540 --schema <verdict-schema> --stdin "<claim>" < <artifact>`, run with a 600000 ms Bash timeout (read-only sandbox, ephemeral; a timeout kills the whole Codex run). The schema must be strict JSON Schema (`"additionalProperties": false`, every property in `required`), e.g. `{"type":"object","additionalProperties":false,"required":["verdict","confidence","evidence"],"properties":{"verdict":{"type":"string","enum":["CONFIRM","REFUTE","UNSURE"]},"confidence":{"type":"number"},"evidence":{"type":"string"}}}`; the verdict arrives in `.json`. In a Workflow, the voter is an `agent()` with its own model (e.g. sonnet) that runs this command. A different model family decorrelates errors that same-family voters re-vote. It is one vote with its own lens, never the only gate, and it never replaces the opus floor on Claude-side verifiers. Pass it the artifact plus a bare claim, not the generator's reasoning. Skip it if `swap-guard codex-ready` reports the Codex account exhausted.
 - Still UNSURE at the top tier? Surface it to the user. An honest "unresolved" is correct output; a manufactured verdict is a defect.
 
-Budget pressure (`budget.remaining()` thin, or fable bucket ~75%+ consumed):
+Budget pressure (`budget.remaining()` thin, or fable's share of the weekly limit ~75%+ used):
 - Cut fan-out width and batch more files per agent FIRST; floors are the last thing to fall.
 - Treat fable as a read-only reserve: one highest-leverage call only (usually synthesis).
 - If the budget cannot cover the fable/opus terminal stages, say so and propose the cut — never silently ship a downgraded final answer.

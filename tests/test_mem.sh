@@ -137,8 +137,15 @@ trap 'pkill -f "$TAG" 2>/dev/null' EXIT
 ( "$HOME/bin/$TAG-srv" >/dev/null 2>&1 </dev/null & )
 ( : | "$HOME/bin/claude" --mcp-config cfg.json --print "$TAG" >/dev/null 2>&1 & )
 ( "$HOME/bin/$TAG-wrap" >/dev/null 2>&1 </dev/null & )
-sleep 1.5
 pid_of() { ps -axwwo pid=,ppid=,command= | awk -v pat="$1" -v pp="${2:-}" 'index($0, pat) && (pp == "" || $2 == pp) { print $1; exit }'; }
+# Wait until the deepest child (the wrapped session) exists, not a fixed time: under
+# memory pressure the helpers can take well over a second to start. Up to 15 s.
+for _ in $(seq 1 60); do
+  w="$(pid_of "$HOME/bin/$TAG-wrap" 1)"
+  [ -n "$w" ] && [ -n "$(pgrep -P "$w" | head -n 1)" ] && [ -n "$(pid_of "--mcp-config cfg.json --print $TAG" 1)" ] && break
+  sleep 0.25
+done
+sleep 0.5
 idle_pid="$(pid_of "$HOME/bin/$TAG-idle" 1)"; idle_child="$(pgrep -P "$idle_pid" | head -n 1)"
 bg_pid="$(pid_of "$HOME/bin/$TAG-bg" 1)"; pipe_pid="$(pid_of "$HOME/bin/$TAG-pipe" 1)"
 srv_pid="$(pid_of "Python -c import socket" 1)"; [ -n "$srv_pid" ] || srv_pid="$(pid_of "time.sleep(300) $TAG" 1)"
