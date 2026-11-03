@@ -1,4 +1,4 @@
-# ULTRACODE.md — Model & Effort Routing (v2, audited 2026-07 against Anthropic multi-agent research, MAST, router-collapse, solve-to-judge-gap literature)
+# ULTRACODE.md — Model & Effort Routing
 
 ## 1. Core principle
 Spend fable only where judgment is the bottleneck, never where volume is: fable counts against the same weekly limit as everything else and may use at most half of it (Max plans), so every fable call shrinks what the rest of your work can spend. Omitting `opts.model` silently inherits fable — every un-annotated `agent()` call is a fable spend.
@@ -25,33 +25,33 @@ Route each agent by one question: "if this agent is quietly wrong, who catches i
 
 Pairing rules:
 - Effort amplifies capability; it never substitutes — and it is non-monotonic: haiku@xhigh loses to sonnet@medium on judgment work, and overthinking degrades mechanical stages. Never pair xhigh with a fan-out stage.
-- Multiply tier by fan-out width BEFORE picking a model — fine at width 3 is a budget event at width 20. Any `parallel()` wider than ~5 gets an explicit haiku/sonnet.
+- Multiply tier by fan-out width before picking a model — fine at width 3 is a budget event at width 20. Any `parallel()` wider than ~5 gets an explicit haiku/sonnet.
 - **Reads parallelize; writes serialize.** `parallel()` is for search/read/test/evaluate over disjoint scope. Never two agents editing the same files or feature concurrently — concurrent writers conflict on unstated decisions. One owner per diff; merge independent reads into a single edit plan.
-- Fan-out buys recall on INDEPENDENT scope, not compute on a coupled problem. For one hard, coupled task, escalate tier/effort on a single agent first — same tokens, fewer coordination failures.
+- Fan-out buys recall on independent scope, not compute on a coupled problem. For one hard, coupled task, escalate tier/effort on a single agent first — same tokens, fewer coordination failures.
 - Buy recall with width (more cheap finders over disjoint files); buy precision with tier (one strong verifier). Upstream misses get caught downstream; a false CONFIRM does not.
 
 ## 3. Hard guardrails
 
 Never downgrade (floors, not targets):
-- Final synthesis, and ANY output the user sees without a downstream check: fable, never below opus. The trust boundary sets the floor, not the stage label.
+- Final synthesis, and any output the user sees without a downstream check: fable, never below opus. The trust boundary sets the floor, not the stage label.
 - Adversarial verification, judge panels, security verdicts, completeness critics: opus floor. A false CONFIRM ends scrutiny — nothing checks the checker.
 - Subtle-correctness verdicts (concurrency, auth/crypto, money math, data-loss migrations): fable. "Looks correct" and "is correct" diverge most here.
 
 Verification order (cheapest reliable check first):
-- Where the class has an OBJECTIVE check — tests, typecheck, lint, a numeric answer — gate on it via bash BEFORE spending an LLM verifier: cheap generator → deterministic gate → escalate tier only on fail. A passing test outranks an LLM CONFIRM.
-- For fuzzy deliverables with no automatic check, verification is NOT easier than generation — buy a stronger generator, not a weak-generator-plus-judge pipeline.
+- Where the class has an objective check — tests, typecheck, lint, a numeric answer — gate on it via bash before spending an LLM verifier: cheap generator → deterministic gate → escalate tier only on fail. A passing test outranks an LLM CONFIRM.
+- For fuzzy deliverables with no automatic check, verification is not easier than generation — buy a stronger generator, not a weak-generator-plus-judge pipeline.
 - Verifier prompts get the diff/artifact plus a bare task statement — never the generator's reasoning trace. A clean-context reviewer re-derives from the code and catches what the author's context can't.
 
 Escalation rule (what makes cheap-first safe):
-- Give every finder/verifier a `schema` requiring `verdict` / `confidence` / `evidence`. Empty evidence IS low confidence, whatever number the agent reports.
-- Re-run once at a HIGHER tier on: confidence < 0.7, UNSURE, empty/malformed output, or contradiction between parallel agents. The escalation target — and any verifier — must be ≥ the generator's tier: a weaker model cannot validate a stronger one's output.
-- Escalation has a CEILING as well as floors: if more than ~1 in 4 downgraded stages escalates, the routing was miscalibrated — stop and re-author the script instead of silently running everything at the top tier.
-- Panels are 2–3 voters with DISTINCT lenses (correctness / security / does-it-reproduce), never N identical voters — same-model repetition just re-votes the same error. Unanimous → accept; any split → one fable adjudicator; never majority-vote or average a split.
-- Cross-family voter: when a verdict matters and the Codex CLI is installed, make ONE panel voter a Codex run — `swap-guard codex-review --timeout 540 --schema <verdict-schema> --stdin "<claim>" < <artifact>`, run with a 600000 ms Bash timeout (read-only sandbox, ephemeral; a timeout kills the whole Codex run). The schema must be strict JSON Schema (`"additionalProperties": false`, every property in `required`), e.g. `{"type":"object","additionalProperties":false,"required":["verdict","confidence","evidence"],"properties":{"verdict":{"type":"string","enum":["CONFIRM","REFUTE","UNSURE"]},"confidence":{"type":"number"},"evidence":{"type":"string"}}}`; the verdict arrives in `.json`. In a Workflow, the voter is an `agent()` with its own model (e.g. sonnet) that runs this command. A different model family decorrelates errors that same-family voters re-vote. It is one vote with its own lens, never the only gate, and it never replaces the opus floor on Claude-side verifiers. Pass it the artifact plus a bare claim, not the generator's reasoning. Skip it if `swap-guard codex-ready` reports the Codex account exhausted.
+- Give every finder/verifier a `schema` requiring `verdict` / `confidence` / `evidence`. Empty evidence is low confidence, whatever number the agent reports.
+- Re-run once at a higher tier on: confidence < 0.7, UNSURE, empty/malformed output, or contradiction between parallel agents. The escalation target — and any verifier — must be ≥ the generator's tier: a weaker model cannot validate a stronger one's output.
+- Escalation has a ceiling as well as floors: if more than ~1 in 4 downgraded stages escalates, the routing was miscalibrated — stop and re-author the script instead of silently running everything at the top tier.
+- Panels are 2–3 voters with distinct lenses (correctness / security / does-it-reproduce), never N identical voters — same-model repetition just re-votes the same error. Unanimous → accept; any split → one fable adjudicator; never majority-vote or average a split.
+- Cross-family voter: when a verdict matters and the Codex CLI is installed, make one panel voter a Codex run — `swap-guard codex-review --timeout 540 --schema <verdict-schema> --stdin "<claim>" < <artifact>`, run with a 600000 ms Bash timeout (read-only sandbox, ephemeral; a timeout kills the whole Codex run). The schema must be strict JSON Schema (`"additionalProperties": false`, every property in `required`), e.g. `{"type":"object","additionalProperties":false,"required":["verdict","confidence","evidence"],"properties":{"verdict":{"type":"string","enum":["CONFIRM","REFUTE","UNSURE"]},"confidence":{"type":"number"},"evidence":{"type":"string"}}}`; the verdict arrives in `.json`. In a Workflow, the voter is an `agent()` with its own model (e.g. sonnet) that runs this command. A different model family decorrelates errors that same-family voters re-vote. It is one vote with its own lens, never the only gate, and it never replaces the opus floor on Claude-side verifiers. Pass it the artifact plus a bare claim, not the generator's reasoning. Skip it if `swap-guard codex-ready` reports the Codex account exhausted.
 - Still UNSURE at the top tier? Surface it to the user. An honest "unresolved" is correct output; a manufactured verdict is a defect.
 
 Budget pressure (`budget.remaining()` thin, or fable's share of the weekly limit ~75%+ used):
-- Cut fan-out width and batch more files per agent FIRST; floors are the last thing to fall.
+- Cut fan-out width and batch more files per agent first; floors are the last thing to fall.
 - Treat fable as a read-only reserve: one highest-leverage call only (usually synthesis).
 - If the budget cannot cover the fable/opus terminal stages, say so and propose the cut — never silently ship a downgraded final answer.
 
@@ -71,7 +71,7 @@ pipeline(files,
 // contested verdicts only — one strong judge beats re-voting the same error
 const ruling = await agent(`Adjudicate the CONFIRM/REFUTE splits`,
   { model: 'fable', effort: 'xhigh', label: 'adjudicate (fable/xhigh)' });
-// model omitted DELIBERATELY: terminal stage inherits fable
+// model omitted deliberately: terminal stage inherits fable
 const report = await agent(`Synthesize the final review, ranked by severity`,
   { effort: 'xhigh', label: 'synthesize (fable/xhigh)' });
 ```
