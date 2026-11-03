@@ -2,7 +2,8 @@
 # Claude Code status line - two-line layout
 #
 # Line 1: model (effort) | dir (branch*) | N sessions | account ↻ weekly reset
-# Line 2: ctx bar | 5h bar | week bar | Fable bar  (10-char bars, one line)
+# Line 2: ctx bar | 5h bar | week bar | Fable bar  (10-char bars, one line;
+#         5h is left out when the plan has no 5-hour window, e.g. Ultra)
 # Line 3+: one compact line per OTHER cswap account (limits + weekly reset)
 #
 # Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
@@ -76,6 +77,9 @@ fi
 five_hour=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
 fable_pct=""
+no_five_hour=""
+# stdin carries rate_limits but no five_hour window at all -> same meaning.
+echo "$input" | jq -e '(.rate_limits | type == "object") and (.rate_limits.five_hour == null)' >/dev/null 2>&1 && no_five_hour=1
 usage_age=""
 week_reset_epoch=""
 fable_seq="${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}"
@@ -100,6 +104,8 @@ if command -v jq >/dev/null 2>&1 && [ -r "$fable_seq" ] && [ -r "$fable_cache" ]
     week_reset_epoch=$(printf '%s' "$cache_vals" | cut -f4)
     # Cache wins when it has a value: per-account-correct beats per-response-stale.
     case "$c5" in ''|null) : ;; *) five_hour="$c5" ;; esac
+    # Cache answered for this account but has no 5h value: the plan has no window.
+    [ -n "$cache_vals" ] && { [ -z "$c5" ] || [ "$c5" = "null" ]; } && no_five_hour=1
     case "$c7" in ''|null) : ;; *) seven_day="$c7" ;; esac
     case "$cf" in ''|null) : ;; *) fable_pct="$cf" ;; esac
     cache_mtime=$(stat -f %m "$fable_cache" 2>/dev/null)
@@ -348,7 +354,9 @@ other_accounts_lines() {
       local nm="${part%%|*}" rest="${part#*|}" pc re
       pc="${rest%%|*}"; re="${rest#*|}"
       case "$re" in ''|*[!0-9]*) : ;; *) [ "$re" -le "$now" ] && pc=0 ;; esac
-      if [ -z "$pc" ] || [ "$pc" = "null" ]; then
+      if { [ -z "$pc" ] || [ "$pc" = "null" ]; } && [ "$nm" = "5h" ]; then
+        continue   # no 5-hour window on this plan (e.g. Ultra): leave it out
+      elif [ -z "$pc" ] || [ "$pc" = "null" ]; then
         seg="$seg ${DIM}${nm} n/a${RESET}"
       else
         seg="$seg ${nm} $(fmt_pct "$pc")"
@@ -411,11 +419,26 @@ if [ -n "$cwd" ] && git -C "$cwd" --no-optional-locks rev-parse --is-inside-work
   fi
 fi
 
-# Count live Claude Code CLI processes (macOS pgrep exact-name match).
-# Fall back to 1 if pgrep is unavailable or matches nothing (this session exists).
+# Count live Claude Code sessions. Primary source: Claude Code's own registry,
+# ~/.claude/sessions/<pid>.json, counting only pids that are still a running
+# `claude` (guards against stale files and pid reuse). A bare `pgrep -x claude`
+# over-counts: helpers such as `claude --chrome-native-host` share the name.
+# Fallback (no registry): pgrep, minus those helpers. Floor of 1 (this session).
 session_count=0
-if command -v pgrep >/dev/null 2>&1; then
-  session_count=$(pgrep -x claude 2>/dev/null | wc -l | tr -d '[:space:]')
+sess_dir="${SWAP_SESSIONS_DIR:-$HOME/.claude/sessions}"
+sess_pids=""
+for f in "$sess_dir"/*.json; do
+  [ -e "$f" ] || continue
+  p="${f##*/}"; p="${p%.json}"
+  # Digits only, and within macOS's pid range: one bad id makes ps print nothing.
+  case "$p" in ''|*[!0-9]*|??????*) continue ;; esac
+  sess_pids="$sess_pids${sess_pids:+,}$p"
+done
+if [ -n "$sess_pids" ]; then
+  session_count=$(ps -o comm= -p "$sess_pids" 2>/dev/null | awk '{n=split($0,a,"/")} a[n]=="claude"' | wc -l | tr -d '[:space:]')
+elif command -v pgrep >/dev/null 2>&1; then
+  # -a: macOS pgrep otherwise skips its own ancestors, i.e. this very session.
+  session_count=$(pgrep -a -lf -x '(.*/)?claude( .*)?' 2>/dev/null | grep -vc -- '--chrome-native-host')
 fi
 case "$session_count" in
   ''|*[!0-9]*) session_count=0 ;;
@@ -445,7 +468,13 @@ if [ -n "$account_seg" ]; then
 fi
 
 # --- Line 2: usage bars, all on one line ---
-line2="$(render_bar "ctx" "$ctx_used") | $(render_bar "5h" "$five_hour") | $(render_bar "week" "$seven_day") | $(render_bar "Fable" "$fable_pct")"
+# The 5h bar is left out when the account has no 5-hour window: plans without
+# one (Ultra) report five_hour as null. Unknown usage (no cache, no response yet)
+# still renders "5h n/a" like week/Fable.
+line2="$(render_bar "ctx" "$ctx_used")"
+if [ -z "$five_hour" ] && [ -n "$no_five_hour" ]; then :
+else line2="$line2 | $(render_bar "5h" "$five_hour")"; fi
+line2="$line2 | $(render_bar "week" "$seven_day") | $(render_bar "Fable" "$fable_pct")"
 # Honest-staleness marker: if the usage cache is >10 min old despite the
 # refresher (cswap gone, network down), say so instead of showing stale
 # numbers as if they were live.
