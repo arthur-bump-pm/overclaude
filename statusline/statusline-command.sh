@@ -72,7 +72,7 @@ fi
 # rate_limits describe whichever account served this session's LAST response —
 # wrong right after a swap and frozen in idle sessions. The cache is
 # per-account-correct the moment a swap lands, and the debounced async
-# refresher below keeps it <= ~5 min old whenever any statusline is rendering.
+# refresher below requests a poll when a subscription observation nears expiry.
 # stdin values remain the fallback when the cache is missing/corrupt.
 five_hour=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
@@ -118,25 +118,11 @@ if [ -z "$week_reset_epoch" ]; then
   week_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty | if type == "number" then floor | tostring else empty end' 2>/dev/null) || week_reset_epoch=""
 fi
 
-# --- Debounced async usage refresh ---
-# If the cache is older than 300s, kick ONE detached `cswap list --json`
-# (side effect: it refetches + rewrites the usage cache). The RENDER path
-# still never waits on cswap: the call is backgrounded, and the lock file is a
-# pure RATE-LIMITER — touched at spawn, never removed, aged out after 60s — so
-# a persistently-failing refresh (network down) attempts at most once a minute
-# instead of every render. Concurrent same-second spawns are tolerated (cswap
-# serializes on its own .usage.lock). SWAP_NO_REFRESH=1 disables (tests).
-if [ -z "${SWAP_NO_REFRESH:-}" ] && command -v cswap >/dev/null 2>&1; then
-  if [ -z "$usage_age" ] || [ "$usage_age" -gt 300 ]; then
-    refresh_lock="${SWAP_REFRESH_LOCK:-$HOME/.claude-swap-backup/cache/.statusline-refresh.lock}"
-    lock_m=$(stat -f %m "$refresh_lock" 2>/dev/null || echo 0)
-    case "$lock_m" in ''|*[!0-9]*) lock_m=0 ;; esac
-    if [ $(( $(date +%s) - lock_m )) -gt 60 ]; then
-      mkdir -p "$(dirname "$refresh_lock")" 2>/dev/null
-      touch "$refresh_lock" 2>/dev/null
-      ( cswap list --json >/dev/null 2>&1 ) >/dev/null 2>&1 &
-    fi
-  fi
+# Shared per-account refresh gate; it starts cswap asynchronously and respects
+# cswap's poll plans and backoff. The route decision itself remains read-only.
+if [ -z "${SWAP_NO_REFRESH:-}" ]; then
+  refresh_sg="${SWAP_GUARD_CMD:-$HOME/.local/bin/swap-guard}"
+  [ -x "$refresh_sg" ] && "$refresh_sg" usage-refresh </dev/null >/dev/null 2>&1
 fi
 
 # ANSI styles

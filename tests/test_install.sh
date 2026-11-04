@@ -35,6 +35,8 @@ assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")" "my-own-hook" 
 assert_eq "$(jq -r '.model' "$S")" "opus" "unrelated settings survive"
 assert_eq "$([ -x "$HOME/.local/bin/swap-guard" ] && echo yes)" "yes" "swap-guard installed"
 
+assert_eq "$([ -x "$HOME/.local/bin/overclaude-codex-continue" ] && echo yes)" "yes" "Codex continuation runner installed"
+
 KA="$HOME/Library/LaunchAgents/com.overclaude.keepalive.plist"
 assert_eq "$([ -f "$KA" ] && echo yes)" "yes" "install turns the keepalive agent on"
 assert_contains "$(cat "$HOME/i1.log")" "keepalive agent on" "and says so"
@@ -94,5 +96,6 @@ assert_eq "$(cat "$HOME/dotfiles/zshrc")" "$(printf 'export EDITOR=vim\nalias gs
 assert_eq "$([ -L "$HOME/.zshrc" ] && echo link)" "link" "uninstall keeps the symlink"
 assert_eq "$(stat -f %Lp "$HOME/dotfiles/zshrc")" "600" "and the file mode"
 
+assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-continue" ] && echo present || echo gone)" "gone" "Codex continuation runner removed"
 rm -rf "$HOME"
 finish

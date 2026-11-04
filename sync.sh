@@ -36,7 +36,8 @@ BEGIN_MARKER='# --- claude-swap integration (begin) ---'
 END_MARKER='# --- claude-swap integration (end) ---'
 
 # live-path:repo-path pairs (bash 3.2: newline list, no assoc arrays)
-PAIRS="$HOME/.local/bin/swap-guard:bin/swap-guard
+PAIRS="$HOME/.local/bin/overclaude-codex-continue:bin/overclaude-codex-continue
+$HOME/.local/bin/swap-guard:bin/swap-guard
 $HOME/.claude/skills/swap/SKILL.md:skills/swap/SKILL.md
 $HOME/.claude/skills/handoff/SKILL.md:skills/handoff/SKILL.md
 $HOME/.claude/hooks/handoff-inject.sh:hooks/handoff-inject.sh

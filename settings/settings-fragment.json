@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cswap *)",
-      "Bash(swap-guard *)"
+      "Bash(swap-guard *)",
+      "Bash(overclaude-codex-continue *)"
     ]
   },
   "hooks": {

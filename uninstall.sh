@@ -72,6 +72,7 @@ fi
 echo "-- files --"
 for p in \
   "$LOCALBIN/swap-guard" \
+  "$LOCALBIN/overclaude-codex-continue" \
   "$CLAUDE_DIR/skills/swap/SKILL.md" \
   "$CLAUDE_DIR/skills/handoff/SKILL.md" \
   "$CLAUDE_DIR/hooks/handoff-inject.sh" \
@@ -167,7 +168,7 @@ else
         "~/.local/bin/swap-guard ratelimit", "~/.local/bin/swap-guard artifact-log",
         "~/.local/bin/swap-guard route-guard"]) as $ours
     | (if (.permissions.allow) != null then
-         .permissions.allow |= map(select(. != "Bash(cswap *)" and . != "Bash(swap-guard *)"))
+         .permissions.allow |= map(select(. != "Bash(cswap *)" and . != "Bash(swap-guard *)" and . != "Bash(overclaude-codex-continue *)"))
        else . end)
     | (if (.hooks | type) == "object" then
          .hooks |= with_entries(.value |= (if type == "array"

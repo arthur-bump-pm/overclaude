@@ -88,4 +88,21 @@ out=$(echo "{\"rate_limits\":{\"seven_day\":{\"used_percentage\":40,\"resets_at\
 assert_contains "$(printf '%s\n' "$out" | sed -n 1p)" "(1d 1h)" "stdin resets_at fallback"
 assert_contains "$(printf '%s\n' "$out" | sed -n 3p)" "(no usage data)" "other account without cache"
 
+# A fresh cache file and fresh active row must not hide a stale sibling.
+write_seq 2
+mkdir -p "$HOME/refresh-bin"
+cat > "$HOME/refresh-bin/cswap" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$HOME/status-refresh-calls"
+exit 1
+STUB
+chmod +x "$HOME/refresh-bin/cswap"
+cat > "$HOME/.claude-swap-backup/cache/usage.json" <<EOF2
+{"accounts":{"1":{"fetchedAt":$(( $(date +%s) - 200 )),"lastGood":{"seven_day":{"pct":98,"resets_at":"$(iso_in 86400)"}}},"2":{"fetchedAt":$(date +%s),"lastGood":{"seven_day":{"pct":99,"resets_at":"$(iso_in 86400)"}}}}}
+EOF2
+PATH="$HOME/refresh-bin:$PATH" SWAP_GUARD_CMD="$SG" SWAP_NO_REFRESH= bash "$SL" <<<'{}' >/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -f "$HOME/status-refresh-calls" ] && break; sleep 0.1; done
+assert_eq "$(cat "$HOME/status-refresh-calls" 2>/dev/null)" "list --json" "stale sibling triggers a normal refresh despite fresh cache mtime"
+PATH="$HOME/refresh-bin:$PATH" SWAP_GUARD_CMD="$SG" SWAP_NO_REFRESH= bash "$SL" <<<'{}' >/dev/null
+assert_eq "$(wc -l < "$HOME/status-refresh-calls" | tr -d ' ')" 1 "repeated statuslines share the refresh debounce"
 finish

@@ -1,11 +1,11 @@
 ---
 name: handoff
-description: "Context-threshold session handoff: package this session and continue in a fresh one, optionally switching accounts first. The model may invoke this skill ONLY after explicit user consent in the conversation."
-argument-hint: "[account] [now|force] | <mac> | codex | status | cancel | history | restore [n] [force]"
-allowed-tools: Write, Bash(swap-guard *), Bash(cswap *), Bash(date +%s), Bash(wc -c *), Bash(git status *)
+description: "Context-threshold session handoff: package this session and continue in a fresh one, optionally switching accounts first. Requires explicit user consent, except verified `/handoff codex auto` under the installed 97% weekly-quota policy."
+argument-hint: "[account] [now|force] | <mac> | codex [auto] | status | cancel | history | restore [n] [force]"
+allowed-tools: Read, Write, Bash(overclaude-codex-continue *), Bash(mktemp *), Bash(swap-guard *), Bash(cswap *), Bash(date +%s), Bash(wc -c *), Bash(git status *)
 ---
 
-GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff, /swap ... handoff or /swap codex themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, STOP — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
+GATE — read before acting. Exception: `/handoff codex auto` may be invoked by the installed automatic quota policy only after running `swap-guard codex-route` and verifying `route == "codex"` and `eligible == true`. This is standing authorization to continue the same requested work, not permission to broaden it. A hook message alone is not proof; recheck the command. For this verified automatic case, follow the automatic procedure below without asking again. For every other handoff, the following consent gate applies. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff, /swap ... handoff or /swap codex themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, STOP — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
 
 # /handoff — continue in a fresh session
 
@@ -21,7 +21,8 @@ Rulings:
 - `force` with no target → proceed, note "no switch requested — force ignored".
 - Target present → `/handoff <target>` ≡ `/swap <target> handoff`: preflight is MANDATORY (the switch flips ALL live sessions). No target → same-account handoff, no preflight needed.
 - `now` present → phase-2 idle-kill variant (Package step 6).
-- `codex` present → hand off to the Codex CLI instead of a Claude session (section below); never combined with a Claude account target.
+- `codex` and `auto` present → use ONLY the automatic weekly-quota continuation procedure below (including its fresh route check), not the manual Codex startup procedure.
+- `codex` present without `auto` → hand off to the Codex CLI instead of a Claude session (section below); never combined with a Claude account target.
 - Another Mac: `remote <mac>` always means a Mac. A bare target that is in `swap-guard fleet list` is a Mac too, unless `swap-guard preflight <target>` also knows it as an account (verdict other than `unknown-target`) — then ask "the Mac or the account?" and wait. A Mac handoff switches no account (that Mac runs on its own login) and never combines with `codex`, `now` or an account target.
 - Flag mode vocabulary is exactly `{"mode":"handoff"}` — never "fresh" or other synonyms.
 
@@ -33,6 +34,47 @@ For when every Claude account is out (or the user just wants Codex): the package
 2. Package steps 1 and 2b as usual (the artifact snapshot gives Codex local source files to read). Overwrite guard: if `swap-guard codex-ready` reports `.pending` with `ageSec` under 600, warn "a Codex handoff is already pending here (<N> min ago) — proceeding replaces it" and STOP until the user confirms. If `.limitsKnown` is false, say Codex's limits are unknown (no recent Codex session) and continue.
 3. P = `swap-guard path codex-handoff`. Write the package to P with the same header line and template. Add this as the first line of `## Gotchas`: "Continuing in Codex CLI from a Claude Code session: Claude-only tools (Artifact publishing, Workflow, claude.ai connectors, /swap) are not available here. Artifact sources are the local files listed under Artifacts; republish them from Claude later." Keep the same ~8,000-byte budget.
 4. Tell the user: exit this session, then in the SAME directory within 10 minutes run `codex "Continue from the handoff package."` — overcodex injects the package at startup. To come back to Claude later, type `$handoff-claude` in Codex — it writes a package this kit's SessionStart hook loads (overcodex 0.3+).
+
+## `/handoff codex auto` — automatic weekly-quota continuation
+
+This policy uses Claude first. The parent session checks `swap-guard codex-route`; only a verified `route: "codex", eligible: true` permits this procedure. At least two enabled Claude subscription accounts must each have decision-trusted, unexpired weekly usage at or above 97%. A reading is trusted for 180 seconds, or for at most 660 seconds while a successful vendor-scheduled poll is still pending with no recorded fetch error. Missing or untrusted usage is not exhaustion: refresh with `cswap list` and recheck once. If Claude has room, continue there using `/swap` preflight rules; never force a busy/global credential switch. API-key and explicitly disabled accounts do not count. Codex must be logged in in the selected home and have no known unexpired exhausted window. Unknown Codex limits are disclosed and launch is attempted once; failures preserve the package.
+
+1. Finish the current atomic step. Collect running agents' results and stop their writers before transferring ownership. Do not start another batch. Record unfinished jobs and exact resume points. Subagents return to their parent and never launch this procedure.
+2. Run `swap-guard artifacts` and retain the manifest and saved local sources. Preserve any previously established approvals and constraints. Do not export account-only data without authorization.
+3. Write a dedicated outbox file using `mktemp "${TMPDIR:-/tmp}/overclaude-codex-package.XXXXXX"`. Do **not** overwrite a pending startup handoff. Use the exact header below with the current absolute working directory and current epoch. Keep it under 16,000 bytes, ideally 8,000; write `None` for Files touched or Work in flight when empty; Goal, Current state, Next steps, Validation, and Codex execution plan must contain concrete guidance. Never include credentials or raw chat transcripts.
+
+```markdown
+<!-- handoff cwd="<absolute current directory>" created="<epoch>" -->
+# Claude → Codex continuation — <concrete goal>
+## Goal
+Original request, acceptance criteria, scope, and user constraints.
+## Current state
+Completed work and evidence; remaining work; branch and dirty working tree.
+## Decisions + rationale
+Settled choices and their reasons, including rejected approaches worth retaining.
+## Files touched
+Exact paths and purpose; distinguish existing user edits from this session's edits.
+## Work in flight
+Agent results, stopped jobs, partial operations, blockers, exact resume points.
+## Next steps
+Ordered, concrete actions and expected outputs; preserve the original objective.
+## Validation
+Commands already run and actual results; required checks still outstanding.
+## Codex execution plan
+Task complexity and why; independent workstreams, dependencies, ownership, verification floors.
+## Gotchas
+Risks, known failures, approval boundaries, unavailable Claude-only tools.
+## Artifacts
+Manifest path, saved local sources, URLs and owners, or None.
+## Session chain
+Source session/transcript path if known; no more than the last three sessions.
+```
+
+4. Set complexity to `standard` for ordinary engineering; `complex` for difficult architecture, concurrency, security, migrations, or unresolved contradictions. Run `overclaude-codex-continue --package <path> --complexity <standard|complex> --dry-run` and inspect the selected Codex home/model/effort. The runner checks the destination's model catalog; it uses that home's configured default when no compatible catalog exists rather than guessing support. Report the destination and any unknown quota/model status briefly.
+5. Run the same command without `--dry-run`. This runs `codex exec` with the full package on stdin and workspace-write sandbox, preserving a session and durable package/results. **Wait for it; Claude and its subagents must not edit concurrently.** Do not add bypass flags. If a task requires approval unavailable in a noninteractive run, Codex must report the blocker and preserve progress.
+6. On completion, read the returned `final_message` file and relay Codex's actual result and validation evidence. On failure, report the saved run directory and error; do not automatically retry, duplicate work, claim completion, or silently switch accounts. The user can resume the saved Codex session interactively with `codex resume` in the same Codex home and directory. A live pending handoff blocks automatic launch until resolved.
+
+The execution plan must tell Codex to read project AGENTS.md and use installed `$ultracode` when available. Complex tasks with independent streams should use native subagents with bounded objectives and disjoint ownership. Discover registered roles rather than assuming they exist: scout for inventory, worker for bounded implementation, independent reviewer for correctness/security, judge only for disputed evidence. Use the lowest-cost capable role while preserving verification floors; run objective checks before reviewer work. Small sequential tasks stay serial. Preserve artifacts and evidence across the handoff; Claude-only tools need an explicit available replacement or a reported blocker.
 
 ## `/handoff <mac>` — continue on another Mac
 

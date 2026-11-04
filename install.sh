@@ -43,6 +43,7 @@ echo
 # ---------------------------------------------------------------------------
 for f in \
   "$SCRIPT_DIR/bin/swap-guard" \
+  "$SCRIPT_DIR/bin/overclaude-codex-continue" \
   "$SCRIPT_DIR/skills/swap/SKILL.md" \
   "$SCRIPT_DIR/skills/handoff/SKILL.md" \
   "$SCRIPT_DIR/hooks/handoff-inject.sh" \
@@ -169,6 +170,7 @@ install_file() {
 # 2. File copies.
 # ---------------------------------------------------------------------------
 echo "-- files --"
+install_file "$SCRIPT_DIR/bin/overclaude-codex-continue" "$LOCALBIN/overclaude-codex-continue" 755
 install_file "$SCRIPT_DIR/bin/swap-guard"                 "$LOCALBIN/swap-guard"                 755
 install_file "$SCRIPT_DIR/skills/swap/SKILL.md"           "$CLAUDE_DIR/skills/swap/SKILL.md"     -
 install_file "$SCRIPT_DIR/skills/handoff/SKILL.md"        "$CLAUDE_DIR/skills/handoff/SKILL.md"  -

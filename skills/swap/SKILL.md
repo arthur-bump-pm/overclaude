@@ -122,7 +122,7 @@ Off by default. A StopFailure hook (`swap-guard server-retry --hook`, matcher `s
 - `retry on` / `retry off` → `swap-guard server-retry on|off`; `retry` alone → `swap-guard server-retry status`.
 
 ### Checkpoint before the limit (`/swap auto checkpoint [on|off]`)
-On by default. A PostToolUse hook (`swap-guard checkpoint --hook`) tells a running session once, mid-run, when the active account crosses its line (5-hour window 90%, week 95%, a per-model limit such as Fable 90%): finish the current step, save progress so the work can resume, and don't start a new batch of subagents; a subagent is told to return its result. Paired with the auto-swap at a 95% threshold (`swap-guard auto install --threshold 95`), switches land between tasks, and the instant swap still catches anything that reaches 100%.
+On by default. A PostToolUse hook (`swap-guard checkpoint --hook`) tells a running session once, mid-run, when the active account crosses its line (5-hour window 90%, week 95%, a per-model limit such as Fable 90%): finish the current step, save progress so the work can resume, and don't start a new batch of subagents; a subagent is told to return its result. Paired with the auto-swap at a 97% threshold (`swap-guard auto install --threshold 97`), switches land between tasks, and the instant swap still catches anything that reaches 100%.
 - `checkpoint on` / `checkpoint off` → `swap-guard checkpoint on|off`; `checkpoint` alone → `swap-guard checkpoint status`.
 
 ### Loop guard (`/swap auto loop [on|off]`)
@@ -200,3 +200,7 @@ If `swap-guard whoami` reports `.entrypoint == "claude-vscode"`:
 
 - Active account hard-limited (this session cannot complete even the /swap turn): tell the user to run `swap <target>` (shell alias for `cswap switch`) in ANY terminal; all live sessions adopt the new credential within ~30 s.
 - Target token dead (preflight `relogin-required`): `/swap relogin <N>` (or `swap-guard login <N>` in a terminal), then retry the swap. Never a plain `/login`.
+
+## Claude-first weekly fallback
+
+At 97% weekly use, prefer another enabled Claude subscription account below 97%, using the mandatory preflight recipe and preserving busy/login guards. Do not force a global credential switch. Only when `swap-guard codex-route` verifies every eligible Claude subscription account is at least 97% may the parent invoke `/handoff codex auto` under the standing quota policy. Unknown or stale Claude usage requires a refresh, not a Codex fallback. This policy transfers the same task with a structured package and waits for Codex to finish; it does not authorize unrelated work.

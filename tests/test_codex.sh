@@ -7,7 +7,7 @@ NOW=$(date +%s)
 roll() { # roll <codex-home> <json-rate_limits>
   local d="$1/sessions/2026/10/09"; mkdir -p "$d"
   { echo '{"type":"session_meta","payload":{}}'
-    printf '{"timestamp":"2026-10-09T07:00:30.216Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":%s}}\n' "$2"
+    printf '{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":%s}}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2"
   } > "$d/rollout-2026-10-09T15-00-00-abc.jsonl"
 }
 roll "$HOME/.codex" "{\"primary\":{\"used_percent\":18.0,\"window_minutes\":10080,\"resets_at\":$((NOW + 200000))},\"secondary\":{\"used_percent\":40.0,\"window_minutes\":300,\"resets_at\":$((NOW + 3600))},\"plan_type\":\"pro\",\"rate_limit_reached_type\":null}"
@@ -46,6 +46,7 @@ STUB="$HOME/stubbin"; mkdir -p "$STUB"
 cat > "$STUB/codex" <<'EOF'
 #!/bin/bash
 # stub: record args + CODEX_HOME; write the -o file; optional slow mode for the timeout test
+if [ "$1 $2" = "login status" ]; then [ -z "${STUB_LOGIN_FAIL:-}" ]; exit $?; fi
 if [ "$1 $2" = "mcp list" ]; then
   [ -n "${STUB_MCP_FAIL:-}" ] && exit 1
   def='[{"name":"playwright"},{"name":"refero"}]'; printf '%s\n' "${STUB_MCP-$def}"; exit 0
@@ -65,6 +66,20 @@ mkdir -p "$HOME/.codex-accounts/work/hooks"; touch "$HOME/.codex-accounts/work/h
 assert_contains "$("$SG" codex-ready | jq -r .detail)" "at its week limit" "not ready: that Codex account is exhausted"
 echo primary > "$HOME/.codex-accounts/.active"; mkdir -p "$HOME/.codex/hooks"; touch "$HOME/.codex/hooks/overcodex-handoff-inject.sh"
 assert_eq "$("$SG" codex-ready | jq -r .ready)" "true" "ready: CLI + hook + room"
+# A reached indicator applies to its own window, not the other window's reset.
+roll "$HOME/.codex" "{\"primary\":{\"used_percent\":100,\"window_minutes\":10080,\"resets_at\":$((NOW - 1))},\"secondary\":{\"used_percent\":10,\"window_minutes\":300,\"resets_at\":$((NOW + 3600))},\"rate_limit_reached_type\":\"primary\"}"
+assert_eq "$("$SG" codex-ready | jq -r .ready)" true "expired primary indicator does not borrow secondary reset"
+roll "$HOME/.codex" "{\"primary\":{\"used_percent\":10,\"window_minutes\":10080,\"resets_at\":$((NOW + 3600))},\"secondary\":{\"used_percent\":100,\"window_minutes\":300,\"resets_at\":$((NOW - 1))},\"rate_limit_reached_type\":\"secondary\"}"
+assert_eq "$("$SG" codex-ready | jq -r .ready)" true "expired secondary indicator does not borrow primary reset"
+roll "$HOME/.codex" "{\"primary\":{\"used_percent\":100,\"window_minutes\":10080,\"resets_at\":$((NOW - 1))},\"secondary\":{\"used_percent\":100,\"window_minutes\":300,\"resets_at\":$((NOW + 3600))},\"rate_limit_reached_type\":\"primary\"}"
+assert_eq "$("$SG" codex-ready | jq -r .ready)" false "other unexpired 100% window blocks"
+roll "$HOME/.codex" "{\"primary\":{\"used_percent\":18,\"window_minutes\":10080,\"resets_at\":$((NOW + 200000))}}"
+roll "$HOME/.codex" "{\"primary\":{\"used_percent\":\"10\",\"window_minutes\":300,\"resets_at\":$((NOW + 3600))},\"rate_limit_reached_type\":\"none\"}"
+assert_eq "$("$SG" codex-ready | jq -r .ready)" true "invalid string percent and none marker do not imply exhaustion"
+assert_eq "$("$SG" codex-ready | jq -r .limitsKnown)" false "invalid percent is unknown"
+roll "$HOME/.codex" "{\"primary\":{\"used_percent\":{},\"window_minutes\":300,\"resets_at\":$((NOW + 3600))},\"rate_limit_reached_type\":\"future_kind\"}"
+assert_eq "$("$SG" codex-ready | jq -r .ready)" true "invalid object percent and unknown marker do not imply exhaustion"
+assert_eq "$("$SG" codex-ready | jq -r .limitReached)" future_kind "unknown indicator is exposed"
 p="$("$SG" path codex-handoff)"; echo x > "$p"
 assert_eq "$("$SG" codex-ready | jq -r '.pending.path')" "$p" "codex-ready reports a pending Codex package (overwrite guard)"
 rm -f "$p"

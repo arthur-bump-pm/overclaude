@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Launch a durable Codex continuation from a dedicated handoff package."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+import uuid
+
+HEADINGS = ('Goal', 'Current state', 'Files touched', 'Work in flight', 'Next steps', 'Validation', 'Codex execution plan')
+HARNESS = '''\n\nContinue the work described above. Follow AGENTS.md instructions. Use the installed $ultracode skill if available, or explicit bounded native subagent delegation for complex independent streams, using only available registered roles. Run objective verification, then independent review for auth, concurrency, or money changes. Maintain the goal, state, and test evidence. Avoid overlapping parent and worker writers; the parent must wait for workers.\n'''
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def route():
+    try:
+        result = subprocess.run(['swap-guard', 'codex-route'], capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        home = data['codex']['home']
+        if data.get('route') != 'codex' or data.get('eligible') is not True:
+            fail('codex route declined or ineligible')
+        if not isinstance(home, str) or not os.path.isabs(home):
+            fail('route returned an invalid Codex home')
+        return os.path.realpath(home), data['codex']
+    except (OSError, subprocess.CalledProcessError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        fail('cannot establish Codex route: ' + str(exc))
+
+
+def package(path, cwd):
+    # Open with no symlink following, then inspect the actual opened inode.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16000:
+            fail('package must be a regular file of at most 16000 bytes')
+        raw = stream.read(16001)
+    if len(raw) > 16000:
+        fail('package exceeds 16000 bytes')
+    content = raw.decode('utf-8')
+    lines = content.splitlines()
+    match = re.fullmatch(r'<!-- handoff cwd="(.*)" created="([0-9]+)" -->', lines[0] if lines else '')
+    if not match or match.group(1) != cwd:
+        fail('package header does not match current cwd')
+    age = time.time() - int(match.group(2))
+    if age < 0 or age > 600:
+        fail('package is stale or has a future timestamp')
+    sections = {}
+    current = None
+    for line in lines[1:]:
+        heading = re.match(r'^#{1,6}\s+(.+?)\s*#*\s*$', line)
+        if heading:
+            current = heading.group(1).strip().lower()
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(line)
+    for heading in HEADINGS:
+        value = '\n'.join(sections.get(heading.lower(), [])).strip()
+        meaningful = re.sub(r'(?im)<!--.*?-->|\b(?:todo|tbd|none|n/?a|placeholder)\b|[\s\W_]+', '', value)
+        explicit_none = heading in ('Files touched', 'Work in flight') and re.fullmatch(r'(?i)none[.]?', value)
+        if not meaningful and not explicit_none:
+            fail('missing or empty section: ' + heading)
+    return raw
+
+
+def model_for(home, complexity):
+    choices = [('gpt-6.1-sol', 'high'), ('gpt-6-sol', 'high'), ('gpt-6-astra', 'high')] if complexity == 'standard' else [('gpt-6-astra', 'xhigh'), ('gpt-6.1-sol', 'xhigh'), ('gpt-6-sol', 'xhigh')]
+    try:
+        data = json.loads((Path(home) / 'models_cache.json').read_text())
+        models = data['models']
+        for slug, effort in choices:
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                levels = model.get('supported_reasoning_levels')
+                if model.get('slug') == slug and isinstance(levels, list) and any(isinstance(level, dict) and level.get('effort') == effort for level in levels):
+                    return slug, effort, 'supported by selected home catalog'
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None, None, 'no compatible model and effort in selected home catalog; using configured Codex default'
+
+
+def pending_conflict(home, digest):
+    p = Path(home) / 'overcodex' / ('handoff-pending-' + digest + '.md')
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        fail('cannot safely inspect pending Codex handoff: ' + str(exc))
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            fail('pending Codex handoff is not a regular file: ' + str(p))
+        # Inspect only a bounded header; malformed headers fall back to mtime.
+        first = stream.readline(16001)
+        created = info.st_mtime
+        try:
+            header = re.fullmatch(r'<!-- handoff cwd="(.*)" created="([0-9]+)" -->',
+                                  first.decode('utf-8').rstrip('\r\n'))
+            if header and header.group(1) == os.getcwd():
+                created = int(header.group(2))
+        except UnicodeError:
+            pass
+        if time.time() - created < 600:
+            fail('fresh pending Codex handoff conflicts with continuation: ' + str(p))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--package', required=True)
+    parser.add_argument('--complexity', choices=('standard', 'complex'), default='standard')
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args()
+    os.umask(0o077)
+    cwd = os.getcwd()
+    digest = hashlib.sha256(cwd.encode()).hexdigest()[:12]
+    raw = package(args.package, cwd)
+    home, route_details = route()
+    pending = Path(home) / 'overcodex' / ('handoff-pending-' + digest + '.md')
+    if os.path.abspath(args.package) == str(pending):
+        fail('package must be a dedicated outbox file, not the pending handoff')
+    pending_conflict(home, digest)
+    model, effort, reason = model_for(home, args.complexity)
+    limits_known = route_details.get('limitsKnown')
+    limits_fresh = route_details.get('limitsFresh')
+    uncertainty = None if limits_known is True and limits_fresh is True else 'Codex usage limits are unknown or stale.'
+    plan = {'limitsKnown': limits_known, 'limitsFresh': limits_fresh, 'uncertainty': uncertainty, 'cwd': cwd, 'codex_home': home, 'complexity': args.complexity, 'model': model, 'effort': effort, 'model_reason': reason, 'dry_run': args.dry_run}
+    if args.dry_run:
+        print(json.dumps(plan))
+        return 0
+    root = Path(home) / 'overcodex' / 'continuations' / digest
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    lock_root = Path.home() / '.claude-swap-backup' / 'continuations'
+    lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(lock_root, 0o700)
+    lock_path = lock_root / (digest + '.lock')
+    with lock_path.open('a') as lock:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail('another continuation is already running for this cwd')
+        run = root / (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + uuid.uuid4().hex)
+        run.mkdir(mode=0o700)
+        print('Continuation output: ' + str(run), file=sys.stderr, flush=True)
+        def write(name, content):
+            path = run / name
+            path.write_text(content, encoding='utf-8')
+            os.chmod(path, 0o600)
+        write('package.md', raw.decode('utf-8'))
+        plan['output_dir'] = str(run)
+        write('plan.json', json.dumps(plan, indent=2) + '\n')
+        write('state.json', json.dumps({'state': 'prepared', 'exit_code': None}) + '\n')
+        command = ['codex', 'exec', '-s', 'workspace-write', '-C', cwd, '--skip-git-repo-check', '--color', 'never', '-o', str(run / 'last-message.md')]
+        if model:
+            command += ['-m', model, '-c', 'model_reasoning_effort="' + effort + '"']
+        command.append('-')
+        env = os.environ.copy()
+        env['CODEX_HOME'] = home
+        try:
+            # Verify all launch-sensitive state again while holding the lock.
+            if route()[0] != home:
+                fail('Codex home changed before launch')
+            pending_conflict(home, digest)
+            if package(args.package, cwd) != raw:
+                fail('package changed before launch')
+            with (run / 'events.log').open('w') as events, (run / 'stderr.log').open('w') as errors:
+                os.chmod(run / 'events.log', 0o600)
+                os.chmod(run / 'stderr.log', 0o600)
+                child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=events, stderr=errors, env=env, start_new_session=True)
+                try:
+                    child.communicate(raw + HARNESS.encode())
+                except BaseException:
+                    # Repeated termination signals must not interrupt cleanup. The
+                    # leader can exit before a descendant that ignored SIGTERM.
+                    previous = {sig: signal.signal(sig, signal.SIG_IGN)
+                                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+                    try:
+                        try:
+                            os.killpg(child.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            child.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        child.wait()
+                    finally:
+                        for sig, handler in previous.items():
+                            signal.signal(sig, handler)
+                    raise
+            code = child.returncode
+            write('state.json', json.dumps({'state': 'completed' if code == 0 else 'failed', 'exit_code': code}) + '\n')
+        except BaseException:
+            write('state.json', json.dumps({'state': 'failed', 'exit_code': None}) + '\n')
+            raise
+        print(json.dumps({'output_dir': str(run), 'final_message': str(run / 'last-message.md'), 'exit_code': code, 'model_reason': reason}))
+        if code:
+            print('Continuation failed; inspect the output and use codex resume if appropriate.', file=sys.stderr)
+        return code if code >= 0 else 128 - code
+
+
+class Terminated(Exception):
+    pass
+
+
+def handle_termination(signum, _frame):
+    raise Terminated(signum)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGHUP, handle_termination)
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, UnicodeError) as exc:
+        print('overclaude-codex-continue: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
+    except Terminated as exc:
+        print('Continuation interrupted; inspect its output and use codex resume if appropriate.', file=sys.stderr)
+        sys.exit(128 + exc.args[0])
+    except KeyboardInterrupt:
+        print('Continuation interrupted; inspect its output and use codex resume if appropriate.', file=sys.stderr)
+        sys.exit(130)

@@ -48,7 +48,7 @@ assert_contains "$out" "out of quota until the reset" "5h at 100% → account ou
 assert_absent "$out" "/handoff codex" "another Claude account has room → swap there, not Codex"
 cache 100 70 20 "" '"lastError":"invalid_grant","authDeadStrikes":1,'
 rm -f "$HOME/.claude-swap-backup/ctx/s1.budget"
-assert_contains "$(PATH="$STUBB:$PATH" hook)" "/handoff codex" "whole account out and no Claude account usable → suggest Codex"
+assert_absent "$(PATH="$STUBB:$PATH" hook)" "/handoff codex" "a dead account with unknown weekly usage does not authorize Codex"
 
 cache 10 50 82 "" '"lastError":"invalid_grant","authDeadStrikes":1,'
 rm -f "$HOME/.claude-swap-backup/ctx/s9.budget"

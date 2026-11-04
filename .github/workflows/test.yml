@@ -42,7 +42,7 @@ jobs:
           python3 -m pip install --quiet build
           python3 -m build --wheel --outdir dist/ >/dev/null
           whl=$(ls dist/*.whl)
-          for f in install.sh uninstall.sh doctor.sh bin/swap-guard hooks/handoff-inject.sh \
+          for f in install.sh uninstall.sh doctor.sh bin/swap-guard bin/overclaude-codex-continue hooks/handoff-inject.sh \
                    hooks/ctx-watch.sh hooks/ctx-notify.sh statusline/statusline-command.sh \
                    skills/swap/SKILL.md skills/handoff/SKILL.md claude/ULTRACODE.md \
                    settings/settings-fragment.json shell/zshrc-snippet.sh vendor/claude-swap/pyproject.toml; do

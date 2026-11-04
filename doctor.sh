@@ -85,6 +85,7 @@ check_file() { # check_file <payload-rel> <live-path>
     ok "$dst"
   fi
 }
+check_file bin/overclaude-codex-continue "$LOCALBIN/overclaude-codex-continue"
 check_file bin/swap-guard                   "$LOCALBIN/swap-guard"
 check_file skills/swap/SKILL.md             "$CLAUDE_DIR/skills/swap/SKILL.md"
 check_file skills/handoff/SKILL.md          "$CLAUDE_DIR/skills/handoff/SKILL.md"

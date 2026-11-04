@@ -109,6 +109,7 @@ usage: swap-guard <subcommand> [args]
   version-check [--force]         newest overclaude on PyPI (cached for a day)
   codex-usage [--refresh]         Codex CLI rate limits per Codex home, from its session logs
   codex-ready                     can /handoff codex work here? (CLI, overcodex hook, limits)
+  codex-route                     read-only Claude-first automatic routing decision
   route-guard [on|off|status]     PreToolUse hook (Agent|Workflow): deny un-routed subagents on Fable
   spend [--days N]                API-price value of your usage (by model/account/session/day) vs plan cost
   codex-review [--dir D] [--model M] [--effort E] [--schema F] [--timeout S] [--raw] <prompt> [--stdin < input]
@@ -574,16 +575,18 @@ _auto_notify() { # _auto_notify <message>
 }
 
 _auto_tick() {
-  local notify=1 probe=0 cargs=() dry rc ev trigger to_num to_email pre verdict busy_n out real_rc now
+  local notify=1 probe=0 threshold_set=0 cargs=() dry rc ev trigger to_num to_email pre verdict busy_n out real_rc now
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-notify) notify=0;;
       --probe) probe=1;;
-      --threshold|--model|--strategy|--cooldown) cargs+=("$1" "${2:-}"); shift;;
+      --threshold) threshold_set=1; cargs+=("$1" "${2:-}"); shift;;
+      --model|--strategy|--cooldown) cargs+=("$1" "${2:-}"); shift;;
       *) :;;
     esac
     shift
   done
+  [ "$threshold_set" -eq 1 ] || cargs+=(--threshold 97)
   command -v cswap >/dev/null 2>&1 || { printf '%s\n' '{"event":"error","detail":"cswap not found"}'; return 1; }
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local errf; errf="$(mktemp "${TMPDIR:-/tmp}/swap-guard-auto.XXXXXX")" || errf=/dev/null
@@ -2616,7 +2619,7 @@ cmd_ratelimit() {
     _rl_out "$(jq -cn --argjson ts "$now" --arg m "$model" --arg f "$from" \
       '{ts:($ts|todate), source:"ratelimit", action:"none", reason:"no-account-with-room", model:$m, from:$f}')"
     [ "$notify" -eq 1 ] && [ "$dry" -eq 0 ] &&
-      _auto_notify "${model:-Usage} limit on $from_l, and no other account has room$(command -v codex >/dev/null 2>&1 && echo ' — /handoff codex continues in Codex' || echo ' (or they need: swap-guard login)')."
+      _auto_notify "${model:-Usage} limit on $from_l, and no other account has room (or they need: swap-guard login)."
     exit 0
   fi
   to="$(printf '%s' "$pick" | jq -r '.number')"
@@ -2645,7 +2648,7 @@ cmd_ratelimit() {
   printf '%s' "$list" | jq -c --arg f "$from" --arg m "$model" --argjson now "$now" \
       --argjson prev "$(jq -c 'if type == "array" then . else [] end' "$RL_CAPPED" 2>/dev/null || echo '[]')" "$JQ_EPOCH"'
     (first(.accounts[]? | select((.number | tostring) == $f)) // {}) as $a | ($a.usage // $a.lastGoodUsage // {}) as $u
-    | (if $m == "" then ([$u.fiveHour, $u.sevenDay] | map(select(. != null and (.pct // 0) >= 100))[0])
+    | (if $m == "" then ([$u.fiveHour, $u.sevenDay] | map(select(. != null and (.pct | type) == "number" and .pct >= 100))[0])
        else ([$u.scoped[]? | select((.name | ascii_downcase) == ($m | ascii_downcase))] | first) end) as $w
     | ((($w // {}).resetsAt // "") | ep) as $r
     | [$prev[] | select(.until > $now and (.slot != $f or .model != $m))]
@@ -2849,7 +2852,10 @@ cmd_checkpoint() {
   # A token job (swap-guard token run) bills another account: its usage isn't this one's.
   band=""
   [ -f "$CKPT_OFF" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || band="$(_ckpt_band)"
-  [ -n "$band$mlvl" ] || exit 0
+  # Route may cross 97% while the checkpoint band stays at 95%.
+  local route_possible=""
+  [ -f "$CKPT_OFF" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || route_possible=1
+  [ -n "$band$mlvl$route_possible" ] || exit 0
   # Runs on every tool call while a line is crossed: read the two ids without jq when
   # that is unambiguous, else fall back to jq. Only the part before the tool payload is
   # searched (a tool's own input or output can carry "session_id"/"agent_id" keys), and
@@ -2889,6 +2895,9 @@ EOF
       '{ts:($ts|todate), source:"checkpoint", action:"nudged", window:$w, pct:$p, session:$s} + (if $a != "" then {agent:$a} else {} end)')"
   fi
   [ -n "$mmsg" ] && msg="${msg:+$msg }$mmsg"
+  if [ -n "$route_possible" ] && [ -z "$aid" ]; then
+    local rmsg; rmsg="$(_route_note "$sid")"; [ -n "$rmsg" ] && msg="${msg:+$msg }$rmsg"
+  fi
   [ -n "$msg" ] || exit 0
   jq -cn --arg m "$msg" '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$m}}'
   exit 0
@@ -3547,6 +3556,9 @@ EOF
     # Rewritten every prompt: the 7-day pruning must not forget a long-lived session.
     mkdir -p "$CTX_DIR" && printf '%s\n' "$now_slot" > "$af"
   fi
+  local aid rmsg
+  aid="$(printf '%s' "$input" | jq -r '.agent_id // empty')"
+  if [ -z "$aid" ]; then rmsg="$(_route_note "$sid")"; [ -n "$rmsg" ] && printf '%s\n' "$rmsg"; fi
   line="$(_budget_eval)" || exit 0
   [ -n "$line" ] || exit 0
   IFS=$'\x1f' read -r key msg clr <<EOF
@@ -3558,12 +3570,6 @@ EOF
   prev="$(cat "$f" 2>/dev/null)"
   [ "$key" = "$prev" ] && exit 0
   if [ -n "$msg" ]; then
-    # Out of quota with no Claude account to swap to: Codex is the next place to work.
-    # Only when the whole account is out (5h/week at 100%, not one model bucket) and no
-    # other Claude account was suggested — and Codex can actually take the work.
-    case "$msg" in *"/swap "*) : ;; *"until the reset"*)
-      [ "$(cmd_codex_ready 2>/dev/null | jq -r '.ready // false' 2>/dev/null)" = true ] &&
-        msg="$msg No Claude account has room; if the user wants to keep going now, /handoff codex continues this work in the Codex CLI.";; esac
     printf '%s\n' "$msg"
   elif [ -n "$prev" ] && printf '%s' "$prev" | grep -q '=[1-9]'; then
     printf '%s\n' "$clr"
@@ -4033,36 +4039,203 @@ EOF
   [ -n "$line" ] || return 0
   mt="$(stat -f %m "$f" 2>/dev/null || echo 0)"
   printf '%s' "$line" | jq -c --arg n "$name" --arg h "$home" --argjson mt "$mt" \
-    --arg active "$(_codex_active_home)" '
+    --arg active "$(_codex_active_home)" "$JQ_EPOCH"'
     (.payload.rate_limits // .rate_limits // empty) as $rl
-    | def win($w): if $w == null then null
-        else {pct: ($w.used_percent // null), windowMinutes: ($w.window_minutes // null), resetsAt: ($w.resets_at // null),
+    | def win($w; $id): if $w == null then null
+        else {id:$id, pct: ($w.used_percent // null), windowMinutes: ($w.window_minutes // null), resetsAt: ($w.resets_at // null),
               label: (($w.window_minutes // 0) as $m | if $m == 300 then "5h" elif $m == 10080 then "week"
                       elif $m >= 1440 then "\($m / 1440 | floor)d" elif $m > 0 then "\($m / 60 | floor)h" else "?" end)} end;
-    {name: $n, home: $h, active: ($h == $active), plan: ($rl.plan_type // null), asOf: $mt,
+    {name: $n, home: $h, active: ($h == $active), plan: ($rl.plan_type // null), asOf: ((.timestamp // "") | ep),
      limitReached: ($rl.rate_limit_reached_type // null),
-     windows: ([win($rl.primary), win($rl.secondary)] | map(select(. != null)))}' 2>/dev/null
+     windows: ([win($rl.primary; "primary"), win($rl.secondary; "secondary")] | map(select(. != null)))}' 2>/dev/null
 }
 
-cmd_codex_ready() { # can a Codex session pick work up here? JSON verdict for /handoff codex
-  local home cli=false hook=false limit=null u
-  home="$(_codex_active_home)"
-  command -v codex >/dev/null 2>&1 && cli=true
+cmd_codex_ready() { # Unknown limits are reported explicitly; known exhaustion blocks readiness.
+  local home cli=false login=false hook=false limit=null u known=false fresh=false now pf pend=null reached=null
+  home="$(_codex_active_home)"; now="$(date +%s)"
+  if command -v codex >/dev/null 2>&1; then
+    cli=true
+    CODEX_HOME="$home" codex login status >/dev/null 2>&1 && login=true
+  fi
   [ -f "$home/hooks/overcodex-handoff-inject.sh" ] && hook=true
   u="$(_codex_usage_one "x" "$home")"
-  local known=false; [ -n "$u" ] && known=true
-  [ -n "$u" ] && limit="$(printf '%s' "$u" | jq -c --argjson now "$(date +%s)" \
-    '[.windows[] | select((.resetsAt // 0) > $now and (.pct // 0) >= 100)] | if length > 0 then .[0] else null end')"
-  local pend pf; pf="$(cmd_path codex-handoff 2>/dev/null)"; pend=null
-  [ -f "$pf" ] && pend="$(jq -cn --arg p "$pf" --argjson age "$(( $(date +%s) - $(stat -f %m "$pf") ))" '{path:$p, ageSec:$age}')"
-  jq -cn --arg home "$home" --argjson cli "$cli" --argjson hook "$hook" --argjson limit "${limit:-null}" \
-    --argjson known "$known" --argjson pend "$pend" '
-    {home: $home, codexCli: $cli, overcodexHook: $hook, exhausted: $limit, limitsKnown: $known, pending: $pend,
-     ready: ($cli and $hook and $limit == null),
-     detail: (if ($cli | not) then "Codex CLI not installed (npm i -g @openai/codex)"
-              elif ($hook | not) then "overcodex is not installed in this Codex home, so nothing would load the package: pipx install overcodex && overcodex install"
-              elif $limit != null then "this Codex account is at its \($limit.label) limit"
-              else "ok" end)}'
+  if [ -n "$u" ]; then
+    reached="$(printf '%s' "$u" | jq -c '.limitReached // null')"
+    known="$(printf '%s' "$u" | jq -r --argjson now "$now" '(.windows | length > 0) and ([.windows[] | select((.pct | type) != "number" or .pct < 0 or .pct > 100 or (.resetsAt | type) != "number" or .resetsAt <= $now)] | length == 0)')"
+    fresh="$(printf '%s' "$u" | jq -r --argjson now "$now" '(.asOf | type) == "number" and .asOf <= $now and .asOf >= ($now - 300)')"
+    limit="$(printf '%s' "$u" | jq -c --argjson now "$now" '
+      ([.windows[] | select(((.resetsAt | type) != "number" or .resetsAt > $now) and (.pct | type) == "number" and .pct >= 100)] | first) //
+      (.limitReached as $reached |
+       if $reached == null or $reached == "" then null
+       elif $reached == "primary" or $reached == "secondary" then
+         ([.windows[] | select(.id == $reached)] | first) as $w |
+         if $w == null or ($w.resetsAt | type) != "number" or $w.resetsAt > $now then {label:"reported"} else null end
+       else null end)')"
+  fi
+  pf="$home/overcodex/handoff-pending-$(hash_cwd "$PWD").md"
+  # Open without following links or blocking on FIFOs; inspect only a bounded header.
+  pend="$(python3 - "$pf" "$PWD" "$now" <<'PYCODE'
+import errno, json, os, re, stat, sys
+path, cwd, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            result = {"path": path, "unsafe": True}
+        else:
+            header = os.read(fd, 16001).split(b"\n", 1)[0].rstrip(b"\r").decode("utf-8", "replace")
+            match = re.fullmatch(r'<!-- handoff cwd="(.*)" created="([0-9]+)" -->', header)
+            created = int(match.group(2)) if match and match.group(1) == cwd else info.st_mtime
+            result = {"path": path, "ageSec": now - int(created)}
+    finally:
+        os.close(fd)
+except OSError as exc:
+    result = None if exc.errno == errno.ENOENT else {"path": path, "unsafe": True}
+print(json.dumps(result))
+PYCODE
+)"; [ -n "$pend" ] || pend='{"unsafe":true}'
+  jq -cn --arg home "$home" --argjson cli "$cli" --argjson login "$login" --argjson hook "$hook" --argjson limit "${limit:-null}" \
+    --argjson known "$known" --argjson fresh "$fresh" --argjson pend "$pend" --argjson reached "${reached:-null}" '
+    {home:$home, codexCli:$cli, loggedIn:$login, overcodexHook:$hook, exhausted:$limit, limitsKnown:$known, limitsFresh:$fresh, limitReached:($reached // null), pending:$pend,
+     ready:($cli and $login and $hook and $limit == null and (($pend.unsafe // false) | not)), continuationReady:($cli and $login and $limit == null and (($pend.unsafe // false) | not)),
+     detail:(if ($cli | not) then "Codex CLI not installed (npm i -g @openai/codex)"
+       elif ($login | not) then "Codex login status failed for this home"
+       elif ($hook | not) then "overcodex is not installed in this Codex home, so nothing would load the package: pipx install overcodex && overcodex install"
+       elif ($pend.unsafe // false) then "pending Codex handoff cannot be safely inspected"
+       elif $limit != null then "this Codex account is at its \($limit.label) limit"
+       elif ($known | not) then "limits unknown" else "ok" end)}'
+}
+
+# Request a normal cswap list when any subscription observation is nearing expiry.
+# cswap itself owns poll plans, backoff, and credentials; never force a fetch.
+_usage_refresh_async() {
+  [ -z "${SWAP_NO_REFRESH:-}" ] || return 0
+  command -v cswap >/dev/null 2>&1 || return 0
+  local seq="${SWAP_SEQ_JSON:-$STATE_ROOT/sequence.json}" cache="${SWAP_USAGE_JSON:-$STATE_ROOT/cache/usage.json}"
+  local now due lock stamp last
+  [ -r "$seq" ] || return 0
+  now="$(date +%s)"
+  due="$(jq -n --slurpfile s "$seq" --slurpfile c "$cache" --argjson now "$now" "$JQ_EPOCH"'
+    any(($s[0].accounts // {} | to_entries[]);
+      select(.value.disabled != true and .value.kind != "api_key") |
+      .key as $n | .value as $account | ($c[0].accounts[$n] // {}) as $r | ($r.lastGood.seven_day // {}) as $w |
+      (($account.email != null and $r.email != null and $account.email != $r.email)
+       or (($account.organizationUuid // "") != ($r.organizationUuid // ""))
+       or ($r.fetchedAt | type) != "number" or $r.fetchedAt > $now or $r.fetchedAt <= ($now - 150)
+       or ($w.pct | type) != "number" or $w.pct < 0 or $w.pct > 100
+       or (($w.resets_at | ep) as $reset | $reset == null or $reset <= $now)))' 2>/dev/null)" || due=true
+  [ "$due" = true ] || return 0
+  lock="$STATE_ROOT/cache/.usage-refresh.flock"; stamp="$STATE_ROOT/cache/.usage-refresh.at"
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null || return 0
+  # The stamp is a cheap fast path; the worker rechecks it under an OS lock.
+  last="$(cat "$stamp" 2>/dev/null)"; case "$last" in ''|*[!0-9]*) last=0;; esac
+  [ "$last" -gt 0 ] && [ $((now - last)) -lt 20 ] && return 0
+  python3 -c '
+import fcntl, os, signal, subprocess, sys, time
+lock, stamp = sys.argv[1:]
+with open(lock, "a") as handle:
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0)
+    try:
+        with open(stamp) as f:
+            last = float(f.read().strip())
+    except (OSError, ValueError):
+        last = 0
+    if time.time() - last < 20:
+        sys.exit(0)
+    with open(stamp, "w") as f:
+        f.write(str(int(time.time())))
+    def terminate(_signum, _frame):
+        raise SystemExit(1)
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    for sig in signals:
+        signal.signal(sig, terminate)
+    child = None
+    try:
+        # Do not lose a termination signal between spawning and recording the child.
+        oldmask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+        try:
+            child = subprocess.Popen(["cswap", "list", "--json"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=True,
+                                     preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, oldmask))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, oldmask)
+        child.wait(timeout=120)
+    except BaseException:
+        # Keep the lock through cleanup, even if the leader exits before a child.
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+        raise
+' "$lock" "$stamp" </dev/null >/dev/null 2>&1 &
+  return 0
+}
+
+cmd_codex_route() { # Strictly read-only; distinguish fresh from bounded scheduled evidence.
+  local seq="$STATE_ROOT/sequence.json" cache="$STATE_ROOT/cache/usage.json" accounts ready active eligible
+  accounts="$(jq -cn --slurpfile s "$seq" --slurpfile c "$cache" --argjson now "$(date +%s)" "$JQ_EPOCH"'
+    [($s[0].accounts // {} | to_entries[]) | select((.value.disabled != true) and (.value.kind != "api_key")) |
+      .key as $n | .value as $account | ($c[0].accounts[$n] // {}) as $row | ($row.lastGood.seven_day // {}) as $w |
+      ($w.resets_at | ep) as $reset |
+      (($row.fetchedAt | type) == "number" and $row.fetchedAt <= $now and $row.fetchedAt >= ($now - 180)) as $fresh |
+      (($row.fetchedAt | type) == "number" and $row.fetchedAt <= $now and $row.fetchedAt >= ($now - 660)
+       and $row.lastError == null and ($row.consecutiveFailures // 0) == 0
+       and ($row.nextPollAt | type) == "number" and $row.nextPollAt > $now) as $scheduled |
+      (($account.email == null or $row.email == null or $account.email == $row.email)
+       and (($account.organizationUuid // "") == ($row.organizationUuid // ""))
+       and ($w.pct | type) == "number" and $w.pct >= 0 and $w.pct <= 100 and $reset != null and $reset > $now) as $valid |
+      {slot:$n, pct:$w.pct, reset:$reset, fresh:($fresh and $valid),
+       freshnessReason:(if ($valid | not) then "unknown" elif $fresh then "fresh" elif $scheduled then "scheduled" else "unknown" end),
+       known:($valid and ($fresh or $scheduled))}]' 2>/dev/null)" || accounts='[]'
+  active="$(jq -r '.activeAccountNumber // empty | tostring' "$seq" 2>/dev/null)"
+  eligible="$(printf '%s' "$accounts" | jq -r 'length >= 2 and all(.[]; .known and .pct >= 97)')"
+  ready='{}'
+  if [ "$eligible" = true ]; then ready="$(cmd_codex_ready 2>/dev/null)"; [ -n "$ready" ] || ready='{}'; fi
+  jq -cn --argjson accounts "$accounts" --argjson codex "$ready" --arg active "$active" '
+    ($accounts | length >= 2 and all(.[]; .known and .pct >= 97)) as $eligible |
+    {route:(if $eligible and $codex.continuationReady and ($codex.pending == null or $codex.pending.ageSec >= 600) then "codex" else "claude" end),
+     eligible:$eligible, active:$active, accounts:$accounts, alternatives:[$accounts[] | select(.slot != $active and .known and .pct < 97)], codex:$codex}'
+}
+
+_route_note() { # shared per-session dedup across both hooks, independent of budget bands
+  local sid="$1" decision route key f now last resets
+  decision="$(cmd_codex_route 2>/dev/null)"
+  if printf '%s' "$decision" | jq -e '(.accounts | length == 0) or any(.accounts[]; (.fresh | not))' >/dev/null 2>&1; then _usage_refresh_async; fi
+  route="$(printf '%s' "$decision" | jq -r '.route // "claude"')"
+  if [ "$route" = codex ]; then
+    key=codex
+  elif printf '%s' "$decision" | jq -e '(.active as $a | any(.accounts[]; .slot == $a and .known and .pct >= 97)) and (.alternatives | length > 0)' >/dev/null 2>&1; then
+    key="claude-$(printf '%s' "$decision" | jq -r '.active')"
+  else
+    return 0
+  fi
+  resets="$(printf '%s' "$decision" | jq -r '[.accounts[].reset // 0] | join("-")')"
+  f="$CTX_DIR/$sid.codex-route-$key-$resets"; now="$(date +%s)"
+  last="$(cat "$f" 2>/dev/null)"; case "$last" in ''|*[!0-9]*) last=0;; esac
+  [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ] && return 0
+  mkdir -p "$CTX_DIR" && printf '%s\n' "$now" > "$f" 2>/dev/null || return 0
+  if [ "$key" = codex ]; then
+    printf '%s' 'overclaude: automatic Claude-first policy authorizes /handoff codex auto. Finish the current step and collect agent results first, then package the handoff and invoke overclaude-codex-continue. Respect pending packages and permission checks.'
+  else
+    printf '%s' 'overclaude: this Claude account is at 97% weekly usage and another has room. Finish the current step and collect agent results, then run swap-guard auto tick --threshold 97 to request the guarded account switch; respect its busy and preflight verdicts.'
+  fi
 }
 
 # cmd_codex_review — a cross-family second opinion for ULTRACODE verify stages:
@@ -4577,6 +4750,8 @@ main() {
     version-check) cmd_version_check "$@";;
     codex-usage)   cmd_codex_usage "$@";;
     codex-ready)   cmd_codex_ready "$@";;
+    codex-route)   cmd_codex_route "$@";;
+    usage-refresh) _usage_refresh_async;;
     codex-review)  cmd_codex_review "$@";;
     route-guard)   cmd_route_guard "$@";;
     spend)         cmd_spend "$@";;
