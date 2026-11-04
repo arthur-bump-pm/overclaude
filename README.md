@@ -23,6 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
+| **1.9.0** | 🚧 in progress | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
 | **1.8.0** | ✅ released 2026-11-04 | Claude-first 97% weekly fallback with authenticated Codex continuation, structured task packages, model-aware orchestration, and durable run results |
 | **1.7.2** | ✅ released 2026-11-03 | Statusline: the 5h bar is left out on plans with no 5-hour window (Ultra), and the session count comes from Claude Code's session registry, so Chrome helper processes no longer count as sessions. ULTRACODE.md cleaned for current models after a prompt audit (checked by Codex and a separate Claude review): emphasis in capitals is plain text, and the title no longer carries its audit history; no rule changed |
 | 1.7.1 | ✅ released 2026-10-28 | Codex reviews can't act: `swap-guard codex-review` now switches off every MCP server, plugin, connector and browser tool for the review, and refuses to run if it can't list them. ULTRACODE.md now says how Fable's limit works: it counts against the same weekly limit as everything else, at most half of it on Max |
