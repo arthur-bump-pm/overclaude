@@ -36,6 +36,8 @@ assert_eq "$(jq -r '.model' "$S")" "opus" "unrelated settings survive"
 assert_eq "$([ -x "$HOME/.local/bin/swap-guard" ] && echo yes)" "yes" "swap-guard installed"
 
 assert_eq "$([ -x "$HOME/.local/bin/overclaude-codex-continue" ] && echo yes)" "yes" "Codex continuation runner installed"
+assert_eq "$([ -x "$HOME/.local/bin/overclaude-codex-probe" ] && echo yes)" "yes" "Codex policy probe installed"
+assert_eq "$([ -x "$HOME/.local/bin/overclaude-codex-pool" ] && echo yes)" "yes" "Codex pool preview installed"
 
 KA="$HOME/Library/LaunchAgents/com.overclaude.keepalive.plist"
 assert_eq "$([ -f "$KA" ] && echo yes)" "yes" "install turns the keepalive agent on"
@@ -97,5 +99,7 @@ assert_eq "$([ -L "$HOME/.zshrc" ] && echo link)" "link" "uninstall keeps the sy
 assert_eq "$(stat -f %Lp "$HOME/dotfiles/zshrc")" "600" "and the file mode"
 
 assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-continue" ] && echo present || echo gone)" "gone" "Codex continuation runner removed"
+assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-probe" ] && echo present || echo gone)" "gone" "Codex policy probe removed"
+assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-pool" ] && echo present || echo gone)" "gone" "Codex pool preview removed"
 rm -rf "$HOME"
 finish

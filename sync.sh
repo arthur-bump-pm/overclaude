@@ -37,14 +37,22 @@ END_MARKER='# --- claude-swap integration (end) ---'
 
 # live-path:repo-path pairs (bash 3.2: newline list, no assoc arrays)
 PAIRS="$HOME/.local/bin/overclaude-codex-continue:bin/overclaude-codex-continue
+$HOME/.local/bin/overclaude-codex-probe:bin/overclaude-codex-probe
+$HOME/.local/bin/overclaude-codex-pool:bin/overclaude-codex-pool
+$HOME/.local/bin/overclaude-checkpoint:bin/overclaude-checkpoint
 $HOME/.local/bin/swap-guard:bin/swap-guard
 $HOME/.claude/skills/swap/SKILL.md:skills/swap/SKILL.md
 $HOME/.claude/skills/handoff/SKILL.md:skills/handoff/SKILL.md
+$HOME/.claude/skills/checkpoint/SKILL.md:skills/checkpoint/SKILL.md
 $HOME/.claude/hooks/handoff-inject.sh:hooks/handoff-inject.sh
 $HOME/.claude/hooks/ctx-watch.sh:hooks/ctx-watch.sh
 $HOME/.claude/hooks/ctx-notify.sh:hooks/ctx-notify.sh
 $HOME/.claude/statusline-command.sh:statusline/statusline-command.sh
 $HOME/.claude/ULTRACODE.md:claude/ULTRACODE.md"
+for runtime_file in README.md __init__.py tomli/LICENSE tomli/__init__.py tomli/_parser.py tomli/_re.py tomli/_types.py tomli/py.typed; do
+  PAIRS="$PAIRS
+$HOME/.local/bin/overclaude_runtime/$runtime_file:bin/overclaude_runtime/$runtime_file"
+done
 
 echo "== overclaude sync (live -> repo) =="
 CHANGED=0

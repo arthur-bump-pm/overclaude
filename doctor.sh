@@ -86,8 +86,12 @@ check_file() { # check_file <payload-rel> <live-path>
   fi
 }
 check_file bin/overclaude-codex-continue "$LOCALBIN/overclaude-codex-continue"
+check_file bin/overclaude-checkpoint "$LOCALBIN/overclaude-checkpoint"
+check_file bin/overclaude-codex-probe "$LOCALBIN/overclaude-codex-probe"
+check_file bin/overclaude-codex-pool "$LOCALBIN/overclaude-codex-pool"
 check_file bin/swap-guard                   "$LOCALBIN/swap-guard"
 check_file skills/swap/SKILL.md             "$CLAUDE_DIR/skills/swap/SKILL.md"
+check_file skills/checkpoint/SKILL.md "$CLAUDE_DIR/skills/checkpoint/SKILL.md"
 check_file skills/handoff/SKILL.md          "$CLAUDE_DIR/skills/handoff/SKILL.md"
 check_file hooks/handoff-inject.sh          "$CLAUDE_DIR/hooks/handoff-inject.sh"
 check_file hooks/ctx-watch.sh               "$CLAUDE_DIR/hooks/ctx-watch.sh"

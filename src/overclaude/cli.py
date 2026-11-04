@@ -66,12 +66,16 @@ def _update(check_only):
         print("upgrading: " + " ".join(cmd))
         rc = subprocess.call(cmd)
         if rc != 0:
-            print("overclaude: upgrade failed; nothing else was changed")
+            print("overclaude: package upgrade failed; managed kit installation was not attempted")
             return rc
     # A fresh interpreter loads the upgraded package before installing its payload.
     rc = subprocess.call([sys.executable, "-m", "overclaude.cli", "install"])
     if rc == 0:
-        print("done — restart open Claude Code sessions so they load the new hooks")
+        rc = subprocess.call([sys.executable, "-m", "overclaude.cli", "verify"])
+        if rc == 0:
+            print("done — restart open Claude Code sessions so they load the new hooks")
+        else:
+            print("overclaude: installed files failed offline verification; package upgrade was not rolled back", file=sys.stderr)
     return rc
 
 
@@ -82,6 +86,21 @@ def main():
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("install", help="install/refresh the kit into ~/.claude (idempotent, backs everything up)")
+    sub.add_parser("verify", help="check installed kit files and hooks offline")
+    p_recover = sub.add_parser("recover", help="inspect or recover an interrupted managed-file transaction", allow_abbrev=False)
+    recovery = p_recover.add_mutually_exclusive_group(required=True)
+    recovery.add_argument("--list", action="store_true")
+    recovery.add_argument("--transaction")
+    p_recover.add_argument("--keep-current", action="store_true", help="retain reviewed conflicts after restoring all eligible files")
+    p_status = sub.add_parser("status", help="show Codex continuation status")
+    p_status.add_argument("--cwd")
+    p_status.add_argument("--run")
+    p_status.add_argument("--json", action="store_true")
+    p_resume = sub.add_parser("resume", help="resume a saved Codex continuation", allow_abbrev=False)
+    p_resume.add_argument("--run", required=True)
+    p_resume.add_argument("--dry-run", action="store_true")
+    p_pool = sub.add_parser("codex-pool", help="preview eligible Codex accounts without switching", allow_abbrev=False)
+    p_pool.add_argument("--model")
     sub.add_parser("uninstall", help="remove exactly what install added (state in ~/.claude-swap-backup survives)")
     p_doc = sub.add_parser("doctor", help="health check of the live install, with a fix for each problem")
     p_doc.add_argument("--fix", action="store_true", help="apply the safe repairs, then check again")
@@ -97,6 +116,37 @@ def main():
 
     if args.cmd == "install":
         sys.exit(_run_script("install.sh"))
+    if args.cmd == "verify":
+        from .verify import verify
+        errors, notes = verify(_payload_dir(), os.path.expanduser("~"), pkg_version("overclaude"))
+        for note in notes:
+            print("note: " + note)
+        for error in errors:
+            print("error: " + error, file=sys.stderr)
+        if not errors:
+            print("overclaude: offline verification passed")
+        sys.exit(1 if errors else 0)
+    if args.cmd == "recover":
+        if args.keep_current and args.list:
+            p_recover.error("--keep-current requires --transaction")
+        payload = _payload_dir()
+        helper = os.path.join(payload, "bin", "overclaude-install-transaction")
+        action = ["list"] if args.list else ["recover", "--transaction", args.transaction] + (["--keep-current"] if args.keep_current else [])
+        sys.exit(subprocess.call([sys.executable, helper, "--payload", payload, *action]))
+    if args.cmd in ("status", "resume"):
+        runner = os.path.expanduser("~/.local/bin/overclaude-codex-continue")
+        if not os.path.isfile(runner) or not os.access(runner, os.X_OK):
+            sys.exit("overclaude: continuation helper missing; run overclaude install")
+        if args.cmd == "status":
+            rest = (["--cwd", args.cwd] if args.cwd else []) + (["--run", args.run] if args.run else []) + (["--json"] if args.json else [])
+        else:
+            rest = ["--run", args.run] + (["--dry-run"] if args.dry_run else [])
+        sys.exit(subprocess.call([runner, args.cmd, *rest]))
+    if args.cmd == "codex-pool":
+        helper = os.path.expanduser("~/.local/bin/overclaude-codex-pool")
+        if not os.path.isfile(helper) or not os.access(helper, os.X_OK):
+            sys.exit("overclaude: pool preview helper missing; run overclaude install")
+        sys.exit(subprocess.call([helper, *(["--model", args.model] if args.model else [])]))
     if args.cmd == "uninstall":
         sys.exit(_run_script("uninstall.sh"))
     if args.cmd == "doctor":

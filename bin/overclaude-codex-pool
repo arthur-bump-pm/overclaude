@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Preview eligible local Codex accounts without changing the active account."""
+import argparse
+import base64
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+MAX_OUTPUT = 2 * 1024 * 1024
+PER_HOME = 5.0
+OVERALL = 20.0
+MAX_SCANNED_ENTRIES = 128
+MAX_HOMES = 32
+
+
+class Unknown(Exception):
+    pass
+
+
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def bounded_auth(home):
+    try:
+        fd = os.open(home / 'auth.json', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 1048576:
+                raise Unknown('identity unavailable')
+            data = json.loads(f.read(1048577))
+        if not isinstance(data, dict) or data.get('auth_mode') not in (None, 'chatgpt') or data.get('OPENAI_API_KEY'):
+            raise Unknown('identity unavailable')
+        tokens = data['tokens']
+        account = tokens['account_id']
+        jwt = tokens['id_token']
+        parts = jwt.split('.')
+        if len(parts) != 3 or not all(parts):
+            raise Unknown('identity unavailable')
+        payload = parts[1] + '=' * (-len(parts[1]) % 4)
+        claims = json.loads(base64.b64decode(payload, altchars=b'-_', validate=True))
+        sub = claims['sub']
+        if not isinstance(account, str) or not account or not isinstance(sub, str) or not sub:
+            raise Unknown('identity unavailable')
+        return account, hashlib.sha256(json.dumps([account, sub], separators=(',', ':')).encode()).hexdigest()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        raise Unknown('identity unavailable') from None
+
+
+def inspect(home, cwd, model, deadline):
+    account_id, identity = bounded_auth(home)
+    env = dict(os.environ, CODEX_HOME=str(home))
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    oldmask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+    try:
+        child = subprocess.Popen(['codex', 'app-server'], cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
+                                 preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, oldmask))
+    except OSError:
+        signal.pthread_sigmask(signal.SIG_SETMASK, oldmask)
+        raise Unknown('app-server unavailable') from None
+    received, buf = 0, b''
+    def send(message):
+        data = memoryview((json.dumps(message, separators=(',', ':')) + '\n').encode())
+        if len(data) > 16384:
+            raise Unknown('app-server request exceeded limit')
+        while data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [child.stdin], [], remaining)[1]:
+                raise Unknown('account check timed out')
+            try:
+                data = data[os.write(child.stdin.fileno(), data):]
+            except BlockingIOError:
+                continue
+            except OSError:
+                raise Unknown('app-server input failed') from None
+    def request(number, method, params=None):
+        nonlocal received, buf
+        message = {'id': number, 'method': method}
+        if params is not None:
+            message['params'] = params
+        send(message)
+        while True:
+            while b'\n' in buf:
+                line, buf = buf.split(b'\n', 1)
+                try:
+                    item = json.loads(line)
+                except (ValueError, UnicodeError, RecursionError):
+                    raise Unknown('invalid app-server response') from None
+                if not isinstance(item, dict):
+                    raise Unknown('invalid app-server response')
+                if item.get('id') == number:
+                    if 'error' in item:
+                        error = item['error']
+                        if isinstance(error, dict):
+                            code, message = error.get('code'), error.get('message')
+                            message = message.lower() if isinstance(message, str) else ''
+                            if (code in (401, 403) or re.search(r'\b(?:401|403)\b|invalid_grant', message)
+                                    or ('expired' in message and any(word in message for word in ('auth', 'token', 'credential')))):
+                                raise Unknown(method + ': authentication unavailable; sign in again')
+                        raise Unknown(method + ': app-server request failed')
+                    if not isinstance(item.get('result'), dict):
+                        raise Unknown(method + ': invalid app-server response')
+                    return item['result']
+                if 'id' in item and 'method' in item:
+                    raise Unknown('unexpected app-server request')
+            remain = deadline - time.monotonic()
+            if remain <= 0 or not select.select([child.stdout], [], [], remain)[0]:
+                raise Unknown('account check timed out')
+            part = os.read(child.stdout.fileno(), min(65536, MAX_OUTPUT + 1 - received))
+            if not part:
+                raise Unknown('app-server closed output')
+            received += len(part)
+            if received > MAX_OUTPUT:
+                raise Unknown('app-server output exceeded limit')
+            buf += part
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, oldmask)
+        os.set_blocking(child.stdin.fileno(), False)
+        init = request(1, 'initialize', {'clientInfo': {'name': 'overclaude-pool-preview', 'version': '1'}})
+        reported = init.get('codexHome')
+        if not isinstance(reported, str) or not os.path.isabs(reported) or os.path.realpath(reported) != str(home):
+            raise Unknown('app-server reported a different home')
+        send({'method': 'initialized'})
+        account_reply = request(2, 'account/read', {'refreshToken': False})
+        account = account_reply.get('account')
+        if not isinstance(account, dict) or account.get('type') != 'chatgpt':
+            raise Unknown('ChatGPT account unavailable')
+        snapshot = request(3, 'config/read', {'includeLayers': True, 'cwd': cwd})
+        config, origins, layers = snapshot.get('config'), snapshot.get('origins'), snapshot.get('layers')
+        requirements = request(4, 'configRequirements/read')
+        if (not isinstance(config, dict) or not isinstance(origins, dict) or not isinstance(layers, list)
+                or 'requirements' not in requirements or not (requirements['requirements'] is None or isinstance(requirements['requirements'], dict))):
+            raise Unknown('effective authentication policy unavailable')
+        def auth_setting(value, allow_file):
+            if isinstance(value, dict):
+                return any((key in ('cli_auth_credentials_store', 'cliAuthCredentialsStore') and val is not None
+                            and (not allow_file or val != 'file')) or auth_setting(val, allow_file)
+                           for key, val in value.items())
+            return isinstance(value, list) and any(auth_setting(item, allow_file) for item in value)
+        auth = config.get('cli_auth_credentials_store')
+        if auth is None:
+            allowed = {'sessionFlags', 'user', 'project', 'system', 'packagedDefaults'}
+            if (origins.get('cli_auth_credentials_store') is not None or auth_setting(requirements['requirements'], False)
+                    or any(not isinstance(layer, dict) or not isinstance(layer.get('name'), dict)
+                           or layer['name'].get('type') not in allowed or not isinstance(layer.get('config'), dict)
+                           or auth_setting(layer['config'], False) for layer in layers)):
+                raise Unknown('effective file authentication not established')
+            auth = 'file'
+        if auth != 'file' or auth_setting(requirements['requirements'], True):
+            raise Unknown('effective file authentication not established')
+        providers = config.get('model_providers')
+        if (not isinstance(providers, dict) or config.get('model_provider') not in (None, 'openai')
+                or config.get('openai_base_url') is not None or 'openai' in providers
+                or config.get('chatgpt_base_url') not in (None, 'https://chatgpt.com/backend-api/')
+                or config.get('forced_login_method') not in (None, 'chatgpt')):
+            raise Unknown('custom provider unsupported')
+        def finalize(status, reason, efforts):
+            if bounded_auth(home) != (account_id, identity):
+                raise Unknown('account identity changed during preview')
+            return identity, status, reason, efforts
+        quota = request(5, 'account/rateLimits/read')
+        returned_id = quota.get('accountId')
+        if returned_id is not None and (not isinstance(returned_id, str) or returned_id != account_id):
+            raise Unknown('account identity mismatch')
+        if 'ordinaryUsageAllowed' in quota and not isinstance(quota['ordinaryUsageAllowed'], bool):
+            raise Unknown('backend usage permission unavailable')
+        if quota.get('ordinaryUsageAllowed') is False:
+            return finalize('exhausted', 'backend denies ordinary usage', [])
+        buckets = quota.get('rateLimitsByLimitId')
+        if buckets is None:
+            bucket = quota.get('rateLimits')
+            if not isinstance(bucket, dict) or bucket.get('limitId') not in (None, 'codex'):
+                raise Unknown('Codex quota unavailable')
+            selected = [bucket]
+        else:
+            if not isinstance(buckets, dict) or not isinstance(buckets.get('codex'), dict):
+                raise Unknown('Codex quota unavailable')
+            modern = buckets['codex']
+            if modern.get('limitId') not in (None, 'codex'):
+                raise Unknown('Codex quota bucket identity mismatch')
+            legacy = quota.get('rateLimits')
+            if legacy is not None:
+                if not isinstance(legacy, dict) or not (legacy.get('limitId') is None or isinstance(legacy.get('limitId'), str)):
+                    raise Unknown('legacy quota identity invalid')
+                if legacy.get('limitId') in (None, 'codex') and any(
+                        legacy.get(key) != modern.get(key) for key in ('primary', 'secondary', 'rateLimitReachedType', 'spendControlReached')):
+                    raise Unknown('conflicting Codex quota snapshots')
+            selected = [modern]
+            if model:
+                other_buckets = [v for k, v in buckets.items() if k != 'codex']
+                if any(not isinstance(v, dict) or not isinstance(v.get('normalModelSlug'), str)
+                       or not v['normalModelSlug'] for v in other_buckets):
+                    raise Unknown('model quota bucket mapping unavailable')
+                aliases = other_buckets
+                matching = [v for v in aliases if v.get('normalModelSlug') == model]
+                if aliases and not matching:
+                    raise Unknown('model quota bucket unavailable')
+                selected.extend(matching)
+        now = time.time()
+        for bucket in selected:
+            spend = bucket.get('spendControlReached')
+            reached = bucket.get('rateLimitReachedType')
+            allowed_reached = ('rate_limit_reached', 'workspace_owner_credits_depleted',
+                               'workspace_member_credits_depleted', 'workspace_owner_usage_limit_reached',
+                               'workspace_member_usage_limit_reached')
+            if (spend is not None and not isinstance(spend, bool)) or (reached is not None and reached not in allowed_reached):
+                raise Unknown('quota control metadata invalid')
+            if reached or spend is True:
+                return finalize('exhausted', 'quota reported exhausted', [])
+            windows = [bucket.get(key) for key in ('primary', 'secondary') if bucket.get(key) is not None]
+            if not windows:
+                raise Unknown('quota windows unavailable')
+            for window in windows:
+                if not isinstance(window, dict):
+                    raise Unknown('quota window invalid')
+                pct, reset, duration = window.get('usedPercent'), window.get('resetsAt'), window.get('windowDurationMins')
+                if (not finite_number(pct) or not 0 <= pct <= 100
+                        or not finite_number(reset) or reset <= now
+                        or not finite_number(duration) or not 0 < duration <= 527040
+                        or reset > now + duration * 60 + 300):
+                    raise Unknown('quota window invalid or stale')
+                if pct >= 100:
+                    return finalize('exhausted', 'quota window exhausted', [])
+        efforts = []
+        if model:
+            cursor = None
+            for number in range(6, 16):
+                params = {'limit': 100}
+                if cursor:
+                    params['cursor'] = cursor
+                listing = request(number, 'model/list', params)
+                items = listing.get('data')
+                if not isinstance(items, list):
+                    raise Unknown('model catalog unavailable')
+                for entry in items:
+                    if not isinstance(entry, dict) or entry.get('model') != model or entry.get('hidden') is not False:
+                        continue
+                    levels = entry.get('supportedReasoningEfforts')
+                    if not isinstance(levels, list):
+                        raise Unknown('model reasoning options unavailable')
+                    allowed = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+                    found = set()
+                    for level in levels:
+                        value = level.get('reasoningEffort') if isinstance(level, dict) else None
+                        if isinstance(value, str) and value in allowed:
+                            found.add(value)
+                        if len(found) == len(allowed):
+                            break
+                    efforts = [value for value in allowed if value in found]
+                    if not efforts:
+                        raise Unknown('model reasoning options unavailable')
+                    break
+                if efforts:
+                    break
+                cursor = listing.get('nextCursor')
+                if cursor is None:
+                    break
+                if not isinstance(cursor, str) or not cursor or len(cursor.encode('utf-8')) > 8192:
+                    raise Unknown('model catalog cursor invalid')
+            if not efforts:
+                raise Unknown('requested model unavailable')
+        return finalize('eligible', 'live quota and account verified' if model else 'live quota verified; model eligibility unchecked', efforts)
+    finally:
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        for sig in signals:
+            signal.signal(sig, handle_signal)
+
+
+def handle_signal(_sig, _frame):
+    raise Unknown('preview interrupted')
+
+
+def main():
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument('--model')
+    args = parser.parse_args()
+    if args.model and not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', args.model):
+        parser.error('invalid model')
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handle_signal)
+    deadline = time.monotonic() + OVERALL
+    base = Path(os.path.realpath(Path.home()))
+    accounts = base / '.codex-accounts'
+    homes = [('primary', base / '.codex')]
+    inventory_reason = None
+    if accounts.is_dir() and not accounts.is_symlink():
+        try:
+            with os.scandir(accounts) as entries:
+                for count, entry in enumerate(entries, 1):
+                    if time.monotonic() >= deadline:
+                        inventory_reason = 'overall preview deadline exceeded during inventory'
+                        break
+                    if count > MAX_SCANNED_ENTRIES:
+                        inventory_reason = 'account inventory scan limit exceeded'
+                        break
+                    if (re.fullmatch(r'[A-Za-z0-9_-]{1,128}', entry.name) and entry.name != 'primary'
+                            and entry.is_dir(follow_symlinks=False)):
+                        if len(homes) >= MAX_HOMES:
+                            inventory_reason = 'account inventory home limit exceeded'
+                            break
+                        homes.append((entry.name, accounts / entry.name))
+        except OSError:
+            inventory_reason = 'account inventory unavailable'
+    elif accounts.is_symlink():
+        inventory_reason = 'account inventory is a symlink'
+    if inventory_reason:
+        print(json.dumps({'selected': None, 'model': args.model,
+                          'model_eligibility': 'requested' if args.model else 'unchecked',
+                          'inventory_complete': False, 'candidates': [], 'reason': inventory_reason}))
+        return 0
+    homes[1:] = sorted(homes[1:], key=lambda pair: pair[0])
+    active = 'primary'
+    try:
+        if accounts.is_symlink():
+            raise OSError('invalid accounts directory')
+        fd = os.open(accounts / '.active', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as stream:
+            st = os.fstat(stream.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 256:
+                raise OSError('invalid active marker')
+            marker = stream.read(257).decode('ascii').strip()
+        if re.fullmatch(r'[A-Za-z0-9_-]+', marker) and marker in [name for name, _ in homes]:
+            active = marker
+    except (OSError, UnicodeError):
+        pass
+    if any(os.environ.get(k) for k in ('CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORGANIZATION', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID')):
+        print(json.dumps({'selected': None, 'candidates': [], 'reason': 'credential or provider environment override unsupported'}))
+        return 0
+    results, identities = [], []
+    budget_exhausted = False
+    for name, path in homes:
+        item = {'name': name, 'home': str(path), 'active': name == active, 'status': 'unknown', 'reason': 'home unavailable'}
+        results.append(item)
+        if not path.is_dir() or path.is_symlink() or os.path.realpath(path) != str(path):
+            continue
+        if time.monotonic() >= deadline:
+            item['reason'] = 'overall preview deadline exceeded'
+            budget_exhausted = True
+            continue
+        try:
+            identity, status, reason, efforts = inspect(path, os.getcwd(), args.model, min(deadline, time.monotonic() + PER_HOME))
+            item.update(status=status, reason=reason)
+            if efforts:
+                item['supported_efforts'] = efforts
+            identities.append((identity, item))
+        except (Unknown, OSError, ValueError, TypeError, AttributeError, RecursionError) as exc:
+            if isinstance(exc, Unknown) and str(exc) == 'preview interrupted':
+                raise
+            item['reason'] = str(exc) if isinstance(exc, Unknown) else 'account check failed'
+    # Prefer the active eligible home among duplicate identities; never treat
+    # contradictory live quota reports for one account as evidence of room.
+    groups = {}
+    for identity, item in identities:
+        groups.setdefault(identity, []).append(item)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        if len({item['status'] for item in group}) > 1:
+            for item in group:
+                item.update(status='unknown', reason='conflicting reports for the same account')
+            continue
+        chosen = next((item for item in group if item['active']), group[0])
+        for item in group:
+            if item is not chosen:
+                item.update(status='duplicate', reason='same account as ' + chosen['name'])
+    eligible = [r for r in results if r['status'] == 'eligible']
+    selected = None if budget_exhausted else next((r for r in eligible if r['active']), eligible[0] if eligible else None)
+    print(json.dumps({'selected': selected['home'] if selected else None, 'model': args.model, 'model_eligibility': 'requested' if args.model else 'unchecked', 'inventory_complete': True, 'candidates': results}, separators=(',', ':')))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (Unknown, OSError, ValueError, TypeError, RecursionError):
+        print(json.dumps({'error': 'account preview interrupted or unavailable'}), file=sys.stderr)
+        sys.exit(1)

@@ -23,7 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
-| **1.9.0** | 🚧 in progress | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
+| **1.9.0** | ✅ 2026-11-04 | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
 | **1.8.0** | ✅ released 2026-11-04 | Claude-first 97% weekly fallback with authenticated Codex continuation, structured task packages, model-aware orchestration, and durable run results |
 | **1.7.2** | ✅ released 2026-11-03 | Statusline: the 5h bar is left out on plans with no 5-hour window (Ultra), and the session count comes from Claude Code's session registry, so Chrome helper processes no longer count as sessions. ULTRACODE.md cleaned for current models after a prompt audit (checked by Codex and a separate Claude review): emphasis in capitals is plain text, and the title no longer carries its audit history; no rule changed |
 | 1.7.1 | ✅ released 2026-10-28 | Codex reviews can't act: `swap-guard codex-review` now switches off every MCP server, plugin, connector and browser tool for the review, and refuses to run if it can't list them. ULTRACODE.md now says how Fable's limit works: it counts against the same weekly limit as everything else, at most half of it on Max |
@@ -41,6 +41,60 @@ bars and percentages turn yellow at 50% · red at 80%
 | 1.0.x | released 2026-07-17/18 | First release: `/swap`, `/handoff`, statusline, ULTRACODE routing, PyPI package |
 
 Install or upgrade: `pipx install overclaude && overclaude install` (upgrade: `overclaude update`, or `pipx upgrade overclaude && overclaude install` from versions before 1.3).
+
+## Continuation reliability (1.9)
+
+`overclaude status --json` reads the latest continuation for the current project
+in the selected Codex home. Use `overclaude status --run /path/to/saved/run --json`
+to inspect a specific attempt. The manifest records lifecycle, thread ID, process
+identity, and final-report availability. A finished process does not mean its
+goal has been independently verified; read the report and its validation evidence.
+
+From the original project directory, `overclaude resume --run /path/to/saved/run
+--dry-run` validates an explicit saved session before resuming it. Omit
+`--dry-run` only when ready to continue that work.
+Resume keeps the original account home and workspace, checks recorded identity and
+configuration, and rejects runs without sufficient identity records. It does not
+choose the latest session automatically. Resumed work must check partial external
+effects before repeating an action.
+
+Guarded resume requires a supported ChatGPT file-credential identity and a matching
+native Codex configuration/policy fingerprint. Keyring/custom-provider or
+unverifiable configurations can still launch the original continuation workflow;
+their manifests explain why guarded resume is unavailable. The policy probe starts
+the native app server and reads configuration, never a model turn; it may need the
+service to resolve managed policy. Raw configuration and credentials are not logged.
+
+`/checkpoint` saves structured progress at a safe stage boundary. Quota nudges
+ask the parent to collect workers and save one before transferring work. Inspect
+saved versions with `overclaude-checkpoint list` and `overclaude-checkpoint show
+<id>` from the original project directory. Snapshots keep validation evidence,
+unfinished operations, and artifact references; they do not expire with handoff
+packages, harvest transcripts, or automatically commit files. A hard quota stop
+can only recover the last successfully saved snapshot.
+
+`overclaude codex-pool` previews account availability using native authenticated
+quota reads. Add `--model <model>` to check that model and its supported effort
+levels; without it, model eligibility is explicitly unchecked. Unknown, stale, or
+contradictory data is not treated as available capacity. Selection is deterministic
+and prefers the active eligible home; it never switches accounts or launches work.
+Only the primary home and direct account-profile directories are considered.
+
+`overclaude verify` checks installed kit files, modes, version, and required hook
+configuration offline. `overclaude update` runs this check after installation and
+returns a failure if integrity checks fail. Custom shell integration and statusline
+configuration are reported separately because the installer preserves them.
+
+Installations journal managed files before replacing them and verify the result
+before activating services. Inspect interrupted or failed updates with
+`overclaude recover --list`, then restore eligible files with
+`overclaude recover --transaction <id>`. Detected edits remain as conflicts;
+after reviewing them, add `--keep-current` to retain those files and resolve the
+transaction. Recovery does not roll back package-manager changes or service state.
+Installer locks coordinate installers; edits by other programs can still race a
+final file replacement.
+
+Implementation order and audit evidence: [docs/plan-1.9.md](docs/plan-1.9.md).
 
 ## What's new in 1.5
 

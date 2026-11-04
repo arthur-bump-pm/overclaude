@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 """Launch a durable Codex continuation from a dedicated handoff package."""
 import argparse
+import base64
+import contextlib
+import io
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
 HEADINGS = ('Goal', 'Current state', 'Files touched', 'Work in flight', 'Next steps', 'Validation', 'Codex execution plan')
-HARNESS = '''\n\nContinue the work described above. Follow AGENTS.md instructions. Use the installed $ultracode skill if available, or explicit bounded native subagent delegation for complex independent streams, using only available registered roles. Run objective verification, then independent review for auth, concurrency, or money changes. Maintain the goal, state, and test evidence. Avoid overlapping parent and worker writers; the parent must wait for workers.\n'''
+HARNESS = '''\n\nContinue the work described above. Follow AGENTS.md instructions. Use the installed $ultracode skill if available, or explicit bounded native subagent delegation for complex independent streams, using only available registered roles. Run objective verification, then independent review for auth, concurrency, or money changes. For every independent workstream specify ownership, objective, artifacts, and verification. Run deterministic checks, then an independent audit after each completed stage; fix findings and rerun relevant checks. Record each verdict, evidence, and limitations. Never claim the goal is complete solely because the process exited successfully. At safe audited stage boundaries, if overclaude-checkpoint is available, save an agent-written structured progress snapshot using its save command and actual session ID or explicit unknown provenance. Collect workers first; record unfinished operations and evidence without harvesting secrets or transcripts. Never commit or stash automatically for a checkpoint. Maintain the goal, state, and test evidence. Avoid overlapping parent and worker writers; the parent must wait for workers.\n'''
 
 
 def fail(message):
     raise ValueError(message)
 
 
-def route():
+def route(require_eligible=True):
     try:
         result = subprocess.run(['swap-guard', 'codex-route'], capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
         home = data['codex']['home']
-        if data.get('route') != 'codex' or data.get('eligible') is not True:
+        if require_eligible and (data.get('route') != 'codex' or data.get('eligible') is not True):
             fail('codex route declined or ineligible')
         if not isinstance(home, str) or not os.path.isabs(home):
             fail('route returned an invalid Codex home')
@@ -115,42 +120,394 @@ def pending_conflict(home, digest):
             fail('fresh pending Codex handoff conflicts with continuation: ' + str(p))
 
 
+MAX_LOG = 10 * 1024 * 1024
+MAX_EVENT = 1024 * 1024
+
+
+def atomic_json(path, data):
+    temp = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
+    try:
+        with temp.open('w', encoding='utf-8') as stream:
+            json.dump(data, stream, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def process_start(pid):
+    try:
+        result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True,
+                                text=True, timeout=2, check=True)
+        return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def selected_home():
+    override = os.environ.get('OVERCLAUDE_CODEX_HOME')
+    if override:
+        if not os.path.isabs(override):
+            fail('invalid selected Codex home')
+        return os.path.realpath(override)
+    base = Path.home() / '.codex-accounts'
+    try:
+        with (base / '.active').open() as marker:
+            name = ''.join(marker.readline(256).split())
+    except OSError:
+        name = ''
+    if re.fullmatch(r'[A-Za-z0-9_-]+', name) and name != 'primary' and (base / name).is_dir():
+        return os.path.realpath(base / name)
+    return os.path.realpath(Path.home() / '.codex')
+
+
+def status_command(argv):
+    parser = argparse.ArgumentParser(prog='overclaude-codex-continue status')
+    parser.add_argument('--run')
+    parser.add_argument('--cwd', default=os.getcwd())
+    parser.add_argument('--json', action='store_true')
+    args = parser.parse_args(argv)
+    cwd = os.path.realpath(args.cwd)
+    if args.run:
+        run = Path(os.path.abspath(args.run))
+        # No component in the supplied path may be a symlink.
+        if str(run) != os.path.realpath(run) or not run.is_dir():
+            fail('invalid continuation run path')
+    else:
+        home = selected_home()
+        digest = hashlib.sha256(cwd.encode()).hexdigest()[:12]
+        root = Path(home) / 'overcodex' / 'continuations' / digest
+        candidates = sorted((p for p in root.iterdir() if p.is_dir() and not p.is_symlink()), key=lambda p: p.stat().st_mtime_ns, reverse=True) if root.is_dir() else []
+        if not candidates:
+            fail('no continuation found for cwd in selected Codex home: ' + home)
+        run = candidates[0]
+    if (run.parent.parent.name != 'continuations' or run.parent.parent.parent.name != 'overcodex'
+            or not re.fullmatch(r'[0-9a-f]{12}', run.parent.name)
+            or not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}', run.name)):
+        fail('invalid continuation run path')
+    manifest_path = run / 'manifest.json'
+    fd = os.open(manifest_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            fail('invalid continuation manifest')
+        manifest = json.loads(stream.read(65537))
+    home = manifest.get('codex_home')
+    recorded_cwd = manifest.get('cwd')
+    if not isinstance(home, str) or not isinstance(recorded_cwd, str) or os.path.realpath(home) != home or os.path.realpath(recorded_cwd) != recorded_cwd:
+        fail('invalid continuation manifest identity')
+    digest = hashlib.sha256(recorded_cwd.encode()).hexdigest()[:12]
+    expected = Path(home) / 'overcodex' / 'continuations' / digest
+    if run.parent != expected or run.parent.is_symlink() or str(run) != os.path.realpath(run):
+        fail('run is outside its declared continuation root')
+    if not args.run and recorded_cwd != cwd:
+        fail('continuation cwd does not match requested cwd')
+    manifest['output_dir'] = str(run)
+    if manifest.get('state') in ('prepared', 'running'):
+        pid = manifest.get('runner_pid')
+        saved = manifest.get('runner_process_start')
+        current = process_start(pid) if isinstance(pid, int) and pid > 0 else None
+        if not current:
+            manifest['process_observation'] = 'runner not observed; manifest may reflect an abrupt interruption'
+        elif not saved:
+            manifest['process_observation'] = 'pid exists; identity not independently verified'
+        elif saved != current:
+            manifest['process_observation'] = 'pid reused; manifest may reflect an abrupt interruption'
+        else:
+            manifest['process_observation'] = 'runner identity matches recorded process start'
+    print(json.dumps(manifest, indent=None if args.json else 2))
+    return 0
+
+
+def stream_log(stream, path, stop, on_line=None):
+    written = 0
+    buffer = b''
+    oversized = False
+    with path.open('wb') as log:
+        while True:
+            ready, _, _ = select.select([stream], [], [], 0.2)
+            if not ready:
+                if stop.is_set():
+                    break
+                continue
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                break
+            if written < MAX_LOG:
+                part = chunk[:MAX_LOG - written]
+                log.write(part)
+                log.flush()
+                written += len(part)
+            if on_line:
+                for piece in chunk.splitlines(keepends=True):
+                    if not oversized:
+                        buffer += piece
+                        if len(buffer) > MAX_EVENT:
+                            buffer = b''
+                            oversized = True
+                    if piece.endswith(b'\n'):
+                        if not oversized:
+                            on_line(buffer)
+                        buffer = b''
+                        oversized = False
+
+
+RECONCILE = """Resume the recorded work. First inspect the current state and reconcile it with the previous session. Verify prior external effects before taking action; never blindly replay an operation. Continue only after establishing what remains. """
+
+
+def bounded_file(path, limit=1048576):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, 'rb') as stream:
+        st = os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            fail('unsupported configuration or authentication file')
+        data = stream.read(limit + 1)
+        if len(data) > limit:
+            fail('unsupported configuration or authentication file')
+        return data
+
+
+def identity_pin(home):
+    try:
+        data = bounded_file(Path(home) / 'auth.json')
+        if data is None:
+            return None
+        auth = json.loads(data)
+        if not isinstance(auth, dict):
+            return None
+        if auth.get('auth_mode') not in (None, 'chatgpt') or auth.get('OPENAI_API_KEY'):
+            return None
+        tokens = auth['tokens']
+        if not isinstance(tokens, dict):
+            return None
+        account = tokens['account_id']
+        jwt = tokens['id_token']
+        if not isinstance(account, str) or not account or not isinstance(jwt, str):
+            return None
+        parts = jwt.split('.')
+        if len(parts) != 3 or not all(parts):
+            return None
+        payload = parts[1] + '=' * (-len(parts[1]) % 4)
+        claims = json.loads(base64.b64decode(payload, altchars=b'-_', validate=True))
+        if not isinstance(claims, dict):
+            return None
+        subject = claims['sub']
+        if not isinstance(subject, str) or not subject:
+            return None
+        return hashlib.sha256(json.dumps([account, subject], separators=(',', ':')).encode()).hexdigest()
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError, RecursionError):
+        return None
+
+
+def policy_snapshot(home, cwd):
+    # Probe returns only a digest and non-secret resolved policy fields.
+    try:
+        reject_alternate_credentials()
+        result = subprocess.run(['overclaude-codex-probe', '--home', home, '--cwd', cwd, 'policy'],
+                                capture_output=True, timeout=20, check=True)
+        if len(result.stdout) > 65536:
+            return None
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict):
+            return None
+        digest = data.get('fingerprint')
+        if (data.get('policyVersion') != 2 or data.get('home') != home or data.get('cwd') != cwd
+                or data.get('provider') != 'openai' or data.get('authStore') != 'file'
+                or data.get('sandbox') != 'workspace-write' or 'approval' not in data
+                or 'networkAccess' not in data or not isinstance(digest, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+            return None
+        env = [[key, os.environ[key]] for key in sorted(os.environ)
+               if key.startswith(('CODEX_', 'OPENAI_')) and key not in ('CODEX_HOME', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_TOOL_CALL_ID')]
+        return hashlib.sha256(json.dumps([digest, env], separators=(',', ':')).encode()).hexdigest()
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError, RecursionError):
+        return None
+
+
+def load_run(path):
+    result = io.StringIO()
+    with contextlib.redirect_stdout(result):
+        status_command(['--run', path, '--json'])
+    return json.loads(result.getvalue())
+
+
+def process_inactive(pid, saved_start):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    current = process_start(pid)
+    return bool(saved_start and current and current != saved_start)
+
+
+def require_inactive_source(source):
+    state = source.get('state')
+    if state not in ('finished', 'failed', 'interrupted', 'running'):
+        fail('source process state is ambiguous')
+    if not process_inactive(source.get('runner_pid'), source.get('runner_process_start')):
+        fail('source runner may still be active')
+    child = source.get('child_pid')
+    if not process_inactive(child, source.get('child_process_start')):
+        fail('source child may still be active')
+    try:
+        os.killpg(child, 0)
+    except ProcessLookupError:
+        return
+    except (OSError, TypeError):
+        fail('source process group activity is unknown')
+    fail('source process group may still be active')
+
+
+def check_ambiguous_attempts(root, source_run, thread_id):
+    if not root.exists():
+        return
+    for run in root.iterdir():
+        if str(run) == source_run or not run.is_dir() or run.is_symlink():
+            continue
+        try:
+            data = bounded_file(run / 'manifest.json', 65536)
+            item = json.loads(data) if data is not None else None
+            if not isinstance(item, dict):
+                fail('ambiguous continuation attempt')
+            if item.get('state') in ('prepared', 'running') and item.get('thread_id') in (None, thread_id):
+                fail('another continuation attempt may be active')
+        except (OSError, ValueError, TypeError, RecursionError):
+            fail('ambiguous continuation attempt')
+
+
+def reject_alternate_credentials():
+    for key in ('CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORGANIZATION', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID'):
+        if os.environ.get(key):
+            fail('alternate credentials or provider overrides are unsupported: ' + key)
+
+
+def authenticate(home):
+    env = os.environ.copy()
+    env['CODEX_HOME'] = home
+    try:
+        result = subprocess.run(['codex', 'login', 'status'], env=env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10)
+        if result.returncode:
+            fail('pinned Codex home is not authenticated')
+    except (OSError, subprocess.TimeoutExpired):
+        fail('cannot establish authentication for pinned Codex home')
+
+
 def main():
+    if sys.argv[1:2] == ['status']:
+        return status_command(sys.argv[2:])
+    resuming = sys.argv[1:2] == ['resume']
     parser = argparse.ArgumentParser()
-    parser.add_argument('--package', required=True)
-    parser.add_argument('--complexity', choices=('standard', 'complex'), default='standard')
-    parser.add_argument('--dry-run', action='store_true')
-    args = parser.parse_args()
+    if resuming:
+        parser.add_argument('--run', required=True)
+        parser.add_argument('--dry-run', action='store_true')
+        args = parser.parse_args(sys.argv[2:])
+    else:
+        parser.add_argument('--package', required=True)
+        parser.add_argument('--complexity', choices=('standard', 'complex'), default='standard')
+        parser.add_argument('--dry-run', action='store_true')
+        args = parser.parse_args()
     os.umask(0o077)
     cwd = os.getcwd()
     digest = hashlib.sha256(cwd.encode()).hexdigest()[:12]
-    raw = package(args.package, cwd)
-    home, route_details = route()
-    pending = Path(home) / 'overcodex' / ('handoff-pending-' + digest + '.md')
-    if os.path.abspath(args.package) == str(pending):
-        fail('package must be a dedicated outbox file, not the pending handoff')
-    pending_conflict(home, digest)
-    model, effort, reason = model_for(home, args.complexity)
-    limits_known = route_details.get('limitsKnown')
-    limits_fresh = route_details.get('limitsFresh')
-    uncertainty = None if limits_known is True and limits_fresh is True else 'Codex usage limits are unknown or stale.'
-    plan = {'limitsKnown': limits_known, 'limitsFresh': limits_fresh, 'uncertainty': uncertainty, 'cwd': cwd, 'codex_home': home, 'complexity': args.complexity, 'model': model, 'effort': effort, 'model_reason': reason, 'dry_run': args.dry_run}
-    if args.dry_run:
-        print(json.dumps(plan))
-        return 0
+    source = None
+    if resuming:
+        source = load_run(args.run)
+        home = source['codex_home']
+        if source['cwd'] != cwd:
+            fail('resume cwd does not match recorded cwd')
+        thread_id = source.get('thread_id')
+        try:
+            if not isinstance(thread_id, str) or str(uuid.UUID(thread_id)) != thread_id:
+                fail('resume requires an exact recorded thread UUID')
+        except ValueError:
+            fail('resume requires an exact recorded thread UUID')
+        model, effort = source.get('model'), source.get('effort')
+        if not ((model is None and effort is None) or
+                (isinstance(model, str) and re.fullmatch(r'[a-z0-9.-]+', model) and
+                 effort in ('low', 'medium', 'high', 'xhigh', 'max', 'ultra'))):
+            fail('invalid recorded model or effort')
+        if not source.get('identity_pin') or not source.get('config_pin') or source.get('policy_version') != 2:
+            fail('resume unavailable: source lacks supported identity or policy pins')
+        reason = 'original model and effort retained'
+        raw = (RECONCILE + HARNESS).encode()
+        plan = {'cwd': cwd, 'codex_home': home, 'model': model, 'effort': effort,
+                'model_reason': reason, 'thread_id': thread_id, 'source_run': source['output_dir'], 'dry_run': args.dry_run}
+    else:
+        raw = package(args.package, cwd)
+        home, route_details = route()
+        pending = Path(home) / 'overcodex' / ('handoff-pending-' + digest + '.md')
+        if os.path.abspath(args.package) == str(pending):
+            fail('package must be a dedicated outbox file, not the pending handoff')
+        pending_conflict(home, digest)
+        model, effort, reason = model_for(home, args.complexity)
+        limits_known = route_details.get('limitsKnown')
+        limits_fresh = route_details.get('limitsFresh')
+        uncertainty = None if limits_known is True and limits_fresh is True else 'Codex usage limits are unknown or stale.'
+        plan = {'limitsKnown': limits_known, 'limitsFresh': limits_fresh, 'uncertainty': uncertainty, 'cwd': cwd, 'codex_home': home, 'complexity': args.complexity, 'model': model, 'effort': effort, 'model_reason': reason, 'dry_run': args.dry_run}
+        if args.dry_run:
+            print(json.dumps(plan))
+            return 0
     root = Path(home) / 'overcodex' / 'continuations' / digest
+    if str(root) != os.path.realpath(root):
+        fail('continuation root contains a symlink')
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if str(root) != os.path.realpath(root):
+        fail('continuation root contains a symlink')
     os.chmod(root, 0o700)
-    lock_root = Path.home() / '.claude-swap-backup' / 'continuations'
+    lock_root = Path(os.path.realpath(Path.home())) / '.claude-swap-backup' / 'continuations'
+    if str(lock_root) != os.path.realpath(lock_root):
+        fail('continuation lock root contains a symlink')
     lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if str(lock_root) != os.path.realpath(lock_root):
+        fail('continuation lock root contains a symlink')
     os.chmod(lock_root, 0o700)
     lock_path = lock_root / (digest + '.lock')
-    with lock_path.open('a') as lock:
-        os.chmod(lock_path, 0o600)
+    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(lock_fd, 'a') as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            fail('continuation lock is not a regular file')
+        os.fchmod(lock.fileno(), 0o600)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             fail('another continuation is already running for this cwd')
+        if resuming:
+            # Revalidate under the per-cwd lock; no route/account switching is involved.
+            if load_run(args.run) != source:
+                fail('resume source changed during validation')
+            require_inactive_source(source)
+            check_ambiguous_attempts(root, source['output_dir'], thread_id)
+            if identity_pin(home) != source['identity_pin'] or policy_snapshot(home, cwd) != source['config_pin']:
+                fail('pinned Codex identity or configuration changed')
+            pending_conflict(home, digest)
+            authenticate(home)
+            if identity_pin(home) != source['identity_pin'] or policy_snapshot(home, cwd) != source['config_pin']:
+                fail('pinned Codex identity or configuration changed during authentication')
+            if args.dry_run:
+                print(json.dumps(plan))
+                return 0
+        if resuming:
+            pins = {'identity_pin': source['identity_pin'], 'config_pin': source['config_pin'],
+                    'policy_version': 2, 'resume_unavailable_reason': None}
+        else:
+            snapshot = policy_snapshot(home, cwd)
+            identity = identity_pin(home) if snapshot is not None else None
+            pins = {'identity_pin': identity, 'config_pin': snapshot if identity else None,
+                    'policy_version': 2 if identity else None,
+                    'resume_unavailable_reason': None if identity else 'effective Codex configuration or identity not verified'}
         run = root / (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + uuid.uuid4().hex)
         run.mkdir(mode=0o700)
         print('Continuation output: ' + str(run), file=sys.stderr, flush=True)
@@ -158,58 +515,148 @@ def main():
             path = run / name
             path.write_text(content, encoding='utf-8')
             os.chmod(path, 0o600)
-        write('package.md', raw.decode('utf-8'))
+        if not resuming:
+            write('package.md', raw.decode('utf-8'))
         plan['output_dir'] = str(run)
         write('plan.json', json.dumps(plan, indent=2) + '\n')
-        write('state.json', json.dumps({'state': 'prepared', 'exit_code': None}) + '\n')
-        command = ['codex', 'exec', '-s', 'workspace-write', '-C', cwd, '--skip-git-repo-check', '--color', 'never', '-o', str(run / 'last-message.md')]
+        manifest = {'version': 1, 'state': 'prepared', 'cwd': cwd, 'codex_home': home,
+                    'created_at': time.time(), 'updated_at': time.time(), 'started_at': None,
+                    'finished_at': None, 'runner_pid': os.getpid(), 'runner_process_start': process_start(os.getpid()),
+                    'child_pid': None, 'child_process_start': None,
+                    'thread_id': thread_id if resuming else None, 'source_run': source['output_dir'] if resuming else None,
+                    'model': model, 'effort': effort, **pins, 'exit_code': None, 'goal_verified': False,
+                    'final_message_present': False}
+        manifest_lock = threading.Lock()
+        def update(**changes):
+            with manifest_lock:
+                manifest.update(changes, updated_at=time.time())
+                atomic_json(run / 'manifest.json', manifest)
+                # Keep the existing state artifact for older consumers.
+                atomic_json(run / 'state.json', {'state': manifest['state'], 'exit_code': manifest['exit_code']})
+        update()
+        command = ['codex', 'exec', '-s', 'workspace-write', '-C', cwd, '--skip-git-repo-check', '--color', 'never', '--json', '-o', str(run / 'last-message.md')]
         if model:
             command += ['-m', model, '-c', 'model_reasoning_effort="' + effort + '"']
+        if resuming:
+            command += ['resume', thread_id]
         command.append('-')
         env = os.environ.copy()
         env['CODEX_HOME'] = home
         try:
             # Verify all launch-sensitive state again while holding the lock.
-            if route()[0] != home:
-                fail('Codex home changed before launch')
+            if resuming:
+                if identity_pin(home) != source['identity_pin'] or policy_snapshot(home, cwd) != source['config_pin']:
+                    fail('pinned Codex identity or configuration changed before launch')
+                authenticate(home)
+                if identity_pin(home) != source['identity_pin'] or policy_snapshot(home, cwd) != source['config_pin']:
+                    fail('pinned Codex identity or configuration changed during authentication')
+            else:
+                if route()[0] != home:
+                    fail('Codex home changed before launch')
+                if package(args.package, cwd) != raw:
+                    fail('package changed before launch')
+                if pins['policy_version'] == 2 and (policy_snapshot(home, cwd) != pins['config_pin'] or identity_pin(home) != pins['identity_pin']):
+                    pins.update(identity_pin=None, config_pin=None, policy_version=None,
+                                resume_unavailable_reason='effective Codex configuration or identity changed before launch')
+                    update(**pins)
             pending_conflict(home, digest)
-            if package(args.package, cwd) != raw:
-                fail('package changed before launch')
-            with (run / 'events.log').open('w') as events, (run / 'stderr.log').open('w') as errors:
-                os.chmod(run / 'events.log', 0o600)
-                os.chmod(run / 'stderr.log', 0o600)
-                child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=events, stderr=errors, env=env, start_new_session=True)
+            def event(line):
                 try:
-                    child.communicate(raw + HARNESS.encode())
-                except BaseException:
-                    # Repeated termination signals must not interrupt cleanup. The
-                    # leader can exit before a descendant that ignored SIGTERM.
-                    previous = {sig: signal.signal(sig, signal.SIG_IGN)
-                                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+                    item = json.loads(line)
+                    if item.get('type') == 'thread.started':
+                        event_id = item.get('thread_id')
+                        if isinstance(event_id, str) and str(uuid.UUID(event_id)) == event_id:
+                            if resuming and event_id != thread_id:
+                                raise RuntimeError('Codex reported a different thread UUID')
+                            if manifest['thread_id'] is None:
+                                update(thread_id=event_id)
+                except (ValueError, TypeError, AttributeError, UnicodeError, RecursionError):
+                    pass
+            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, env=env, start_new_session=True)
+            stop_readers = threading.Event()
+            reader_errors = []
+            def read_stream(stream, path, callback=None):
+                try:
+                    stream_log(stream, path, stop_readers, callback)
+                except Exception as exc:
+                    reader_errors.append(exc)
+            readers = [threading.Thread(target=read_stream, args=(child.stdout, run / 'events.log', event), daemon=True),
+                       threading.Thread(target=read_stream, args=(child.stderr, run / 'stderr.log'), daemon=True)]
+            started_readers = []
+            group_cleaned = False
+            try:
+                for reader in readers:
+                    reader.start()
+                    started_readers.append(reader)
+                update(state='running', started_at=time.time(), child_pid=child.pid,
+                       child_process_start=process_start(child.pid))
+                prompt = memoryview(raw if resuming else raw + HARNESS.encode())
+                os.set_blocking(child.stdin.fileno(), False)
+                while child.poll() is None:
+                    if reader_errors:
+                        raise OSError('event or stderr log reader failed: ' + str(reader_errors[0]))
+                    if prompt:
+                        _, writable, _ = select.select([], [child.stdin], [], 0.1)
+                        if writable:
+                            try:
+                                prompt = prompt[os.write(child.stdin.fileno(), prompt):]
+                            except BrokenPipeError:
+                                prompt = prompt[:0]
+                        if not prompt:
+                            child.stdin.close()
+                    else:
+                        time.sleep(0.1)
+                if not child.stdin.closed:
+                    child.stdin.close()
+            except BaseException:
+                previous = {sig: signal.signal(sig, signal.SIG_IGN)
+                            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+                try:
                     try:
-                        try:
-                            os.killpg(child.pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            child.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            pass
-                        try:
-                            os.killpg(child.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        child.wait()
-                    finally:
-                        for sig, handler in previous.items():
-                            signal.signal(sig, handler)
+                        os.killpg(child.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        child.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
                     raise
+                finally:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+                    group_cleaned = True
+                    for sig, handler in previous.items():
+                        signal.signal(sig, handler)
+            finally:
+                # A successful leader may leave descendants holding output pipes.
+                if not group_cleaned:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                for reader in started_readers:
+                    reader.join(timeout=1)
+                stop_readers.set()
+                for reader in started_readers:
+                    reader.join(timeout=1)
+            if any(reader.is_alive() for reader in started_readers):
+                fail('log readers did not stop after bounded drain')
+            if reader_errors:
+                raise OSError('event or stderr log reader failed: ' + str(reader_errors[0]))
             code = child.returncode
-            write('state.json', json.dumps({'state': 'completed' if code == 0 else 'failed', 'exit_code': code}) + '\n')
-        except BaseException:
-            write('state.json', json.dumps({'state': 'failed', 'exit_code': None}) + '\n')
+            final = run / 'last-message.md'
+            present = final.is_file() and final.stat().st_size > 0
+            update(state='finished' if code == 0 else 'failed', exit_code=code,
+                   finished_at=time.time(), final_message_present=present)
+        except BaseException as exc:
+            update(state='interrupted' if isinstance(exc, (KeyboardInterrupt, Terminated)) else 'failed',
+                   exit_code=None, finished_at=time.time())
             raise
-        print(json.dumps({'output_dir': str(run), 'final_message': str(run / 'last-message.md'), 'exit_code': code, 'model_reason': reason}))
+        print(json.dumps({'output_dir': str(run), 'final_message': str(run / 'last-message.md'), 'exit_code': code, 'model_reason': reason, 'goal_verified': False, 'final_message_present': present}))
         if code:
             print('Continuation failed; inspect the output and use codex resume if appropriate.', file=sys.stderr)
         return code if code >= 0 else 128 - code
@@ -228,7 +675,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGHUP, handle_termination)
     try:
         sys.exit(main())
-    except (ValueError, OSError, UnicodeError) as exc:
+    except (ValueError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         print('overclaude-codex-continue: ' + str(exc), file=sys.stderr)
         sys.exit(1)
     except Terminated as exc:

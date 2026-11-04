@@ -72,9 +72,13 @@ fi
 echo "-- files --"
 for p in \
   "$LOCALBIN/swap-guard" \
+  "$LOCALBIN/overclaude-checkpoint" \
   "$LOCALBIN/overclaude-codex-continue" \
+  "$LOCALBIN/overclaude-codex-probe" \
+  "$LOCALBIN/overclaude-codex-pool" \
   "$CLAUDE_DIR/skills/swap/SKILL.md" \
   "$CLAUDE_DIR/skills/handoff/SKILL.md" \
+  "$CLAUDE_DIR/skills/checkpoint/SKILL.md" \
   "$CLAUDE_DIR/hooks/handoff-inject.sh" \
   "$CLAUDE_DIR/hooks/ctx-watch.sh" \
   "$CLAUDE_DIR/hooks/ctx-notify.sh" \
@@ -88,7 +92,15 @@ for p in \
 done
 
 # Prune now-empty skill directories (never touch anything non-empty).
-for d in "$CLAUDE_DIR/skills/swap" "$CLAUDE_DIR/skills/handoff"; do
+for runtime_file in README.md __init__.py tomli/LICENSE tomli/__init__.py tomli/_parser.py tomli/_re.py tomli/_types.py tomli/py.typed; do
+  p="$LOCALBIN/overclaude_runtime/$runtime_file"
+  if [ -f "$p" ]; then
+    rm -f "$p" && note_did "removed $p" || note_warn "could not remove $p"
+  fi
+done
+# Bytecode and user files are left alone; remove only empty runtime directories.
+rmdir "$LOCALBIN/overclaude_runtime/tomli" "$LOCALBIN/overclaude_runtime" 2>/dev/null || true
+for d in "$CLAUDE_DIR/skills/swap" "$CLAUDE_DIR/skills/handoff" "$CLAUDE_DIR/skills/checkpoint"; do
   [ -d "$d" ] && rmdir "$d" 2>/dev/null && note_did "removed empty dir $d"
 done
 echo
@@ -168,7 +180,7 @@ else
         "~/.local/bin/swap-guard ratelimit", "~/.local/bin/swap-guard artifact-log",
         "~/.local/bin/swap-guard route-guard"]) as $ours
     | (if (.permissions.allow) != null then
-         .permissions.allow |= map(select(. != "Bash(cswap *)" and . != "Bash(swap-guard *)" and . != "Bash(overclaude-codex-continue *)"))
+         .permissions.allow |= map(select(. != "Bash(cswap *)" and . != "Bash(swap-guard *)" and . != "Bash(overclaude-codex-continue *)" and . != "Bash(overclaude-checkpoint *)"))
        else . end)
     | (if (.hooks | type) == "object" then
          .hooks |= with_entries(.value |= (if type == "array"

@@ -43,9 +43,12 @@ echo
 # ---------------------------------------------------------------------------
 for f in \
   "$SCRIPT_DIR/bin/swap-guard" \
+  "$SCRIPT_DIR/bin/overclaude-checkpoint" \
+  "$SCRIPT_DIR/bin/overclaude-install-transaction" \
   "$SCRIPT_DIR/bin/overclaude-codex-continue" \
   "$SCRIPT_DIR/skills/swap/SKILL.md" \
   "$SCRIPT_DIR/skills/handoff/SKILL.md" \
+  "$SCRIPT_DIR/skills/checkpoint/SKILL.md" \
   "$SCRIPT_DIR/hooks/handoff-inject.sh" \
   "$SCRIPT_DIR/hooks/ctx-watch.sh" \
   "$SCRIPT_DIR/hooks/ctx-notify.sh" \
@@ -132,201 +135,17 @@ esac
 echo
 
 # ---------------------------------------------------------------------------
-# Helpers.
+# Managed payload + shared configuration: write-ahead journal and offline verify.
+# Dependency installation above and service activation below are separate.
 # ---------------------------------------------------------------------------
-
-# backup_file <path> — timestamped backup if the file exists. Prints backup path.
-backup_file() {
-  bf_path="$1"
-  if [ -f "$bf_path" ]; then
-    cp -p "$bf_path" "$bf_path.bak-$EPOCH" || die "backup failed: $bf_path"
-    echo "$bf_path.bak-$EPOCH"
-  fi
-}
-
-# install_file <src> <dest> <mode|-> — copy with backup-on-change, chmod.
-# No backup, no copy when the destination is already identical.
-install_file() {
-  if_src="$1"; if_dest="$2"; if_mode="$3"
-  mkdir -p "$(dirname "$if_dest")" || die "mkdir failed for $if_dest"
-  if [ -f "$if_dest" ]; then
-    if cmp -s "$if_src" "$if_dest"; then
-      [ "$if_mode" != "-" ] && chmod "$if_mode" "$if_dest" 2>/dev/null
-      note_skip "up-to-date: $if_dest"
-      return 0
-    fi
-    b=$(backup_file "$if_dest")
-    cp "$if_src" "$if_dest" || die "copy failed: $if_dest"
-    [ "$if_mode" != "-" ] && chmod "$if_mode" "$if_dest"
-    note_did "updated: $if_dest (backup: $b)"
-  else
-    cp "$if_src" "$if_dest" || die "copy failed: $if_dest"
-    [ "$if_mode" != "-" ] && chmod "$if_mode" "$if_dest"
-    note_did "installed: $if_dest"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# 2. File copies.
-# ---------------------------------------------------------------------------
-echo "-- files --"
-install_file "$SCRIPT_DIR/bin/overclaude-codex-continue" "$LOCALBIN/overclaude-codex-continue" 755
-install_file "$SCRIPT_DIR/bin/swap-guard"                 "$LOCALBIN/swap-guard"                 755
-install_file "$SCRIPT_DIR/skills/swap/SKILL.md"           "$CLAUDE_DIR/skills/swap/SKILL.md"     -
-install_file "$SCRIPT_DIR/skills/handoff/SKILL.md"        "$CLAUDE_DIR/skills/handoff/SKILL.md"  -
-install_file "$SCRIPT_DIR/hooks/handoff-inject.sh"        "$CLAUDE_DIR/hooks/handoff-inject.sh"  755
-install_file "$SCRIPT_DIR/hooks/ctx-watch.sh"             "$CLAUDE_DIR/hooks/ctx-watch.sh"       755
-install_file "$SCRIPT_DIR/hooks/ctx-notify.sh"            "$CLAUDE_DIR/hooks/ctx-notify.sh"      755
-install_file "$SCRIPT_DIR/statusline/statusline-command.sh" "$CLAUDE_DIR/statusline-command.sh" 755
-install_file "$SCRIPT_DIR/claude/ULTRACODE.md"            "$CLAUDE_DIR/ULTRACODE.md"             -
-# Record the installed kit version (doctor + the statusline's update badge read it).
-# `overclaude install` passes OVERCLAUDE_VERSION; a git checkout has pyproject.toml.
+echo "-- managed files and settings --"
 KIT_VER="${OVERCLAUDE_VERSION:-}"
 [ -n "$KIT_VER" ] || KIT_VER=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SCRIPT_DIR/pyproject.toml" 2>/dev/null | head -1)
-# A wheel payload run directly (no pyproject.toml, no env): ask the installed CLI.
 [ -n "$KIT_VER" ] || KIT_VER=$(overclaude version 2>/dev/null | head -1)
-if [ -n "$KIT_VER" ] && mkdir -p "$HOME/.claude-swap-backup" 2>/dev/null; then
-  printf '%s\n' "$KIT_VER" > "$HOME/.claude-swap-backup/kit-version"
-fi
-echo
-
-# ---------------------------------------------------------------------------
-# 3. CLAUDE.md — ensure "@ULTRACODE.md" import line present.
-# ---------------------------------------------------------------------------
-echo "-- CLAUDE.md --"
-mkdir -p "$CLAUDE_DIR"
-if [ -f "$CLAUDE_MD" ] && grep -qxF '@ULTRACODE.md' "$CLAUDE_MD"; then
-  note_skip "@ULTRACODE.md already imported in $CLAUDE_MD"
-else
-  b=""
-  [ -f "$CLAUDE_MD" ] && b=$(backup_file "$CLAUDE_MD")
-  # Ensure a trailing newline before appending, then add the import line.
-  if [ -f "$CLAUDE_MD" ] && [ -s "$CLAUDE_MD" ]; then
-    # add a separating newline only if the file does not already end with one
-    if [ -n "$(tail -c1 "$CLAUDE_MD")" ]; then printf '\n' >>"$CLAUDE_MD"; fi
-  fi
-  printf '@ULTRACODE.md\n' >>"$CLAUDE_MD" || die "could not write $CLAUDE_MD"
-  if [ -n "$b" ]; then
-    note_did "appended @ULTRACODE.md to $CLAUDE_MD (backup: $b)"
-  else
-    note_did "created $CLAUDE_MD with @ULTRACODE.md"
-  fi
-fi
-echo
-
-# ---------------------------------------------------------------------------
-# 4. settings.json merge (jq, idempotent, preserves existing content).
-# ---------------------------------------------------------------------------
-echo "-- settings.json --"
-if [ -f "$SETTINGS" ]; then
-  if ! grep -q '[^[:space:]]' "$SETTINGS" 2>/dev/null; then
-    CUR_JSON='{}'   # empty/whitespace-only file: treat as fresh
-  elif CUR_JSON=$(jq -ce 'if type == "object" then . else error("not an object") end' "$SETTINGS" 2>/dev/null); then
-    :
-  else
-    die "$SETTINGS is not a JSON object; refusing to touch it. Fix or remove it first."
-  fi
-else
-  CUR_JSON='{}'
-fi
-
-# Detect a pre-existing statusLine (so we can warn and skip rather than overwrite).
-STATUSLINE_EXISTS=no
-if printf '%s' "$CUR_JSON" | jq -e '.statusLine != null' >/dev/null 2>&1; then
-  STATUSLINE_EXISTS=yes
-fi
-
-MERGED=$(jq -n \
-  --argjson cur "$CUR_JSON" \
-  --slurpfile fragarr "$FRAG" \
-  '
-  ($fragarr[0]) as $frag
-  | ($cur.permissions.allow // []) as $ca
-  | ($frag.permissions.allow // []) as $fa
-  # Each fragment hook group is added to its event unless a hook with the same
-  # script (last path component of the command) is already registered there.
-  | def marker: (.command // "") | sub("^bash +"; "") | split("/") | last;
-    def has($evt; $m): (($cur.hooks[$evt]) // []) | any(.[].hooks[]?; (.command // "") | contains($m));
-    ($cur
-     | .permissions = (.permissions // {})
-     | .permissions.allow = ($ca + ($fa - $ca))
-     | .hooks = (.hooks // {})
-     | reduce ($frag.hooks | to_entries[]) as $e (.;
-         reduce $e.value[] as $g (.;
-           if has($e.key; ($g.hooks[0] | marker)) then .
-           else .hooks[$e.key] = ((.hooks[$e.key] // []) + [$g]) end))
-     | (if (.statusLine == null) then .statusLine = $frag.statusLine else . end))
-  ') || die "jq merge failed for settings.json"
-
-# New in 1.3: automatic account switching on a usage cap. Say so the first time
-# the hook lands, so an upgrade never turns it on silently.
-if ! printf '%s' "$CUR_JSON" | jq -e '[.hooks.StopFailure[]?.hooks[]?.command // ""] | any(contains("swap-guard ratelimit"))' >/dev/null 2>&1; then
-  note_warn "Instant swap is ON: when a usage cap stops a session, overclaude switches to the account"
-  note_warn "  with the most room (this flips all live sessions). Turn it off: swap-guard auto instant off"
-fi
-
-# New in 1.4: the routing guard can deny tool calls that used to pass — say so once.
-if ! printf '%s' "$CUR_JSON" | jq -e '[.hooks.PreToolUse[]?.hooks[]?.command // ""] | any(contains("swap-guard route-guard"))' >/dev/null 2>&1; then
-  note_warn "Routing guard is ON: on Fable sessions, a subagent launched without a model is blocked"
-  note_warn "  with the fix (pass a model, or model \"fable\" on purpose). Turn it off: swap-guard route-guard off"
-  note_warn "  The statusline also refreshes a 7-day spend estimate in the background (SWAP_HIDE_SPEND=1 hides it)."
-fi
-
-# statusLine notice: we never overwrite an existing one (but stay quiet when
-# the existing one already points at the kit's script).
-CUR_SL=$(printf '%s' "$CUR_JSON" | jq -r '.statusLine.command // ""' 2>/dev/null)
-if [ "$STATUSLINE_EXISTS" = yes ] && [ "$CUR_SL" = "bash ~/.claude/statusline-command.sh" ]; then
-  note_skip "statusLine already points at the kit's statusline"
-elif [ "$STATUSLINE_EXISTS" = yes ]; then
-  note_warn "settings.json already defines a statusLine — leaving it untouched."
-  note_warn "  NOTE: the kit's statusline is what publishes the context relay that the"
-  note_warn "  ctx-watch/ctx-notify hooks read — WITHOUT it the /handoff threshold"
-  note_warn "  prompts will never fire. To enable them, set .statusLine.command to:"
-  note_warn "    bash ~/.claude/statusline-command.sh   (refreshInterval: 10)"
-  note_warn "  or merge the relay-publishing block into your own statusline script."
-fi
-
-# Write only if the normalized result differs from what is already there.
-CUR_NORM=$(printf '%s' "$CUR_JSON" | jq -S . 2>/dev/null)
-NEW_NORM=$(printf '%s' "$MERGED"   | jq -S . 2>/dev/null)
-if [ "$CUR_NORM" = "$NEW_NORM" ]; then
-  note_skip "settings.json already has the kit's config (no change)"
-else
-  b=""
-  [ -f "$SETTINGS" ] && b=$(backup_file "$SETTINGS")
-  mkdir -p "$CLAUDE_DIR"
-  printf '%s\n' "$MERGED" | jq . >"$SETTINGS.tmp-$EPOCH" || die "could not render settings.json"
-  mv "$SETTINGS.tmp-$EPOCH" "$SETTINGS" || die "could not write $SETTINGS"
-  if [ -n "$b" ]; then
-    note_did "merged kit config into settings.json (backup: $b)"
-  else
-    note_did "created settings.json with kit config"
-  fi
-fi
-echo
-
-# ---------------------------------------------------------------------------
-# 5. .zshrc — append the integration snippet if the begin marker is absent.
-# ---------------------------------------------------------------------------
-echo "-- .zshrc --"
-if [ -f "$ZSHRC" ] && grep -qF "$BEGIN_MARKER" "$ZSHRC"; then
-  note_skip "claude-swap zshrc block already present in $ZSHRC"
-else
-  b=""
-  [ -f "$ZSHRC" ] && b=$(backup_file "$ZSHRC")
-  if [ -f "$ZSHRC" ] && [ -s "$ZSHRC" ]; then
-    # ensure a trailing newline, then a blank separator line before our block
-    if [ -n "$(tail -c1 "$ZSHRC")" ]; then printf '\n' >>"$ZSHRC"; fi
-    printf '\n' >>"$ZSHRC"
-  fi
-  cat "$ZSNIPPET" >>"$ZSHRC" || die "could not append to $ZSHRC"
-  if [ -n "$b" ]; then
-    note_did "appended claude-swap block to $ZSHRC (backup: $b)"
-  else
-    note_did "created $ZSHRC with claude-swap block"
-  fi
-  note_warn "Open a new shell or run: source $ZSHRC"
-fi
+[ -n "$KIT_VER" ] || die "cannot determine kit version"
+python3 "$SCRIPT_DIR/bin/overclaude-install-transaction" --payload "$SCRIPT_DIR" apply --version "$KIT_VER" ||
+  die "managed file transaction failed; package/dependency changes, if any, are separate; inspect or recover the transaction"
+note_did "managed payload and settings verified"
 echo
 
 # ---------------------------------------------------------------------------

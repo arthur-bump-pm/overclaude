@@ -2802,7 +2802,8 @@ cmd_loop_guard() {
 # never sees it. This hook runs after every tool call and, the first time the active
 # account crosses its line (5-hour window 90%, week 95%, any per-model limit like
 # Fable 90%), tells that agent once to finish the step it is on and save progress, so
-# a switch at the limit (instant swap) or at 95% (auto-swap) loses nothing half-done.
+# a later session can recover the last saved progress. A hard cutoff may prevent
+# another snapshot; the hook cannot guarantee lossless recovery.
 # Cheap when nothing is near a limit: the band is recomputed only when cswap's usage
 # cache or the active account changes. On by default; `checkpoint off` to silence.
 CKPT_OFF="$STATE_ROOT/checkpoint.off"
@@ -2889,7 +2890,7 @@ EOF
     if [ -n "$aid" ]; then
       msg="${msg}You are a subagent: finish the task you are on and return your result now, without starting more work."
     else
-      msg="${msg}Wrap up before it runs out: finish the step you are on, save progress so the work can resume (write results to files, commit if this is a repo, and for a long task keep a short notes file of where you are and what is next), and do not start a new batch of subagents or a long workflow right now. If the limit is reached, the account switches automatically and you will be told to continue."
+      msg="${msg}Wrap up before it runs out: finish the step you are on and collect agent results, then use /checkpoint to save progress at a safe boundary (session ID: $sid), and do not start a new batch of subagents or a long workflow right now. If the limit is reached, the account switches automatically and you will be told to continue."
     fi
     _auto_log "$(jq -cn --argjson ts "$(date +%s)" --arg s "$sid" --arg a "$aid" --arg w "$win" --argjson p "$pct" \
       '{ts:($ts|todate), source:"checkpoint", action:"nudged", window:$w, pct:$p, session:$s} + (if $a != "" then {agent:$a} else {} end)')"

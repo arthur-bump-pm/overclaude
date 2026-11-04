@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Bounded native Codex policy inspection; never starts a thread or model turn."""
+import argparse
+import hashlib
+import json
+import os
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        from overclaude_runtime import tomli as tomllib
+    except ImportError:
+        tomllib = None
+
+MAX_BYTES = 2 * 1024 * 1024
+DEADLINE = 5.0
+
+
+class ProbeError(Exception):
+    pass
+
+
+def pin_agent_configs(config, origins, layers):
+    """Pin native-resolved role files without following symlinks or recursion."""
+    agents = config.get('agents')
+    if agents is None:
+        return []
+    if not isinstance(agents, dict):
+        raise ProbeError('unsupported agent configuration')
+    pins, total = [], 0
+    for name, role in sorted(agents.items()):
+        if not isinstance(role, dict) or role.get('config_file') is None:
+            continue
+        path = role['config_file']
+        origin = origins.get('agents.' + name + '.config_file')
+        if (not isinstance(path, str) or not os.path.isabs(path) or path != os.path.normpath(path) or
+                not isinstance(origin, dict) or not isinstance(origin.get('name'), dict) or
+                not any(isinstance(layer, dict) and layer.get('name') == origin['name'] for layer in layers)):
+            raise ProbeError('agent config reference is ambiguous')
+        if len(pins) >= 32:
+            raise ProbeError('too many agent config references')
+        fd = None
+        try:
+            # Open each path component without following any symlink, even in
+            # intermediate directories. Never read a FIFO or device.
+            fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+            components = path.split('/')[1:]
+            for component in components[:-1]:
+                next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            file_fd = os.open(components[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                st = os.fstat(file_fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > 1024 * 1024:
+                    raise ProbeError('agent config is not a bounded regular file')
+                data = b''
+                while len(data) <= 1024 * 1024:
+                    chunk = os.read(file_fd, min(65536, 1024 * 1024 + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+                if len(data) > 1024 * 1024:
+                    raise ProbeError('agent config exceeds limit')
+            finally:
+                os.close(file_fd)
+        except OSError:
+            raise ProbeError('agent config cannot be safely read') from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+        total += len(data)
+        if total > 4 * 1024 * 1024:
+            raise ProbeError('agent configs exceed total limit')
+        # Resolve nested references structurally, including escaped TOML keys.
+        # A missing bundled parser leaves role files safely non-resumable.
+        if tomllib is None:
+            raise ProbeError('agent config parser is unavailable')
+        try:
+            parsed = tomllib.loads(data.decode('utf-8'))
+        except (ValueError, UnicodeError, RecursionError):
+            raise ProbeError('agent config is invalid') from None
+        def has_reference(value):
+            if isinstance(value, dict):
+                return any((isinstance(key, str) and (key.endswith('_file') or key in ('include', 'includes')))
+                           or has_reference(item) for key, item in value.items())
+            if isinstance(value, list):
+                return any(has_reference(item) for item in value)
+            return False
+        if has_reference(parsed):
+            raise ProbeError('recursive agent config references are unsupported')
+        pins.append({'role': name, 'path': path, 'sha256': hashlib.sha256(data).hexdigest()})
+    return pins
+
+
+def probe(home, cwd):
+    if not os.path.isabs(home) or not os.path.isabs(cwd):
+        raise ProbeError('home and cwd must be absolute')
+    home, cwd = os.path.realpath(home), os.path.realpath(cwd)
+    if not os.path.isdir(home) or not os.path.isdir(cwd):
+        raise ProbeError('home or cwd is unavailable')
+    if any(os.environ.get(k) for k in ('CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL',
+                                        'OPENAI_ORGANIZATION', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID')):
+        raise ProbeError('credential or endpoint environment override is unsupported')
+    env = dict(os.environ, CODEX_HOME=home)
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    oldmask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+    try:
+        process = subprocess.Popen(['codex', '-c', 'sandbox_mode="workspace-write"', 'app-server'],
+                                   cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, start_new_session=True,
+                                   preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, oldmask))
+    except OSError:
+        signal.pthread_sigmask(signal.SIG_SETMASK, oldmask)
+        raise ProbeError('cannot start Codex app-server') from None
+    received, buffer = 0, b''
+
+    def send(message):
+        try:
+            process.stdin.write((json.dumps(message, separators=(',', ':')) + '\n').encode())
+            process.stdin.flush()
+        except (OSError, BrokenPipeError):
+            raise ProbeError('app-server input failed') from None
+
+    def request(number, method, params=None):
+        nonlocal received, buffer
+        message = {'id': number, 'method': method}
+        if params is not None:
+            message['params'] = params
+        send(message)
+        deadline = time.monotonic() + DEADLINE
+        while True:
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                try:
+                    item = json.loads(line)
+                except (ValueError, UnicodeError, RecursionError):
+                    raise ProbeError('invalid app-server response') from None
+                if not isinstance(item, dict):
+                    raise ProbeError('invalid app-server response')
+                if item.get('id') == number:
+                    if 'error' in item or not isinstance(item.get('result'), dict):
+                        raise ProbeError('app-server request failed')
+                    return item['result']
+                if 'id' in item and 'method' in item:
+                    raise ProbeError('unexpected app-server request')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                raise ProbeError('app-server request timed out')
+            try:
+                part = os.read(process.stdout.fileno(), min(65536, MAX_BYTES + 1 - received))
+            except OSError:
+                raise ProbeError('app-server output failed') from None
+            if not part:
+                raise ProbeError('app-server closed output')
+            received += len(part)
+            if received > MAX_BYTES:
+                raise ProbeError('app-server output exceeded limit')
+            buffer += part
+
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, oldmask)
+        init = request(1, 'initialize', {'clientInfo': {'name': 'overclaude-policy-probe', 'version': '2'}})
+        user_agent = init.get('userAgent')
+        if (not isinstance(user_agent, str) or len(user_agent) > 1024 or
+                not re.search(r'/[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?(?:\s|$)', user_agent) or
+                any(ord(ch) < 32 or ord(ch) == 127 for ch in user_agent)):
+            raise ProbeError('app-server identity is unavailable')
+        reported = init.get('codexHome')
+        if not isinstance(reported, str) or not os.path.isabs(reported) or os.path.realpath(reported) != home:
+            raise ProbeError('app-server reported a different Codex home')
+        send({'method': 'initialized'})
+        snapshot = request(2, 'config/read', {'includeLayers': True, 'cwd': cwd})
+        requirements = request(3, 'configRequirements/read')
+        config, origins = snapshot.get('config'), snapshot.get('origins')
+        if not isinstance(config, dict) or not isinstance(origins, dict) or not isinstance(snapshot.get('layers'), list):
+            raise ProbeError('incomplete effective configuration')
+        if 'requirements' not in requirements or not (requirements['requirements'] is None or isinstance(requirements['requirements'], dict)):
+            raise ProbeError('incomplete policy requirements')
+        if not {'model_provider', 'cli_auth_credentials_store', 'sandbox_mode', 'approval_policy',
+                'sandbox_workspace_write', 'model_providers'}.issubset(config):
+            raise ProbeError('incomplete effective policy')
+        provider = config.get('model_provider')
+        auth = config.get('cli_auth_credentials_store')
+        sandbox = config.get('sandbox_mode')
+        approval = config.get('approval_policy')
+        workspace = config.get('sandbox_workspace_write')
+        if auth is None:
+            # Older servers report the file default as null. Only infer it when
+            # every exposed layer and requirement proves there is no auth setting.
+            def has_auth_setting(value):
+                if isinstance(value, dict):
+                    return any((key in ('cli_auth_credentials_store', 'cliAuthCredentialsStore') and val is not None)
+                               or has_auth_setting(val) for key, val in value.items())
+                if isinstance(value, list):
+                    return any(has_auth_setting(item) for item in value)
+                return False
+            layers = snapshot['layers']
+            allowed_layers = {'sessionFlags', 'user', 'project', 'system', 'packagedDefaults'}
+            if (origins.get('cli_auth_credentials_store') is not None or
+                    has_auth_setting(requirements['requirements']) or
+                    any(not isinstance(layer, dict) or not isinstance(layer.get('name'), dict) or
+                        layer['name'].get('type') not in allowed_layers or
+                        not isinstance(layer.get('config'), dict) or has_auth_setting(layer['config'])
+                        for layer in layers)):
+                raise ProbeError('authentication store default is ambiguous')
+            auth = 'file'
+        if provider not in (None, 'openai') or auth != 'file' or sandbox != 'workspace-write':
+            raise ProbeError('effective provider, authentication store or sandbox is unsupported')
+        providers = config.get('model_providers')
+        if not isinstance(providers, dict) or 'openai' in providers or config.get('openai_base_url') is not None:
+            raise ProbeError('custom OpenAI provider is unsupported')
+        if config.get('chatgpt_base_url') not in (None, 'https://chatgpt.com/backend-api/'):
+            raise ProbeError('custom ChatGPT endpoint is unsupported')
+        if config.get('forced_login_method') not in (None, 'chatgpt'):
+            raise ProbeError('effective login method is unsupported')
+        if approval is not None and not isinstance(approval, str):
+            raise ProbeError('unsupported approval policy')
+        if workspace is not None and not isinstance(workspace, dict):
+            raise ProbeError('unsupported workspace sandbox')
+        network = None if workspace is None else workspace.get('network_access')
+        if network is not None and not isinstance(network, bool):
+            raise ProbeError('unsupported workspace network policy')
+        role_pins = pin_agent_configs(config, origins, snapshot['layers'])
+        canonical = json.dumps({'userAgent': user_agent, 'config': snapshot, 'requirements': requirements, 'agentConfigs': role_pins}, sort_keys=True,
+                               separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode()
+        return {'policyVersion': 2, 'home': home, 'cwd': cwd,
+                'fingerprint': hashlib.sha256(canonical).hexdigest(), 'provider': 'openai',
+                'authStore': auth, 'sandbox': sandbox, 'approval': approval, 'networkAccess': network}
+    finally:
+        # Even a successful app-server can leave children; release the entire group.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument('--home', required=True)
+    parser.add_argument('--cwd', required=True)
+    parser.add_argument('operation', choices=['policy'])
+    args = parser.parse_args()
+    def interrupted(_sig, _frame):
+        raise ProbeError('probe interrupted')
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    try:
+        print(json.dumps(probe(args.home, args.cwd), separators=(',', ':')))
+    except (ProbeError, OSError, ValueError, TypeError, RecursionError) as exc:
+        # Never echo server output, stderr, config values or exception details.
+        message = str(exc) if isinstance(exc, ProbeError) else 'cannot inspect effective policy'
+        print(json.dumps({'error': message}, separators=(',', ':')), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
