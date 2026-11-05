@@ -421,13 +421,13 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 
 ```bash
 ./sync.sh            # live setup -> repo: scrub-gated diff, commit, push
-./sync.sh --release  # + version bump + GitHub release -> PyPI (trusted publishing)
+./sync.sh --release  # + version bump, build + upload to PyPI from this Mac, GitHub release
 ./sync.sh --dry-run  # preview either
 bash scrub.sh --install-hook   # once per clone: pre-push check for commits made outside sync.sh
 bash scrub.sh --history        # scan every commit for personal data
 ```
 
-`bash tests/run.sh` runs the suite locally (throwaway `$HOME`, never touches your live setup); CI runs it plus shellcheck and a wheel-payload check on macOS for every push, and the PyPI publish job waits for it.
+`bash tests/run.sh` runs the suite locally (throwaway `$HOME`, never touches your live setup). There is no CI: `./sync.sh --release` runs shellcheck, the suite under `/bin/bash` 3.2 and a wheel-payload check before it uploads anything.
 
 A plain `git push` updates git installs only — **PyPI users get changes only via releases**. The scrub gate aborts any commit whose diff contains usernames, emails, or `/Users/…` paths, and first proves it still works (`scrub.sh --self-test`). See `CLAUDE.md` for the full protocol.
 

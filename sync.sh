@@ -1,8 +1,8 @@
 #!/bin/bash
 # sync.sh — pull the LIVE setup files from this machine back into the repo,
 # scrub-check the diff for personal data, then commit and push.
-# With --release: also bump the patch version and cut a GitHub release,
-# which triggers the PyPI publish workflow.
+# With --release: also bump the patch version, build and upload to PyPI from
+# this Mac, then push and cut a GitHub release. No GitHub Actions (owner's rule).
 # macOS /bin/bash 3.2 compatible.
 # Usage: ./sync.sh [--dry-run] [--release] [commit message]
 set -u
@@ -10,6 +10,7 @@ set -u
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR" || exit 1
 
+PKG=overclaude
 DRY_RUN=no
 RELEASE=no
 MSG=""
@@ -22,8 +23,8 @@ for arg in "$@"; do
     *) MSG="$arg" ;;
   esac
 done
-# A release is cut from main only: gh tags the commit given by --target below, and
-# CI's Tests run (which publish.yml reuses) only runs for pushes to main.
+# A release is cut from main only: gh tags the commit given by --target below,
+# and PyPI should only ever get what main has.
 if [ "$RELEASE" = yes ]; then
   BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
   [ "$BR" = main ] || {
@@ -104,8 +105,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Release gate: shellcheck + the full suite must pass BEFORE anything is
-# committed, pushed, or released. CI re-checks, but by then a GitHub release
-# already exists — a red CI run would leave a release with no PyPI package.
+# committed, pushed, or released. Nothing re-checks later: there is no CI.
 # Runs under /bin/bash 3.2, the strictest shell users' `env bash` resolves to.
 # ---------------------------------------------------------------------------
 if [ "$RELEASE" = yes ]; then
@@ -113,6 +113,15 @@ if [ "$RELEASE" = yes ]; then
   echo "== release gate (tests before anything ships) =="
   # Homebrew's folders aren't on PATH in every shell (Claude Code's `!` runs a bare one).
   PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+  # The PyPI upload token lives in the login Keychain; check it first so a release
+  # never stops half-way. The owner stores it once (see CLAUDE.md); it is never printed.
+  if [ "$DRY_RUN" != yes ]; then
+    command -v uv >/dev/null 2>&1 || { echo "release: uv not found — brew install uv" >&2; exit 1; }
+    /usr/bin/security find-generic-password -s "pypi-$PKG" -a __token__ >/dev/null 2>&1 || {
+      echo "release: no PyPI token in the Keychain (service pypi-$PKG). Store it once with:" >&2
+      echo "  security add-generic-password -U -a __token__ -s pypi-$PKG -w" >&2
+      exit 1; }
+  fi
   command -v shellcheck >/dev/null 2>&1 || {
     echo "release: shellcheck not found — brew install shellcheck" >&2; exit 1; }
   shellcheck -S error bin/swap-guard hooks/*.sh statusline/statusline-command.sh \
@@ -182,8 +191,8 @@ if [ "$NOTHING_TO_COMMIT" = no ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# --release: patch-bump the version and cut a GitHub release. The repo's
-# publish.yml workflow then builds and publishes to PyPI (trusted publishing).
+# --release: patch-bump the version, build on this Mac, check the wheel, upload
+# to PyPI, then push and cut the GitHub release (notes only; nothing runs there).
 # Remember: git push alone does NOT update PyPI — only releases do.
 # ---------------------------------------------------------------------------
 [ "$RELEASE" = yes ] || exit 0
@@ -226,7 +235,7 @@ fi
 [ -n "$NOTES" ] || NOTES="- $MSG"
 
 if [ "$DRY_RUN" = yes ]; then
-  echo "(dry run) would bump $CUR -> $NEW and create release v$NEW with notes:"
+  echo "(dry run) would bump $CUR -> $NEW, build and upload $PKG $NEW to PyPI, and create release v$NEW with notes:"
   printf '%s\n' "$NOTES"
   exit 0
 fi
@@ -237,11 +246,25 @@ if [ "$NEW" != "$CUR" ]; then
     echo "release: version-bump commit failed" >&2; exit 1
   }
 fi
+# Build and upload BEFORE pushing: a failed upload leaves only a local bump commit,
+# and re-running `./sync.sh --release` picks it up as a manual bump (same version).
+DIST=$(mktemp -d "${TMPDIR:-/tmp}/$PKG-dist.XXXXXX")
+uv build --quiet --sdist --wheel -o "$DIST" || { echo "release: build failed (nothing pushed)" >&2; exit 1; }
+bash tests/check_wheel.sh "$DIST" || { echo "release: wheel check failed (nothing pushed)" >&2; exit 1; }
+uvx --quiet twine check --strict "$DIST"/* || { echo "release: twine check failed (nothing pushed)" >&2; exit 1; }
+# --check-url skips files PyPI already has, so a re-run after a partial upload is safe.
+TOKEN="$(/usr/bin/security find-generic-password -s "pypi-$PKG" -a __token__ -w 2>/dev/null)"
+[ -n "$TOKEN" ] || { echo "release: could not read the PyPI token from the Keychain (unlock it, then re-run; nothing pushed)" >&2; exit 1; }
+UV_PUBLISH_TOKEN="$TOKEN" uv publish --quiet --check-url "https://pypi.org/simple/" "$DIST"/* || {
+  echo "release: PyPI upload failed (the version bump is not pushed). Fix it, then re-run ./sync.sh --release" >&2; exit 1; }
+unset TOKEN
+rm -rf "$DIST"
+echo "  [ok] $PKG $NEW uploaded to PyPI"
 # Manual bump: the version is already committed, so there is no bump commit — just push.
-git push || { echo "release: push failed" >&2; exit 1; }
+git push || { echo "release: push failed (PyPI already has $NEW) — re-run: git push && gh release create v$NEW" >&2; exit 1; }
 gh release create "v$NEW" --target "$(git rev-parse HEAD)" --title "overclaude v$NEW" --notes "$NOTES" || {
   echo "release: gh release create failed — the version bump IS committed; re-run: gh release create v$NEW" >&2
   exit 1
 }
-echo "Release v$NEW created — GitHub Actions is now publishing to PyPI."
-echo "Verify in ~2 min: pipx upgrade overclaude   (or: curl -s https://pypi.org/pypi/overclaude/json | jq -r .info.version)"
+echo "Release v$NEW created and $PKG $NEW is on PyPI."
+echo "Other machines update with: overclaude update   (or: pipx upgrade overclaude && overclaude install)"
