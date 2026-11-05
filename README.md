@@ -23,7 +23,8 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
-| **1.9.0** | ✅ 2026-11-04 | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
+| **1.9.1** | ✅ 2026-11-05 | Bundles cswap 0.29.0 (was 0.26.0), so `overclaude install` and `overclaude update` upgrade an older cswap on their own. New in cswap since 0.26: switching onto an account with a session running no longer logs it out, every file it writes is atomic, a separate weekly switch line, the most-headroom escape when every account is over its lines, and no more `MallocStackLogging` lines under memory pressure on macOS. Its JSON and cache formats only gained fields; overclaude reads them unchanged |
+| 1.9.0 | ✅ 2026-11-04 | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
 | **1.8.0** | ✅ released 2026-11-04 | Claude-first 97% weekly fallback with authenticated Codex continuation, structured task packages, model-aware orchestration, and durable run results |
 | **1.7.2** | ✅ released 2026-11-03 | Statusline: the 5h bar is left out on plans with no 5-hour window (Ultra), and the session count comes from Claude Code's session registry, so Chrome helper processes no longer count as sessions. ULTRACODE.md cleaned for current models after a prompt audit (checked by Codex and a separate Claude review): emphasis in capitals is plain text, and the title no longer carries its audit history; no rule changed |
 | 1.7.1 | ✅ released 2026-10-28 | Codex reviews can't act: `swap-guard codex-review` now switches off every MCP server, plugin, connector and browser tool for the review, and refuses to run if it can't list them. ULTRACODE.md now says how Fable's limit works: it counts against the same weekly limit as everything else, at most half of it on Max |
@@ -42,7 +43,16 @@ bars and percentages turn yellow at 50% · red at 80%
 
 Install or upgrade: `pipx install overclaude && overclaude install` (upgrade: `overclaude update`, or `pipx upgrade overclaude && overclaude install` from versions before 1.3).
 
-Release details: [1.9](#whats-new-in-19) · [1.8](#whats-new-in-18) · [1.7](#whats-new-in-17) · [1.6](#whats-new-in-16) · [1.5](#whats-new-in-15)
+Release details: [1.9.1](#whats-new-in-191) · [1.9](#whats-new-in-19) · [1.8](#whats-new-in-18) · [1.7](#whats-new-in-17) · [1.6](#whats-new-in-16) · [1.5](#whats-new-in-15)
+
+## What's new in 1.9.1
+
+The bundled cswap moves from 0.26.0 to 0.29.0. You don't need to do anything: `overclaude update` (or `pipx upgrade overclaude && overclaude install`) upgrades an older installed cswap to it, and never downgrades a newer one. What 0.27–0.29 bring is in the [cswap release notes](https://github.com/realiti4/claude-swap/releases); the parts that matter here:
+
+- Switching onto an account that a session has used no longer takes that login down: an exited session's rotated token is adopted first, and while a session is still running the switch refuses a token it has rotated past.
+- Every file cswap writes (`~/.claude.json`, `sequence.json`, the caches) is replaced atomically, so a reader never sees a half-written file.
+- `cswap list --json` adds `loginExpiresAt`, `usageError` and `usageRetryAt`; `cache/usage.json` stays at schema 2. Nothing overclaude reads was renamed or removed.
+- On macOS, `cswap auto` and the dashboard stop printing `MallocStackLogging` lines once memory gets tight.
 
 ## What's new in 1.9
 
@@ -400,7 +410,7 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 | `claude/ULTRACODE.md` | `~/.claude/` + `CLAUDE.md` import | Model/effort routing policy |
 | `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | hooks (SessionStart handoff inject; UserPromptSubmit ctx-watch + usage bands; Stop banners; StopFailure `rate_limit` instant swap; PostToolUse `Artifact` registry), statusLine, 2 permission allows |
 | `shell/zshrc-snippet.sh` | `~/.zshrc` (markers) | `claude()` relaunch wrapper, `swap` alias, PATH guard |
-| `vendor/claude-swap/` | pipx/uv-installed if absent or older | The bundled credential engine (0.26.0) |
+| `vendor/claude-swap/` | pipx/uv-installed if absent or older | The bundled credential engine (0.29.0) |
 | `doctor.sh` | run by `overclaude doctor` | Read-only health check |
 | `~/Library/LaunchAgents/com.overclaude.autoswap.plist` | only via `/swap auto on` | Runs `swap-guard auto tick` every 3 min (opt-in; removed by uninstall) |
 

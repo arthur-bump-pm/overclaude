@@ -114,9 +114,15 @@ n0="$(wc -l < "$HOME/codex-calls")"
 assert_eq "$(STUB_MCP_FAIL=1 "$SG" codex-review --dir "$HOME" "x" | jq -r .error)" "mcp-lock-failed" "fails closed when the MCP list can't be read"
 assert_eq "$(STUB_MCP='[{"name":"a.b"}]' "$SG" codex-review --dir "$HOME" "x" | jq -r .error)" "mcp-lock-failed" "fails closed on a name that isn't a safe config key"
 assert_eq "$(STUB_FEAT_FAIL=1 "$SG" codex-review --dir "$HOME" "x" | jq -r .error)" "mcp-lock-failed" "fails closed when the feature list can't be read"
-n1="$(ls "${TMPDIR:-/tmp}" | wc -l)"
-printf 'diff' | STUB_MCP_FAIL=1 "$SG" codex-review --stdin --dir "$HOME" "x" >/dev/null
-assert_eq "$(ls "${TMPDIR:-/tmp}" | wc -l)" "$n1" "a refused review leaves no stdin temp file behind"
+# Look for the leaked file by its content: counting the shared temp dir raced other
+# processes, and macOS mktemp ignores TMPDIR, so a private TMPDIR can't catch it.
+mark="stdin-leak-check-$$-$RANDOM"
+printf '%s' "$mark" | STUB_MCP_FAIL=1 "$SG" codex-review --stdin --dir "$HOME" "x" >/dev/null
+leaks=0
+for d in "${TMPDIR:-/tmp}" "$(dirname "$(mktemp -u)")"; do
+  for f in "$d"/*; do [ -f "$f" ] && grep -qF "$mark" "$f" 2>/dev/null && leaks=$((leaks + 1)); done
+done
+assert_eq "$leaks" "0" "a refused review leaves no stdin temp file behind"
 assert_eq "$(wc -l < "$HOME/codex-calls")" "$n0" "and Codex is never started in any of these cases"
 assert_eq "$(STUB_MCP='[]' "$SG" codex-review --dir "$HOME" "x" | jq -r .ok)" "true" "no MCP servers configured is fine"
 assert_eq "$("$SG" codex-review --timeout 0 "x" | jq -r .error)" "bad-timeout" "--timeout 0 (no timeout) is refused"
