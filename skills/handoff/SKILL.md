@@ -5,7 +5,7 @@ argument-hint: "[account] [now|force] | <mac> | codex [auto] | status | cancel |
 allowed-tools: Read, Write, Bash(overclaude-codex-continue *), Bash(overclaude-checkpoint *), Bash(overclaude status *), Bash(overclaude resume *), Bash(mktemp *), Bash(swap-guard *), Bash(cswap *), Bash(date +%s), Bash(wc -c *), Bash(git status *)
 ---
 
-GATE — read before acting. Exception: `/handoff codex auto` may be invoked by the installed automatic quota policy only after running `swap-guard codex-route` and verifying `route == "codex"` and `eligible == true`. This is standing authorization to continue the same requested work, not permission to broaden it. A hook message alone is not proof; recheck the command. For this verified automatic case, follow the automatic procedure below without asking again. For every other handoff, the following consent gate applies. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff, /swap ... handoff or /swap codex themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, STOP — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
+Consent gate. Exception: `/handoff codex auto` may be invoked by the installed automatic quota policy only after running `swap-guard codex-route` and verifying `route == "codex"` and `eligible == true`. This is standing authorization to continue the same requested work, not permission to broaden it. A hook message alone is not proof; recheck the command. For this verified automatic case, follow the automatic procedure below without asking again. For every other handoff, the following consent rule applies. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly requested or accepted a handoff in this conversation: they typed /handoff, /swap ... handoff or /swap codex themselves, said yes to a handoff offer, or asked to continue in a fresh session. If no such explicit consent exists in the transcript, stop — write no files, run no commands. Instead ask: "Context is at N% — want me to hand this off to a fresh session?" and wait for the reply.
 
 # /handoff — continue in a fresh session
 
@@ -19,9 +19,9 @@ Rulings:
 - `status`, `cancel`, `history`, or `restore` present → run that subcommand only, then stop (`restore` takes an optional number and `force`).
 - `restart` present → error: restart is a /swap mode; point to `/swap <target> restart`.
 - `force` with no target → proceed, note "no switch requested — force ignored".
-- Target present → `/handoff <target>` ≡ `/swap <target> handoff`: preflight is MANDATORY (the switch flips ALL live sessions). No target → same-account handoff, no preflight needed.
+- Target present → `/handoff <target>` ≡ `/swap <target> handoff`: preflight is required (the switch flips all live sessions). No target → same-account handoff, no preflight needed.
 - `now` present → phase-2 idle-kill variant (Package step 6).
-- `codex` and `auto` present → use ONLY the automatic weekly-quota continuation procedure below (including its fresh route check), not the manual Codex startup procedure.
+- `codex` and `auto` present → use only the automatic weekly-quota continuation procedure below (including its fresh route check), not the manual Codex startup procedure.
 - `codex` present without `auto` → hand off to the Codex CLI instead of a Claude session (section below); never combined with a Claude account target.
 - Another Mac: `remote <mac>` always means a Mac. A bare target that is in `swap-guard fleet list` is a Mac too, unless `swap-guard preflight <target>` also knows it as an account (verdict other than `unknown-target`) — then ask "the Mac or the account?" and wait. A Mac handoff switches no account (that Mac runs on its own login) and never combines with `codex`, `now` or an account target.
 - Flag mode vocabulary is exactly `{"mode":"handoff"}` — never "fresh" or other synonyms.
@@ -37,7 +37,7 @@ For when every Claude account is out (or the user just wants Codex): the package
 
 ## `/handoff codex auto` — automatic weekly-quota continuation
 
-This policy uses Claude first. The parent session checks `swap-guard codex-route`; only a verified `route: "codex", eligible: true` permits this procedure. At least two enabled Claude subscription accounts must each have decision-trusted, unexpired weekly usage at or above 97%. A reading is trusted for 180 seconds, or for at most 660 seconds while a successful vendor-scheduled poll is still pending with no recorded fetch error. Missing or untrusted usage is not exhaustion: refresh with `cswap list` and recheck once. If Claude has room, continue there using `/swap` preflight rules; never force a busy/global credential switch. API-key and explicitly disabled accounts do not count. Codex must be logged in in the selected home and have no known unexpired exhausted window. Unknown Codex limits are disclosed and launch is attempted once; failures preserve the package.
+This policy uses Claude first. The parent session checks `swap-guard codex-route`; only a verified `route: "codex", eligible: true` permits this procedure. At least two enabled Claude subscription accounts must each have decision-trusted, unexpired weekly usage at or above 97%. A reading is trusted for 180 seconds, or for at most 660 seconds while a successful vendor-scheduled poll is still pending with no recorded fetch error. Missing or untrusted usage is not exhaustion: refresh with `cswap list` and recheck once. If Claude has room, continue there using `/swap` preflight rules (an account switch still needs the user's request or the installed auto-swap); never force a busy/global credential switch. API-key and explicitly disabled accounts do not count. Codex must be logged in in the selected home and have no known unexpired exhausted window. Unknown Codex limits are disclosed and launch is attempted once; failures preserve the package.
 
 1. Finish the current atomic step. Collect running agents' results and stop their writers before transferring ownership. Do not start another batch. Record unfinished jobs and exact resume points. Subagents return to their parent and never launch this procedure. Save a durable `/checkpoint` from the collected state before transfer when the checkpoint helper is available; include its returned ID in the handoff. A checkpoint does not start another session or replace this outbox package, and its history is independent of the ten-minute handoff TTL.
 2. Run `swap-guard artifacts` and retain the manifest and saved local sources. Preserve any previously established approvals and constraints. Do not export account-only data without authorization.
@@ -105,11 +105,11 @@ Recovers a package that expired (10-min TTL) or was injected into a session the 
 
 ## Switching (`/handoff <target> [now] [force]`)
 
-Run recipe steps 1–2 NOW (the verdict gate). Run step 3 (the actual `cswap switch`) only AFTER Package step 3 — the artifact snapshot and any db export must happen while this session is still on the account that owns those artifacts; the switch flips this session's credentials within ~30s.
+Run recipe steps 1–2 first (the verdict gate). Run step 3 (the actual `cswap switch`) only after Package step 3 — the artifact snapshot and any db export must happen while this session is still on the account that owns those artifacts; the switch flips this session's credentials within ~30s.
 
 <!-- SHARED:PREFLIGHT-RECIPE BEGIN -->
 1. Run `swap-guard preflight <target>` and read `.verdict` from its JSON output.
-2. If `unknown-target` → report `.detail` and stop. If `relogin-required` → REFUSE to switch (this includes a login past its end date); give the recovery recipe: `/swap relogin <N>` (runs `swap-guard login <N>`: saves the live account's token first, signs in inside a throwaway profile, registers slot N), then retry. Never suggest a plain `/login` + `cswap add`: signing in over the live account overwrites its newest token before cswap saved it, which kills the live account next. If `busy` and the `force` token was NOT given → STOP and show the `.busy` table (pid, sessionId, cwd, kind, entrypoint, status; missing status means possibly-busy); tell the user to re-run with `force` to override. If `login-ending` → REFUSE to switch: the target's login ends within hours (`.detail` says when), so sessions moved there would stop then; relay `.detail` — renew first with `/swap relogin <N>`, then retry. `force` never overrides it.
+2. If `unknown-target` → report `.detail` and stop. If `relogin-required` → refuse to switch (this includes a login past its end date); give the recovery recipe: `/swap relogin <N>` (runs `swap-guard login <N>`: saves the live account's token first, signs in inside a throwaway profile, registers slot N), then retry. Never suggest a plain `/login` + `cswap add`: signing in over the live account overwrites its newest token before cswap saved it, which kills the live account next. If `busy` and the `force` token was NOT given → stop and show the `.busy` table (pid, sessionId, cwd, kind, entrypoint, status; missing status means possibly-busy); tell the user to re-run with `force` to override. If `login-ending` → refuse to switch: the target's login ends within hours (`.detail` says when), so sessions moved there would stop then; relay `.detail` — renew first with `/swap relogin <N>`, then retry. `force` never overrides it.
 3. If `ok` (or `busy` overridden by `force`) → run `cswap switch <target> --json`, then report `.reason` and every entry of `.warnings[]` to the user.
 <!-- SHARED:PREFLIGHT-RECIPE END -->
 
@@ -120,7 +120,7 @@ Run recipe steps 1–2 NOW (the verdict gate). Run step 3 (the actual `cswap swi
 2b. Artifacts: run `swap-guard artifacts`. It reads this session's transcript (plus subagent/workflow transcripts), copies every published/touched artifact's source into `~/.claude-swap-backup/handoff-artifacts/<sessionId>/<artifact_id>/` (the scratchpad is session-scoped /tmp and dies with the session), and prints a manifest (`.account` = active account at collection time, `.artifacts[]` with `url`, `title`, `owner` (the account that published it, from the artifact registry; null if it predates the registry → assume `.account`), `saved`, `savedFiles`, `capabilities`). `saved: null` → source already gone; say so in the package. If switching to a DIFFERENT account:
    - Same link across accounts: artifacts are owned by the account that published them, and the new account can update one in place only if the owner shared it with edit access. For each still-in-play artifact whose owner is not the target account, tell the user once (optional, one click each, before or after the switch): "To keep <title> editable at the same link, open <url> → Share → Can edit → <target email>." Do not wait for an answer; note `share: asked` on that artifact's package line.
    - If an artifact has a `db` capability, ask the user whether to export its rows first; if yes, read them with ArtifactData now and write them as JSON next to `saved` (the new account cannot read them later).
-3. Write the package to P with the Write tool. Line 1 of the file MUST be exactly this comment — first line, no blank line before it, `cwd` = the absolute cwd from step 1, `created` = the epoch integer from step 1:
+3. Write the package to P with the Write tool. Line 1 of the file must be exactly this comment — first line, no blank line before it, `cwd` = the absolute cwd from step 1, `created` = the epoch integer from step 1:
 
 ```markdown
 <!-- handoff cwd="<abs-cwd>" created="<epoch-int>" -->
@@ -142,11 +142,11 @@ Fill every section from this conversation — concise and decision-dense; a summ
 3b. If a target was given: run recipe step 3 now (`cswap switch <target> --json`, report `.reason` + `.warnings[]`).
 4. Flag: run `swap-guard flag '{"mode":"handoff"}'` (it fills cwd and created). Skip this step in VS Code (below).
 5. Tell the user: "Press Ctrl+D — the wrapper opens a fresh session with the handoff preloaded." Injection requires the same directory and happens only within 10 minutes; after that the package is archived as expired.
-6. `now` token: run `swap-guard schedule-kill <pid>` (pid from step 1). If it errors (v1 stub), say phase-2 is not enabled and fall back to the Ctrl+D instruction in step 5.
+6. `now` token: phase-2 idle-kill is not built yet (`swap-guard schedule-kill` is a stub); say so and give the Ctrl+D instruction in step 5.
 
 ## VS Code degradation
 
-If `.entrypoint == "claude-vscode"`: write the package (steps 1–3) but NOT the flag; tell the user to reload the VS Code window manually — the SessionStart injector loads the package in the new window's session.
+If `.entrypoint == "claude-vscode"`: write the package (steps 1–3) but not the flag; tell the user to reload the VS Code window manually — the SessionStart injector loads the package in the new window's session.
 
 ## ctx-watch interplay
 

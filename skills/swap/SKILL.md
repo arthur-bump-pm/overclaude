@@ -5,7 +5,7 @@ argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <a
 allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(overclaude doctor *), Bash(bash *doctor.sh*)
 ---
 
-GATE — read before acting. If this skill was invoked by you (the model) rather than typed by the user, first verify the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, memory check/cleanup, routing guard, continue in Codex, fleet, remote session, doctor). Never invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task. If explicit consent is missing, STOP and ask. A dead account token is ALWAYS fixed with `swap-guard login <N>` (the relogin section) — never a plain `/login`, which kills the live account's token.
+Consent gate. If this skill was invoked by you (the model) rather than typed by the user, first confirm the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, memory check/cleanup, routing guard, continue in Codex, fleet, remote session, doctor). Don't invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task; without that request, stop and ask. Fix a dead account token with `swap-guard login <N>` (the relogin section), never a plain `/login`, which kills the live account's token.
 
 # /swap — Claude account switcher
 
@@ -64,7 +64,7 @@ Edge rulings:
 - `forecast` takes nothing else and never has a target; it never switches.
 - `mem` takes an optional `clean`, or `watch`/`autoclean`/`nudge`/`gate` with `on`/`off` (alone → status); it never has a target and never switches.
 - `spend` takes an optional `days N` (default 7); `guard` takes `on`/`off`/`status` (alone → `status`). Neither has a target.
-- `codex` present (e.g. `/swap codex`, `/swap codex handoff`) → INVOKE the handoff skill as `/handoff codex` (continue in the Codex CLI); `codex` is never a Claude account target. This takes precedence over the `/swap handoff` (no target) ruling. An account aliased `codex` stays reachable by slot number or email.
+- `codex` present (e.g. `/swap codex`, `/swap codex handoff`) → invoke the handoff skill as `/handoff codex` (continue in the Codex CLI); `codex` is never a Claude account target. This takes precedence over the `/swap handoff` (no target) ruling. An account aliased `codex` stays reachable by slot number or email.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
 - Flag mode vocabulary matches the command names exactly: `{"mode":"handoff"}` and `{"mode":"restart","sessionId":...}` — never "fresh"/"resume" or other synonyms.
 
@@ -72,7 +72,7 @@ Edge rulings:
 
 <!-- SHARED:PREFLIGHT-RECIPE BEGIN -->
 1. Run `swap-guard preflight <target>` and read `.verdict` from its JSON output.
-2. If `unknown-target` → report `.detail` and stop. If `relogin-required` → REFUSE to switch (this includes a login past its end date); give the recovery recipe: `/swap relogin <N>` (runs `swap-guard login <N>`: saves the live account's token first, signs in inside a throwaway profile, registers slot N), then retry. Never suggest a plain `/login` + `cswap add`: signing in over the live account overwrites its newest token before cswap saved it, which kills the live account next. If `busy` and the `force` token was NOT given → STOP and show the `.busy` table (pid, sessionId, cwd, kind, entrypoint, status; missing status means possibly-busy); tell the user to re-run with `force` to override. If `login-ending` → REFUSE to switch: the target's login ends within hours (`.detail` says when), so sessions moved there would stop then; relay `.detail` — renew first with `/swap relogin <N>`, then retry. `force` never overrides it.
+2. If `unknown-target` → report `.detail` and stop. If `relogin-required` → refuse to switch (this includes a login past its end date); give the recovery recipe: `/swap relogin <N>` (runs `swap-guard login <N>`: saves the live account's token first, signs in inside a throwaway profile, registers slot N), then retry. Never suggest a plain `/login` + `cswap add`: signing in over the live account overwrites its newest token before cswap saved it, which kills the live account next. If `busy` and the `force` token was NOT given → stop and show the `.busy` table (pid, sessionId, cwd, kind, entrypoint, status; missing status means possibly-busy); tell the user to re-run with `force` to override. If `login-ending` → refuse to switch: the target's login ends within hours (`.detail` says when), so sessions moved there would stop then; relay `.detail` — renew first with `/swap relogin <N>`, then retry. `force` never overrides it.
 3. If `ok` (or `busy` overridden by `force`) → run `cswap switch <target> --json`, then report `.reason` and every entry of `.warnings[]` to the user.
 <!-- SHARED:PREFLIGHT-RECIPE END -->
 
@@ -87,14 +87,14 @@ Render from the auto-collected context above, then stop. Never switch from the d
 Run the preflight recipe. On a successful switch, confirm with exactly this shape, filled from the switch JSON and the sessions table:
 
 > Switched <from> → <to> (slot <N>, <email>). reason: <reason>; warnings: <warnings[] or "none">.
-> Blast radius: this flips ALL <count> live Claude Code sessions on this machine (every session in the table above) within ~30 s. Statusline updates within ~10 s; rate-limit bars lag until the new account serves a response.
+> Blast radius: this flips all <count> live Claude Code sessions on this machine (every session in the table above) within ~30 s. Statusline updates within ~10 s; rate-limit bars lag until the new account serves a response.
 
-The blast-radius line is mandatory in every hot-swap confirmation.
+The blast-radius line is required in every hot-swap confirmation.
 
 ## `/swap <target> handoff [now] [force]`
 
-1. INVOKE the handoff skill WITH the target, passing `now`/`force` through (`/handoff <target> [now] [force]`). It runs preflight steps 1–2, packages (including the artifact snapshot, which must happen while still on the owning account), THEN switches.
-2. Do not run the preflight, switch, package, flag, or exit instructions yourself — that logic lives ONLY in the handoff skill.
+1. Invoke the handoff skill with the target, passing `now`/`force` through (`/handoff <target> [now] [force]`). It runs preflight steps 1–2, packages (including the artifact snapshot, which must happen while still on the owning account), THEN switches.
+2. Do not run the preflight, switch, package, flag, or exit instructions yourself — that logic lives only in the handoff skill.
 
 ## `/swap <target> restart [now] [force]`
 
@@ -102,15 +102,15 @@ The blast-radius line is mandatory in every hot-swap confirmation.
 2. After a successful switch, get your own sessionId: `swap-guard whoami` → `.sessionId`.
 3. Run `swap-guard flag '{"mode":"restart","sessionId":"<sessionId>"}'` with the actual id substituted.
 4. Tell the user: exit with Ctrl+D — the shell wrapper relaunches `claude --resume <sessionId>` on the new account with full context (flag honored only in the same directory, within 300 s).
-5. `now` token: run `swap-guard schedule-kill <pid>` (pid from `swap-guard whoami`). If it errors (v1 stub), say phase-2 is not enabled and fall back to the Ctrl+D instruction.
+5. `now` token: phase-2 idle-kill is not built yet (`swap-guard schedule-kill` is a stub); say so and give the Ctrl+D instruction.
 
 ## `/swap auto [on|off|status] [threshold N] [model X]`
 
 Opt-in background auto-switching: a LaunchAgent runs `swap-guard auto tick` every 3 min. Each tick asks `cswap auto` for a dry-run decision; a PROACTIVE switch (nearing the threshold) is deferred while any live session is busy, an AT-LIMIT switch proceeds (the account is stalled anyway), dead-token targets are skipped, and cswap's cooldown applies. (cswap's "failover" for unreadable usage needs 3 consecutive failures inside one long-running process, so the per-tick agent does not fail over.) Install validates the arguments and runs a probe tick that never switches; a bad value is refused up front. A macOS notification announces each switch.
-- `on` → confirm the blast radius first ("switches flip ALL live sessions"), then run `swap-guard auto install` with `--threshold N` (if omitted, cswap's own threshold applies — 90 unless changed in cswap's settings) and `--model X` if given (suggest `--model Fable` when the scoped bucket is the usual wall). Report the JSON.
+- `on` → confirm the blast radius first ("switches flip ALL live sessions"), then run `swap-guard auto install` with `--threshold N` (if omitted, swap-guard passes 97) and `--model X` if given (suggest `--model Fable` when the scoped bucket is the usual wall). Report the JSON.
 - `off` → `swap-guard auto uninstall`.
 - `status` (default) → `swap-guard auto status`; render loaded yes/no and the recent ticks (ts, action, reason) as a table.
-Note: a session paused at a usage limit does NOT resume by itself after a background switch — the user sends any message and it goes through on the new account.
+Note: a session paused at a usage limit does not resume by itself after a background switch — the user sends any message and it goes through on the new account.
 
 ### Instant swap (`/swap auto instant [on|off]`)
 Independent of the LaunchAgent and ON by default: a StopFailure hook (`swap-guard ratelimit`) fires the moment a usage CAP stops a session ("You've reached your Fable limit"), picks the other account with the most room on that window (dead, disabled and API-key accounts are never targets), switches, sends a notification, and wakes the stopped session to continue (asyncRewake; each session at most once per 10 min, so a still-capped account cannot loop). A transient 429 throttle never swaps. Sessions that hit the cap together share one swap.
@@ -203,4 +203,4 @@ If `swap-guard whoami` reports `.entrypoint == "claude-vscode"`:
 
 ## Claude-first weekly fallback
 
-At 97% weekly use, prefer another enabled Claude subscription account below 97%, using the mandatory preflight recipe and preserving busy/login guards. Do not force a global credential switch. Only when `swap-guard codex-route` verifies every eligible Claude subscription account is at least 97% may the parent invoke `/handoff codex auto` under the standing quota policy. Unknown or stale Claude usage requires a refresh, not a Codex fallback. This policy transfers the same task with a structured package and waits for Codex to finish; it does not authorize unrelated work.
+The 97% weekly Claude-to-Codex fallback belongs to the handoff skill (`/handoff codex auto`, with its own route check and consent exception). This skill never switches accounts for it on the model's own initiative; the auto-swap LaunchAgent (`swap-guard auto install --threshold 97`), if installed, handles moving between Claude accounts.
