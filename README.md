@@ -23,6 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
+| **1.9.2** | ✅ 2026-11-06 | Handoff offers measure against a session's auto-compact window: a session started with `claude --autocompact N` gets its 60/75/85% offers at those points of N, not of the model's full window, so a 400k session is offered a handoff before it compacts. Also the 5 Nov prompt-audit fixes (skills, ULTRACODE) |
 | **1.9.1** | ✅ 2026-11-05 | Bundles cswap 0.29.0 (was 0.26.0), so `overclaude install` and `overclaude update` upgrade an older cswap on their own. New in cswap since 0.26: switching onto an account with a session running no longer logs it out, every file it writes is atomic, a separate weekly switch line, the most-headroom escape when every account is over its lines, and no more `MallocStackLogging` lines under memory pressure on macOS. Its JSON and cache formats only gained fields; overclaude reads them unchanged |
 | 1.9.0 | ✅ 2026-11-04 | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
 | **1.8.0** | ✅ released 2026-11-04 | Claude-first 97% weekly fallback with authenticated Codex continuation, structured task packages, model-aware orchestration, and durable run results |

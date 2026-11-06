@@ -105,4 +105,27 @@ for i in 1 2 3 4 5 6 7 8 9 10; do [ -f "$HOME/status-refresh-calls" ] && break; 
 assert_eq "$(cat "$HOME/status-refresh-calls" 2>/dev/null)" "list --json" "stale sibling triggers a normal refresh despite fresh cache mtime"
 PATH="$HOME/refresh-bin:$PATH" SWAP_GUARD_CMD="$SG" SWAP_NO_REFRESH= bash "$SL" <<<'{}' >/dev/null
 assert_eq "$(wc -l < "$HOME/status-refresh-calls" | tr -d ' ')" 1 "repeated statuslines share the refresh debounce"
+# Auto-compact window: a session started with --autocompact N gets its handoff offers
+# measured against N, not the model's full window (domo s0-dewiwin, 6 Nov).
+ctxj() { printf '{"session_id":"acw1","model":{"id":"m"},"context_window":{"used_percentage":%s,"context_window_size":1000000,"total_input_tokens":%s,"current_usage":{"input_tokens":4,"cache_creation_input_tokens":1000,"cache_read_input_tokens":%s}}}' "$1" "$2" "$(( $2 - 1004 ))"; }
+relay="$HOME/.claude-swap-backup/ctx/acw1.json"
+ctxj 22 216000 | OVERCLAUDE_AUTOCOMPACT=400000 bash "$SL" >/dev/null
+assert_eq "$(jq -r .pct "$relay")" "54.00" "relay pct is measured against the 400k auto-compact window"
+ctxj 22 216000 | OVERCLAUDE_AUTOCOMPACT=400k bash "$SL" >/dev/null
+assert_eq "$(jq -r .pct "$relay")" "54.00" "a 400k-style window value is read too"
+ctxj 22 216000 | OVERCLAUDE_AUTOCOMPACT= bash "$SL" >/dev/null
+assert_eq "$(jq -r .pct "$relay")" "22" "no auto-compact window: the full-window percentage is kept"
+ctxj 22 216000 | OVERCLAUDE_AUTOCOMPACT=2000000 bash "$SL" >/dev/null
+assert_eq "$(jq -r .pct "$relay")" "22" "a window at or above the model's own is ignored"
+ctxj 47 470000 | OVERCLAUDE_AUTOCOMPACT=400000 bash "$SL" >/dev/null
+assert_eq "$(jq -r .pct "$relay")" "100.00" "past the auto-compact window the pct caps at 100"
+ctxj 25 250000 | OVERCLAUDE_AUTOCOMPACT=400000 bash "$SL" >/dev/null
+offer=$(printf '{"session_id":"acw1","prompt":"go on"}' | bash "$REPO/hooks/ctx-watch.sh")
+err=$(ctxj 22 216000 | OVERCLAUDE_AUTOCOMPACT=0400k bash "$SL" 2>&1 >/dev/null)
+assert_eq "$err" "" "a leading-zero window prints nothing on stderr"
+assert_eq "$(jq -r .pct "$relay")" "54.00" "a leading-zero window is read as decimal, not octal"
+err=$(printf '{"session_id":"acw1","model":{"id":"m"},"context_window":{"used_percentage":22,"current_usage":{"input_tokens":216000}}}' | OVERCLAUDE_AUTOCOMPACT=400000 bash "$SL" 2>&1 >/dev/null)
+assert_eq "$err" "" "a payload without the window size prints nothing on stderr"
+assert_eq "$(jq -r .pct "$relay")" "22" "and keeps the full-window percentage"
+assert_contains "$offer" "Context is at 62%" "ctx-watch offers a handoff at 62% of the auto-compact window (25% of the full window)"
 finish

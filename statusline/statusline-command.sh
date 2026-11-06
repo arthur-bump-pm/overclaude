@@ -42,6 +42,40 @@ case "$ctx_used" in
   *[!0-9.]* | *.*.* | .* | *.) relay_pct="" ;;                     # not a plain JSON number: skip
   *) relay_pct="$ctx_used" ;;
 esac
+# Auto-compact window: a session started with `claude --autocompact N` compacts at N tokens,
+# not at the model's full window, so the handoff offers (ctx-watch, ctx-notify) measure against
+# N. Claude Code gives the statusline only the full window, so N comes from the claude
+# process's own arguments (the statusline runs under it). OVERCLAUDE_AUTOCOMPACT overrides (tests).
+relay_acw=""
+if [ -n "$relay_pct" ] && [ "$relay_pct" != null ]; then
+  relay_acw="${OVERCLAUDE_AUTOCOMPACT:-}"
+  if [ -z "$relay_acw" ]; then
+    p="$PPID"
+    for _ in 1 2 3 4; do
+      case "$p" in '' | *[!0-9]* | 0 | 1) break ;; esac
+      a=$(ps -o args= -p "$p" 2>/dev/null)
+      case "$a" in
+        *--autocompact*) relay_acw=$(printf '%s\n' "$a" | sed -nE 's/.*--autocompact[ =]0*([1-9][0-9]*[kKmM]?)([ ].*)?$/\1/p'); break ;;
+      esac
+      p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    done
+  fi
+  relay_acw="${relay_acw#"${relay_acw%%[!0]*}"}"   # no leading zeros (bash would read them as octal)
+  case "$relay_acw" in
+    [1-9]*[kK] | [1-9][kK]) n="${relay_acw%?}"; case "$n" in *[!0-9]*) relay_acw="" ;; *) relay_acw=$(( n * 1000 )) ;; esac ;;
+    [1-9]*[mM] | [1-9][mM]) n="${relay_acw%?}"; case "$n" in *[!0-9]*) relay_acw="" ;; *) relay_acw=$(( n * 1000000 )) ;; esac ;;
+  esac
+  case "$relay_acw" in '' | *[!0-9]*) relay_acw="" ;; esac
+  win=$(echo "$input" | jq -r '.context_window.context_window_size // empty' 2>/dev/null)
+  # The current context size: what's in the window now (input + cache creation + cache reads).
+  tok=$(echo "$input" | jq -r '.context_window.current_usage // empty
+    | if type == "object" then ((.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)) else empty end' 2>/dev/null)
+  case "$win" in '' | *[!0-9]*) relay_acw="" ;; esac
+  case "$tok" in '' | *[!0-9]* | 0) relay_acw="" ;; esac
+  if [ -n "$relay_acw" ] && [ "$relay_acw" -gt 0 ] && [ "$relay_acw" -lt "$win" ]; then
+    relay_pct=$(awk -v t="$tok" -v w="$relay_acw" 'BEGIN { p = t * 100 / w; if (p > 100) p = 100; printf "%.2f", p }')
+  fi
+fi
 # A null pct is still published when the model is known, so the routing guard knows the
 # session model from the first turn (ctx-watch ignores a null pct).
 if [ -n "$relay_session_id" ] && [ -n "$relay_pct" ] && { [ "$relay_pct" != null ] || [ -n "$relay_model" ]; }; then
