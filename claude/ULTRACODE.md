@@ -3,6 +3,7 @@
 ## 1. Core principle
 Spend fable only where judgment is the bottleneck, never where volume is: fable counts against the same weekly limit as everything else and may use at most half of it (Max plans), so every fable call shrinks what the rest of your work can spend. Omitting `opts.model` inherits the session's model — on a Fable session that is a fable spend, and overclaude's route-guard denies it unless the stage label names fable.
 Explicit down-routing is your default posture, not an optimization.
+`fable` = Claude Fable 5.2 (`claude-fable-5-2`, released 2026-11-09): Anthropic reports it at **High** effort matching Opus 5.5's **Max** on agentic coding for about half the cost per task, ahead of Opus 5.5 on nearly every benchmark, with markedly stronger vision (chart/visual reading). That makes fable/high a cost-competitive judgment tier, not only a terminal one — but it still draws on the same weekly limit (≤ half on Max plans), so it stays a deliberate, counted spend. Fast mode doubles the price: don't use it in workflows.
 Route each agent by one question: "if this agent is quietly wrong, who catches it?" — a downstream check means you may downgrade; nobody means top tier.
 
 ## 2. Routing table
@@ -15,7 +16,8 @@ Route each agent by one question: "if this agent is quietly wrong, who catches i
 | Finder sweeps (bug / perf) | sonnet | medium | recall |
 | Security sweeps | opus | high | asymmetry |
 | Implementation edits (well-scoped) | sonnet | medium | authorship |
-| Implementation edits (cross-cutting / tricky) | opus | high | judgment |
+| Implementation edits (cross-cutting / tricky) | opus (fable when fable's weekly share has room) | high | judgment; fable/high ≈ opus/max at ~½ cost |
+| Vision-heavy judgment (frames, charts, on-screen text, visual QA verdicts) | fable | high | 5.2's vision lead over opus |
 | Adversarial verification / refutation | opus | high | precision |
 | Judge panel voters (2–3, distinct lenses) | opus | high | decorrelate |
 | Cross-family second opinion (one panel voter / verifier) | codex via `swap-guard codex-review` | low–high | different model family |
@@ -24,6 +26,7 @@ Route each agent by one question: "if this agent is quietly wrong, who catches i
 | Final synthesis | fable (omit `model`) | xhigh | unrecoverable |
 
 Pairing rules:
+- Fable effort: **high** for non-terminal fable stages (implementation, vision verdicts); **xhigh** only for the terminal chair / adjudicator / final synthesis. 5.2 at high already reaches opus/max quality, so xhigh elsewhere is overspend.
 - Effort amplifies capability; it never substitutes — and it is non-monotonic: haiku@xhigh loses to sonnet@medium on judgment work, and overthinking degrades mechanical stages. Never pair xhigh with a fan-out stage.
 - Multiply tier by fan-out width before picking a model — fine at width 3 is a budget event at width 20. Any `parallel()` wider than ~5 gets an explicit haiku/sonnet.
 - **Reads parallelize; writes serialize.** `parallel()` is for search/read/test/evaluate over disjoint scope. Never two agents editing the same files or feature concurrently — concurrent writers conflict on unstated decisions. One owner per diff; merge independent reads into a single edit plan.
