@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Claude Code status line - two-line layout
 #
-# Line 1: model (effort) | dir (branch*) | N sessions | account ↻ weekly reset
-# Line 2: ctx bar | 5h bar | week bar | Fable bar  (10-char bars, one line;
+# Line 1: model (effort) | dir (branch*) | 💬 N | account ↻ weekly reset
+# Line 2: ctx bar | ⚙ N agents (only while running) | 5h bar | week bar | Fable bar  (10-char bars, one line;
 #         5h is left out when the plan has no 5-hour window, e.g. Ultra)
 # Line 3+: one compact line per OTHER cswap account (limits + weekly reset)
 #
-# Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
+# 🧠 Fable 5 (hi) | 📁 myproject (master*) | 💬 3 | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
 # ctx [████░░░░░░] 42% | 5h [███████░░░] 71% | week [██░░░░░░░░] 18% | Fable [███████░░░] 73%
 # ↳ personal [2] 5h 10% · week 85% · Fable 100% ↻ Thu Oct 9 17:59 (1d 1h)
 
@@ -410,11 +410,16 @@ other_accounts_lines() {
   printf '%s' "$out"
 }
 
-# --- Line 1: model (effort) | dir (branch*) | N sessions | account ---
+# --- Line 1: model (effort) | dir (branch*) | 💬 N | account ---
 
 model_seg="$model_name"
 if [ -n "$effort_level" ] && [ "$effort_level" != "null" ]; then
-  model_seg="$model_name ($effort_level)"
+  # Short effort names keep line 1 narrow: lo, med, hi, xhi, max.
+  case "$effort_level" in
+    low) effort_short=lo;; medium) effort_short=med;; high) effort_short=hi;;
+    xhigh) effort_short=xhi;; *) effort_short="$effort_level";;
+  esac
+  model_seg="$model_name ($effort_short)"
 fi
 
 # Directory segment shows just the folder name ("myproject", not "~/Documents/myproject");
@@ -466,14 +471,49 @@ esac
 if [ "$session_count" -lt 1 ]; then
   session_count=1
 fi
-if [ "$session_count" -eq 1 ]; then
-  session_word="session"
-else
-  session_word="sessions"
-fi
-segment_sessions="$session_count $session_word"
+# "💬 2": the open Claude sessions on this Mac, as an icon and a number.
+segment_sessions="💬 $session_count"
 
-line1="${BOLD}${model_seg}${RESET} | ${BOLD}${segment_dir}${RESET} | ${BOLD}${segment_sessions}${RESET}"
+# This Mac: CPU in use (all cores), memory in use, and, only while memory is tight,
+# swap past 1 GB in brackets: "mem 61% (3.6G)"
+# (swap-guard mem's cache; the memwatch agent refreshes it every minute, and without
+# it a render refreshes it in the background at most once a minute). It sits on line 2,
+# after the limit meters and before the spend.
+# Dim when fine; CPU turns yellow from 85%; memory gets a yellow ⚠ when tight and a
+# red ⚠ … ! when critical. SWAP_HIDE_MEM=1 hides memory, SWAP_HIDE_CPU=1 hides CPU.
+mem_segment() {
+  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock
+  { [ -z "${SWAP_HIDE_MEM:-}" ] || [ -z "${SWAP_HIDE_CPU:-}" ]; } && command -v jq >/dev/null 2>&1 || return 0
+  cache="$st/cache/mem.json"; now=$(date +%s); m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+  if [ $(( now - m )) -ge 90 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
+    lock="$st/cache/mem.lock"
+    if [ -z "$(find "$lock" -mmin -1 2>/dev/null)" ]; then
+      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" mem >/dev/null 2>&1 & )
+    fi
+  fi
+  # A sample older than 10 minutes says nothing about now.
+  [ -s "$cache" ] && [ $(( now - m )) -lt 600 ] || return 0
+  jq -r --arg y "$YELLOW" --arg r "$RED" --arg d "$DIM" --arg x "$RESET" \
+     --arg hm "${SWAP_HIDE_MEM:-}" --arg hc "${SWAP_HIDE_CPU:-}" '
+    def gb: "\((. / 1024 * 10 | round) / 10)G";
+    ("mem " + (if .usedPct == null then "?" else "\(.usedPct)%" end)
+     + (if (.level // "ok") != "ok" and (.swapUsedMB // 0) >= 1024 then " (\(.swapUsedMB | gb))" else "" end)) as $t
+    | (if $hm != "" then null
+       elif .level == "critical" then "\($r)⚠ \($t) !\($x)"
+       elif .level == "warn" then "\($y)⚠ \($t)\($x)"
+       else "\($d)\($t)\($x)" end) as $mem
+    | (if $hc != "" or .cpuPct == null then null
+       elif .cpuPct >= 85 then "\($y)cpu \(.cpuPct)%\($x)"
+       else "\($d)cpu \(.cpuPct)%\($x)" end) as $cpu
+    | [$cpu, $mem] | map(select(. != null)) | join("\($d) · \($x)")' "$cache" 2>/dev/null
+}
+mem_seg=$(mem_segment 2>/dev/null) || mem_seg=""
+
+# Order: this session (model), where (folder, sessions), then the account
+# together with its weekly reset.
+# Every piece of line 1 leads with an icon: 🧠 model, 📁 folder, 💬 sessions, 👤 account.
+line1="${BOLD}🧠 ${model_seg}${RESET}"
+line1="$line1 | ${BOLD}📁 ${segment_dir}${RESET} | ${BOLD}${segment_sessions}${RESET}"
 
 account_seg=$(swap_account_segment 2>/dev/null) || account_seg=""
 if [ -n "$account_seg" ]; then
@@ -487,11 +527,39 @@ if [ -n "$account_seg" ]; then
   fi
 fi
 
+# Agents this session has running right now: subagents whose record
+# (<transcript>/subagents/agent-*.meta.json) is not marked finished and whose
+# transcript moved in the last hour (a crashed one never gets marked), plus workflow
+# agents written to in the last 2 minutes.
+# Shown only when there is one. SWAP_HIDE_AGENTS=1 hides it.
+agents_segment() {
+  local tp dir n=0 f
+  [ -z "${SWAP_HIDE_AGENTS:-}" ] || return 0
+  tp=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null) || return 0
+  dir="${tp%.jsonl}/subagents"
+  [ -n "$tp" ] && [ -d "$dir" ] || return 0
+  # Workflow agents are never marked finished, so for them "running" = written to in
+  # the last 2 minutes (a live agent's transcript keeps growing).
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      */subagents/workflows/*) [ -n "$(find "$f" -mmin -2 2>/dev/null)" ] && n=$(( n + 1 )) ;;
+      *) grep -q '"finished":true' "${f%.jsonl}.meta.json" 2>/dev/null || n=$(( n + 1 )) ;;
+    esac
+  done <<EOF
+$(find "$dir" -name 'agent-*.jsonl' -mmin -60 2>/dev/null)
+EOF
+  [ "$n" -gt 0 ] || return 0
+  if [ "$n" -eq 1 ]; then printf '⚙ 1 agent'; else printf '⚙ %d agents' "$n"; fi
+}
+agents_seg=$(agents_segment 2>/dev/null) || agents_seg=""
+
 # --- Line 2: usage bars, all on one line ---
 # The 5h bar is left out when the account has no 5-hour window: plans without
 # one (Ultra) report five_hour as null. Unknown usage (no cache, no response yet)
 # still renders "5h n/a" like week/Fable.
 line2="$(render_bar "ctx" "$ctx_used")"
+[ -n "$agents_seg" ] && line2="$line2 | ${BOLD}${agents_seg}${RESET}"
 if [ -z "$five_hour" ] && [ -n "$no_five_hour" ]; then :
 else line2="$line2 | $(render_bar "5h" "$five_hour")"; fi
 line2="$line2 | $(render_bar "week" "$seven_day") | $(render_bar "Fable" "$fable_pct")"
@@ -522,6 +590,8 @@ spend_segment() {
     | "💵 \(.usd | money)/\(.days)d" + (if .ratio != null then " · \(.ratio)× plan" else "" end)' "$cache" 2>/dev/null
 }
 spend_seg=$(spend_segment 2>/dev/null) || spend_seg=""
+# This Mac (CPU, memory) sits after the limit meters and before the spend.
+[ -n "$mem_seg" ] && line2="$line2 | ${mem_seg}"
 [ -n "$spend_seg" ] && line2="$line2 | ${DIM}${spend_seg}${RESET}"
 
 # Run-out warning: at this pace every account's week runs out within a day
@@ -544,33 +614,6 @@ forecast_segment() {
 }
 fc_seg=$(forecast_segment 2>/dev/null) || fc_seg=""
 [ -n "$fc_seg" ] && line2="$line2 | ${RED}${fc_seg}${RESET}"
-
-# Memory: how much of this Mac's memory is in use, and swap once it passes 1 GB
-# (swap-guard mem's cache; the memwatch agent refreshes it every minute, and without
-# it a render refreshes it in the background at most once a minute). Dim when fine,
-# yellow ⚠ when tight, red ⚠ when critical. SWAP_HIDE_MEM=1 hides it.
-mem_segment() {
-  local st="$HOME/.claude-swap-backup" cache sg="$HOME/.local/bin/swap-guard" now m lock
-  [ -z "${SWAP_HIDE_MEM:-}" ] && command -v jq >/dev/null 2>&1 || return 0
-  cache="$st/cache/mem.json"; now=$(date +%s); m=$(stat -f %m "$cache" 2>/dev/null || echo 0)
-  if [ $(( now - m )) -ge 90 ] && [ -z "${SWAP_NO_REFRESH:-}" ] && [ -x "$sg" ]; then
-    lock="$st/cache/mem.lock"
-    if [ -z "$(find "$lock" -mmin -1 2>/dev/null)" ]; then
-      mkdir -p "$st/cache" && touch "$lock" && ( "$sg" mem >/dev/null 2>&1 & )
-    fi
-  fi
-  # A sample older than 10 minutes says nothing about now.
-  [ -s "$cache" ] && [ $(( now - m )) -lt 600 ] || return 0
-  jq -r --arg y "$YELLOW" --arg r "$RED" --arg d "$DIM" --arg x "$RESET" '
-    def gb: "\((. / 1024 * 10 | round) / 10)G";
-    ("mem " + (if .usedPct == null then "?" else "\(.usedPct)%" end)
-     + (if (.swapUsedMB // 0) >= 1024 then " · swap \(.swapUsedMB | gb)" else "" end)) as $t
-    | if .level == "critical" then "\($r)⚠ \($t) critical\($x)"
-      elif .level == "warn" then "\($y)⚠ \($t)\($x)"
-      else "\($d)\($t)\($x)" end' "$cache" 2>/dev/null
-}
-mem_seg=$(mem_segment 2>/dev/null) || mem_seg=""
-[ -n "$mem_seg" ] && line2="$line2 | ${mem_seg}"
 
 printf "%s\n" "$line1"
 printf "%s\n" "$line2"
@@ -599,8 +642,10 @@ codex_lines() {
     .[]? | select((.windows | length) > 0)
     | . as $h
     | [ (if .name == "primary" then "codex" else "codex:" + .name end),
-        (.windows | map(.label + " " + (if .resetsAt != null and .resetsAt <= $now then "0"
-                                        else ((.pct // 0) | floor | tostring) end) + "%") | join(" · ")),
+        # "label|pct|reset" per window, shortest first (5h before week, as the Claude lines).
+        (.windows | sort_by(.windowMinutes // 0)
+         | map(.label + "|" + (if .resetsAt != null and .resetsAt <= $now then "0"
+                               else ((.pct // 0) | tostring) end)) | join(";")),
         ((.windows as $w | (($w | map(select(.label == "week")) | first) // $w[0])).resetsAt // "" | tostring),
         (($now - (.asOf // $now)) | tostring),
         (if .limitReached != null then "1" else "" end) ]
@@ -609,11 +654,20 @@ codex_lines() {
   local name wins reset age hit seg
   while IFS=$'\x1f' read -r name wins reset age hit; do
     [ -n "$name" ] || continue
-    seg="↳ ${BOLD}${name}${RESET} ${wins}"
+    # Styled like the other-account lines: bold name, each window coloured by fmt_pct.
+    seg="↳ ${BOLD}${name}${RESET}"
+    local w first=1
+    while IFS= read -r w; do
+      [ -n "$w" ] || continue
+      [ "$first" -eq 1 ] || seg="$seg ·"
+      seg="$seg ${w%%|*} $(fmt_pct "${w#*|}")"; first=0
+    done <<WEOF
+$(printf '%s' "$wins" | tr ';' '\n')
+WEOF
     case "$reset" in ''|*[!0-9]*) : ;; *) [ "$reset" -gt "$now" ] &&
       seg="$seg ↻ $(date -r "$reset" '+%a %b %-d %H:%M') ${DIM}($(fmt_left $(( reset - now ))))${RESET}" ;; esac
     [ -n "$hit" ] && seg="$seg ${RED}⚠ limit reached${RESET}"
-    case "$age" in ''|*[!0-9]*) : ;; *) [ "$age" -gt 3600 ] && seg="$seg ${DIM}(as of $(fmt_left "$age") ago)${RESET}" ;; esac
+    case "$age" in ''|*[!0-9]*) : ;; *) [ "$age" -gt 3600 ] && seg="$seg ${DIM}($(fmt_left "$age") old)${RESET}" ;; esac
     printf '%s\n' "$seg"
   done <<EOF
 $rows

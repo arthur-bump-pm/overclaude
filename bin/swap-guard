@@ -107,7 +107,7 @@ usage: swap-guard <subcommand> [args]
                                   which Chrome profile a re-login opens in
   login --new                     add a new account the same safe way
   version-check [--force]         newest overclaude on PyPI (cached for a day)
-  codex-usage [--refresh]         Codex CLI rate limits per Codex home, from its session logs
+  codex-usage [--refresh]         Codex CLI rate limits per Codex home, live from Codex (logs as fallback)
   codex-ready                     can /handoff codex work here? (CLI, overcodex hook, limits)
   codex-route                     read-only Claude-first automatic routing decision
   route-guard [on|off|status]     PreToolUse hook (Agent|Workflow): deny un-routed subagents on Fable
@@ -2951,7 +2951,7 @@ _mem_log() { # _mem_log <json> — append + keep the last 500 lines
 
 # _mem_sys — one JSON object: the system numbers and the level they add up to.
 _mem_sys() {
-  local ram lvl sw free comp swu swt wf cf
+  local ram lvl sw free comp swu swt wf cf cpu ncpu
   ram="$(sysctl -n hw.memsize 2>/dev/null)"
   case "$ram" in ''|*[!0-9]*) return 1;; esac
   lvl="$(_mem_num "$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)" 0)"
@@ -2970,7 +2970,17 @@ $(printf '%s' "$sw" | awk '
   END { printf "%d %d\n", t, u }')
 EOF
   wf="$(_mem_num "${SWAP_MEM_WARN_FREE:-}" 20)"; cf="$(_mem_num "${SWAP_MEM_CRIT_FREE:-}" 10)"
-  jq -cn --argjson ram "$(( ram / 1048576 ))" --argjson lvl "$lvl" --argjson free "$free" \
+  # CPU: every process's share added up, over the number of cores (ps: milliseconds).
+  # ps reports a recent average per process, so this is "lately", not this instant.
+  ncpu="$(_mem_num "$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)" 0)"
+  cpu=-1
+  if [ -n "${SWAP_MEM_TEST_CPU:-}" ]; then cpu="$(_mem_num "$SWAP_MEM_TEST_CPU" -1)"
+  elif [ "$ncpu" -gt 0 ]; then
+    cpu="$(/bin/ps -A -o %cpu= 2>/dev/null | awk -v n="$ncpu" '
+      { s += $1 } END { if (NR == 0) { print -1; exit } p = int(s / n + 0.5); if (p > 100) p = 100; print p }')"
+    case "$cpu" in ''|*[!0-9]*) cpu=-1;; esac
+  fi
+  jq -cn --argjson cpu "$cpu" --argjson ncpu "$ncpu" --argjson ram "$(( ram / 1048576 ))" --argjson lvl "$lvl" --argjson free "$free" \
     --argjson su "$(_mem_num "$swu" 0)" --argjson st "$(_mem_num "$swt" 0)" --argjson comp "$(_mem_num "$comp" 0)" \
     --argjson wf "$wf" --argjson cf "$cf" '
     def gb: (. / 1024 * 10 | round) / 10 | tostring + " GB";
@@ -2988,7 +2998,8 @@ EOF
        ramMB: $ram, freePct: (if $free < 0 then null else $free end),
        usedPct: (if $free < 0 then null else 100 - $free end),
        pressure: (if $lvl >= 4 then "critical" elif $lvl == 2 then "warn" elif $lvl == 1 then "normal" else "unknown" end),
-       swapUsedMB: $su, swapTotalMB: $st, compressedMB: $comp}'
+       swapUsedMB: $su, swapTotalMB: $st, compressedMB: $comp,
+       cpuPct: (if $cpu < 0 then null else $cpu end), cpus: $ncpu}'
 }
 
 # _mem_procs [--footprint] — JSON {basis, apps, sessions, orphans}. Memory is RSS from
@@ -3995,8 +4006,8 @@ cmd_version_check() {
 # Codex accounts are separate CODEX_HOMEs: ~/.codex (primary) and, with overcodex's
 # codex-swap, ~/.codex-accounts/<name>; ~/.codex-accounts/.active names the one new
 # `codex` runs use. Codex records its own rate limits in every session log
-# (event_msg/token_count .payload.rate_limits), so usage is read from there — as
-# fresh as that home's last Codex turn.
+# (event_msg/token_count .payload.rate_limits). Usage is asked live from Codex's server
+# first, as the Claude lines are, and read from those logs only when that fails.
 CODEX_ACCOUNTS="$HOME/.codex-accounts"
 
 _codex_active_home() { # the CODEX_HOME a new `codex` would use
@@ -4023,9 +4034,82 @@ _codex_homes() { # name<TAB>home for every Codex home on this machine
   done
 }
 
-# _codex_usage_one <name> <home> — JSON for one home's latest rate limits, or nothing.
+# _codex_live_one <home> — the home's rate limits straight from Codex's server, the way
+# the Claude lines get theirs: `codex app-server`, then account/rateLimits/read (no
+# thread, no model turn), 8 s budget and a hard 10 s ceiling; the app-server is killed
+# (TERM, then KILL) every time. Prints one JSON object with at least one window, or
+# nothing — then the session logs are used.
+# OVERCLAUDE_CODEX_LIVE=off skips it (then only the session logs are read).
+_codex_live_one() {
+  local home="$1"
+  [ "${OVERCLAUDE_CODEX_LIVE:-on}" != off ] && command -v codex >/dev/null 2>&1 && [ -d "$home" ] || return 0
+  CODEX_HOME="$home" python3 - <<'PYCODE' 2>/dev/null
+import json, os, select, signal, subprocess, sys, time
+signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(TimeoutError()))
+signal.alarm(10)  # hard ceiling, whatever Codex does
+deadline = time.time() + 8
+p = None
+def stop():
+    if p is None: return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try: os.killpg(p.pid, sig)
+        except OSError: return
+        try: p.wait(1); return
+        except Exception: pass
+buf = b''
+def recv(i):
+    # Own buffer over os.read: select() can't see lines a buffered reader already holds.
+    global buf
+    fd = p.stdout.fileno()
+    while True:
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1)
+            try: m = json.loads(line)
+            except ValueError: continue
+            if isinstance(m, dict) and m.get('id') == i: return m
+        left = deadline - time.time()
+        if left <= 0: return None
+        r, _, _ = select.select([fd], [], [], left)
+        if not r: return None
+        chunk = os.read(fd, 65536)
+        if not chunk or len(buf) > 4 * 1024 * 1024: return None
+        buf += chunk
+def send(m):
+    p.stdin.write((json.dumps(m) + '\n').encode()); p.stdin.flush()
+try:
+    p = subprocess.Popen(['codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'overclaude-usage', 'version': '1'}}})
+    if (recv(1) or {}).get('result'):
+        send({'method': 'initialized'})
+        send({'id': 2, 'method': 'account/rateLimits/read'})
+        rl = ((recv(2) or {}).get('result') or {}).get('rateLimits')
+        if isinstance(rl, dict) and (rl.get('primary') or rl.get('secondary')):
+            print(json.dumps(rl))
+except BaseException:
+    pass
+finally:
+    signal.alarm(0)
+    stop()
+PYCODE
+}
+
+# _codex_usage_one <name> <home> — JSON for one home's rate limits, or nothing: live from
+# Codex's server when it answers (source "live"), else the newest session log ("log").
 _codex_usage_one() {
-  local name="$1" home="$2" f line mt
+  local name="$1" home="$2" f line mt live
+  live="$(_codex_live_one "$home")"
+  if [ -n "$live" ]; then
+    printf '%s' "$live" | jq -c --arg n "$name" --arg h "$home" --argjson now "$(date +%s)" \
+      --arg active "$(_codex_active_home)" '
+      def win($w; $id): if $w == null then null
+        else {id:$id, pct: ($w.usedPercent // null), windowMinutes: ($w.windowDurationMins // null), resetsAt: ($w.resetsAt // null),
+              label: (($w.windowDurationMins // 0) as $m | if $m == 300 then "5h" elif $m == 10080 then "week"
+                      elif $m >= 1440 then "\($m / 1440 | floor)d" elif $m > 0 then "\($m / 60 | floor)h" else "?" end)} end;
+      {name: $n, home: $h, active: ($h == $active), plan: (.planType // null), asOf: $now, source: "live",
+       limitReached: (.rateLimitReachedType // null),
+       windows: ([win(.primary; "primary"), win(.secondary; "secondary")] | map(select(. != null)))}' 2>/dev/null && return 0
+  fi
   [ -d "$home/sessions" ] || return 0
   # Newest session log that actually carries rate limits: a just-started session has
   # none yet, and one that hit the limit early may log rate_limits: null.
@@ -4046,7 +4130,7 @@ EOF
         else {id:$id, pct: ($w.used_percent // null), windowMinutes: ($w.window_minutes // null), resetsAt: ($w.resets_at // null),
               label: (($w.window_minutes // 0) as $m | if $m == 300 then "5h" elif $m == 10080 then "week"
                       elif $m >= 1440 then "\($m / 1440 | floor)d" elif $m > 0 then "\($m / 60 | floor)h" else "?" end)} end;
-    {name: $n, home: $h, active: ($h == $active), plan: ($rl.plan_type // null), asOf: ((.timestamp // "") | ep),
+    {name: $n, home: $h, active: ($h == $active), plan: ($rl.plan_type // null), asOf: ((.timestamp // "") | ep), source: "log",
      limitReached: ($rl.rate_limit_reached_type // null),
      windows: ([win($rl.primary; "primary"), win($rl.secondary; "secondary")] | map(select(. != null)))}' 2>/dev/null
 }
@@ -4217,7 +4301,8 @@ cmd_codex_route() { # Strictly read-only; distinguish fresh from bounded schedul
 
 _route_note() { # shared per-session dedup across both hooks, independent of budget bands
   local sid="$1" decision route key f now last resets
-  decision="$(cmd_codex_route 2>/dev/null)"
+  # Hooks never wait on a live Codex call: the route check reads the logs only.
+  decision="$(OVERCLAUDE_CODEX_LIVE=off cmd_codex_route 2>/dev/null)"
   if printf '%s' "$decision" | jq -e '(.accounts | length == 0) or any(.accounts[]; (.fresh | not))' >/dev/null 2>&1; then _usage_refresh_async; fi
   route="$(printf '%s' "$decision" | jq -r '.route // "claude"')"
   if [ "$route" = codex ]; then
@@ -4345,7 +4430,22 @@ cmd_codex_usage() { # [--refresh] — cached for 2 minutes (the statusline reads
   command -v jq >/dev/null 2>&1 || { printf '[]\n'; exit 0; }
   now="$(date +%s)"; m="$(stat -f %m "$cache" 2>/dev/null || echo 0)"
   if [ "$refresh" -eq 0 ] && [ $(( now - m )) -lt 120 ] && [ -s "$cache" ]; then cat "$cache"; exit 0; fi
-  out="$(_codex_homes | while IFS=$'\t' read -r name home; do _codex_usage_one "$name" "$home"; done | jq -sc '.')"
+  # Every home at once: each may wait on its own live Codex call (10 s ceiling).
+  local tmp i=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/oc-codex-usage.XXXXXX")" || tmp=""
+  if [ -n "$tmp" ]; then
+    while IFS=$'\t' read -r name home; do
+      [ -n "$name" ] || continue
+      i=$(( i + 1 )); _codex_usage_one "$name" "$home" > "$tmp/$(printf '%03d' "$i")" &
+    done <<EOF
+$(_codex_homes)
+EOF
+    wait
+    out="$(cat "$tmp"/* 2>/dev/null | jq -sc '.')"
+    rm -rf "$tmp"
+  else
+    out="$(_codex_homes | while IFS=$'\t' read -r name home; do _codex_usage_one "$name" "$home"; done | jq -sc '.')"
+  fi
   [ -n "$out" ] || out="[]"
   mkdir -p "$STATE_ROOT/cache" && printf '%s\n' "$out" > "$cache.tmp.$$" && mv "$cache.tmp.$$" "$cache"
   printf '%s\n' "$out"

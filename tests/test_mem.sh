@@ -251,14 +251,30 @@ assert_contains "$("$SG" mem bogus 2>&1)" "usage: swap-guard mem" "unknown optio
 
 # --- statusline -----------------------------------------------------------------
 sl() { printf '{"model":{"display_name":"Opus"},"workspace":{"current_dir":"%s"}}' "$HOME" | SWAP_NO_REFRESH=1 bash "$SL" | sed -n 2p | strip_ansi; }
+export SWAP_MEM_TEST_CPU=34
 set_mem 55 1 3700; "$SG" mem >/dev/null
-assert_contains "$(sl)" "mem 45% · swap 3.6G" "statusline: memory in use and swap"
-set_mem 55 1 500; "$SG" mem >/dev/null
-assert_absent "$(sl)" "swap" "swap under 1 GB is not shown"
+assert_eq "$(jq -r .cpuPct "$B/cache/mem.json")" "34" "the cache carries CPU in use"
+assert_contains "$(sl)" " | cpu 34% · mem 45%" "statusline: CPU and memory on line 2 after the meters; swap is not shown while memory is fine"
+assert_absent "$(sl)" "G)" "no swap figure while memory is fine"
+set_mem 15 1 3700; "$SG" mem >/dev/null
+assert_contains "$(sl)" "cpu 34% · ⚠ mem 85% (3.6G)" "tight memory: swap shown, short"
+set_mem 55 1 3700; "$SG" mem >/dev/null
+assert_absent "$(SWAP_HIDE_CPU=1 sl)" "cpu " "SWAP_HIDE_CPU hides CPU"
+assert_contains "$(SWAP_HIDE_CPU=1 sl)" " | mem 45%" "memory stays when CPU is hidden"
+assert_contains "$(SWAP_HIDE_MEM=1 sl)" " | cpu 34%" "CPU stays when memory is hidden"
+SWAP_MEM_TEST_CPU=91 "$SG" mem >/dev/null
+assert_contains "$(printf '{"model":{"display_name":"Opus"},"workspace":{"current_dir":"%s"}}' "$HOME" | SWAP_NO_REFRESH=1 bash "$SL" | sed -n 2p)" "$(printf '\033[33m')cpu 91%" "CPU from 85% is yellow"
+"$SG" mem >/dev/null
+unset SWAP_MEM_TEST_CPU
+"$SG" mem >/dev/null
+case "$(jq -r .cpuPct "$B/cache/mem.json")" in ''|null|*[!0-9]*) fail "real CPU sample is a whole number";; *) pass "real CPU sample is a whole number";; esac
+export SWAP_MEM_TEST_CPU=34
+set_mem 15 1 500; "$SG" mem >/dev/null
+assert_absent "$(sl)" "G)" "swap under 1 GB is not shown"
 set_mem 15 1 500; "$SG" mem >/dev/null
 assert_contains "$(sl)" "⚠ mem 85%" "warn: flagged"
 set_mem 5 1 500; "$SG" mem >/dev/null
-assert_contains "$(sl)" "⚠ mem 95% critical" "critical: flagged"
+assert_contains "$(sl)" "⚠ mem 95% !" "critical: flagged"
 assert_absent "$(SWAP_HIDE_MEM=1 sl)" "mem " "SWAP_HIDE_MEM hides it"
 touch -t "$(date -r $(( $(date +%s) - 900 )) +%Y%m%d%H%M.%S)" "$B/cache/mem.json"
 assert_absent "$(sl)" "mem " "a sample older than 10 min is not shown"

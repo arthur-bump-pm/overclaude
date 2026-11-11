@@ -18,6 +18,8 @@ new_home() {
   mkdir -p "$TH/.claude/sessions" "$TH/.claude/projects" "$TH/.claude-swap-backup/cache"
   export HOME="$TH"
   export SWAP_NO_REFRESH=1
+  # Never ask a real Codex server; test_codex.sh turns this on with a stub codex.
+  export OVERCLAUDE_CODEX_LIVE=off
   # A default `security` that finds nothing: the real keychain is never read (logins,
   # preflight). Tests that need one put their own stub earlier on PATH.
   mkdir -p "$TH/.stub-security"

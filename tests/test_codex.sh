@@ -20,7 +20,7 @@ assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | [.window
 assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | .active')" "true" "primary is active without a marker"
 
 out="$(echo '{"model":{"display_name":"M"},"context_window":{"used_percentage":1}}' | SWAP_NO_REFRESH=1 bash "$SL" | strip_ansi)"
-assert_contains "$out" "↳ codex week 18% · 5h 40%" "statusline shows the primary Codex home"
+assert_contains "$out" "↳ codex 5h 40% · week 18%" "statusline shows the primary Codex home, shortest window first like the Claude lines"
 assert_contains "$out" "↳ codex:work week 100%" "and every other Codex account"
 assert_contains "$out" "⚠ limit reached" "a reached limit is flagged"
 assert_absent "$(echo '{"model":{"display_name":"M"}}' | SWAP_NO_REFRESH=1 SWAP_HIDE_CODEX=1 bash "$SL" | strip_ansi)" "codex" "SWAP_HIDE_CODEX hides it"
@@ -34,8 +34,85 @@ roll "$HOME/.codex-accounts/fiveonly" "{\"primary\":{\"used_percent\":7.0,\"wind
 "$SG" codex-usage --refresh >/dev/null
 out="$(echo '{"model":{"display_name":"M"}}' | SWAP_NO_REFRESH=1 bash "$SL" | strip_ansi)"
 assert_contains "$out" "↳ codex:fiveonly 5h 7%" "a Codex home with only a 5h window renders"
-assert_contains "$out" "↳ codex week 18%" "and does not hide the other homes"
+assert_contains "$out" "↳ codex 5h 40% · week 18%" "and does not hide the other homes"
 rm -rf "$HOME/.codex-accounts/fiveonly"; "$SG" codex-usage --refresh >/dev/null
+
+# Live usage: Codex's own server (app-server, account/rateLimits/read) wins over the logs,
+# so a week that reset and was used up again shows its real figure, not 0%.
+LIVE="$HOME/livebin"; mkdir -p "$LIVE"
+cat > "$LIVE/codex" <<PY
+#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get('id') == 1: print(json.dumps({'id': 1, 'result': {'userAgent': 'x'}}), flush=True)
+    if m.get('id') == 2:
+        print(json.dumps({'id': 2, 'result': {'rateLimits': {'primary': {'usedPercent': 93, 'windowDurationMins': 10080, 'resetsAt': $((NOW + 90000))}, 'secondary': None, 'planType': 'plus', 'rateLimitReachedType': None}}}), flush=True)
+PY
+chmod +x "$LIVE/codex"
+u="$(PATH="$LIVE:$PATH" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | "\(.source) \(.windows[0].label) \(.windows[0].pct)"')" "live week 93" "live figures from Codex's server win over the logs"
+out="$(echo '{"model":{"display_name":"M"}}' | SWAP_NO_REFRESH=1 bash "$SL" | strip_ansi)"
+assert_contains "$out" "↳ codex week 93%" "the statusline shows the live figure"
+assert_absent "$(printf '%s\n' "$out" | grep '↳ codex week')" " old)" "a live figure is never marked old"
+printf '#!/bin/bash\nexit 1\n' > "$LIVE/codex"
+u="$(PATH="$LIVE:$PATH" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | .source')" "log" "no answer from the server: the logs are used"
+# A notification before the reply, in the same write, is still read.
+cat > "$LIVE/codex" <<PY
+#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get('id') == 1: print(json.dumps({'id': 1, 'result': {'userAgent': 'x'}}), flush=True)
+    if m.get('id') == 2:
+        sys.stdout.write(json.dumps({'method': 'note'}) + "\\n" + json.dumps({'id': 2, 'result': {'rateLimits': {'primary': {'usedPercent': 41, 'windowDurationMins': 10080, 'resetsAt': $((NOW + 90000))}, 'secondary': None}}}) + "\\n"); sys.stdout.flush()
+PY
+u="$(PATH="$LIVE:$PATH" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | "\(.source) \(.windows[0].pct)"')" "live 41" "a notification sharing the reply's write does not hide it"
+# Not signed in: an error reply -> the logs.
+cat > "$LIVE/codex" <<'PY'
+#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get('id') == 1: print(json.dumps({'id': 1, 'result': {'userAgent': 'x'}}), flush=True)
+    if m.get('id') == 2: print(json.dumps({'id': 2, 'error': {'code': -32600, 'message': 'not logged in'}}), flush=True)
+PY
+u="$(PATH="$LIVE:$PATH" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | .source')" "log" "an error reply (not signed in): the logs are used"
+# No windows in the answer (e.g. an API-key login): the logs, not an empty line.
+cat > "$LIVE/codex" <<'PY'
+#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get('id') == 1: print(json.dumps({'id': 1, 'result': {'userAgent': 'x'}}), flush=True)
+    if m.get('id') == 2: print(json.dumps({'id': 2, 'result': {'rateLimits': {'primary': None, 'secondary': None}}}), flush=True)
+PY
+u="$(PATH="$LIVE:$PATH" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | .source')" "log" "an answer with no windows: the logs are used"
+# A half line then a stall, ignoring TERM: back within the ceiling, nothing left running.
+tag="ocx-hang-$$-$RANDOM"
+cat > "$LIVE/codex" <<PY
+#!/usr/bin/env python3
+import signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+sys.argv[0] = "$tag"
+sys.stdout.write('{"id": 1, "res'); sys.stdout.flush()
+while True: time.sleep(1)  # $tag
+PY
+t0=$(date +%s)
+u="$(PATH="$LIVE:$PATH" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+el=$(( $(date +%s) - t0 ))
+assert_eq "$([ "$el" -le 13 ] && echo yes || echo "no ($el s)")" "yes" "a stalled Codex server costs at most the 10 s ceiling"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | .source')" "log" "and the logs are used"
+sleep 1
+assert_eq "$(pgrep -f "$tag" | wc -l | tr -d ' ')" "0" "and no codex app-server is left running"
+# On, but no codex anywhere: the logs.
+u="$(PATH="/usr/bin:/bin:$(dirname "$(command -v jq)")" OVERCLAUDE_CODEX_LIVE=on "$SG" codex-usage --refresh)"
+assert_eq "$(printf '%s' "$u" | jq -r '.[] | select(.name=="primary") | .source')" "log" "no codex on PATH: the logs are used"
+"$SG" codex-usage --refresh >/dev/null
 
 echo work > "$HOME/.codex-accounts/.active"
 assert_eq "$(CODEX_HOME="$HOME/.codex" "$SG" path codex-handoff --cwd /tmp/x | grep -c codex-accounts/work)" "1" "an inherited CODEX_HOME is ignored; codex-swap's marker wins"

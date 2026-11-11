@@ -7,8 +7,8 @@
 **Claude Code, overclocked.** Hot-swap between Claude accounts without leaving your session, hand off to a fresh session before context fills up, and watch every usage meter live:
 
 ```text
-Fable 5 (high) | myproject (master*) | 3 sessions | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
-└ model+effort   └ folder+branch*      └ live count └ account     └ when its weekly limit resets
+🧠 Fable 5 (hi) | 📁 myproject (master*) | 💬 3 | 👤 work [1/2] ↻ Thu Oct 9 23:59 (1d 6h)
+└ model+effort     └ folder+branch*         └ live └ account     └ when its weekly limit resets
 
 ctx [████░░░░░░] 42% | 5h [███████░░░] 71% | week [██░░░░░░░░] 18% | Fable [███████░░░] 73%
 └ context window       └ 5-hour limit         └ weekly limit           └ model-scoped bucket
@@ -23,6 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
+| **1.10.0** | ✅ 2026-11-12 | Statusline: CPU next to memory (`cpu 34% · mem 48%`, on line 2 before the spend; swap only while memory is tight, as `(3.6G)`), `⚙ N agents` while this session has subagents or workflow agents running, icons on line 1 (`🧠 model (hi) | 📁 folder | 💬 sessions | 👤 account`) with short effort names. Codex limits are asked live from Codex's server (logs as fallback) and the Codex line is styled like the Claude account lines |
 | **1.9.2** | ✅ 2026-11-06 | Handoff offers measure against a session's auto-compact window: a session started with `claude --autocompact N` gets its 60/75/85% offers at those points of N, not of the model's full window, so a 400k session is offered a handoff before it compacts. Also the 5 Nov prompt-audit fixes (skills, ULTRACODE) |
 | **1.9.1** | ✅ 2026-11-05 | Bundles cswap 0.29.0 (was 0.26.0), so `overclaude install` and `overclaude update` upgrade an older cswap on their own. New in cswap since 0.26: switching onto an account with a session running no longer logs it out, every file it writes is atomic, a separate weekly switch line, the most-headroom escape when every account is over its lines, and no more `MallocStackLogging` lines under memory pressure on macOS. Its JSON and cache formats only gained fields; overclaude reads them unchanged |
 | 1.9.0 | ✅ 2026-11-04 | Continuation status and exact resume, durable checkpoints, offline verification, preview account selection, and recoverable payload updates; staged independent QA |
@@ -158,7 +159,7 @@ Version 1.5.1 also fixes token-job limits switching the interactive account, fle
 ## What's new in 1.4
 
 - **Codex as the next place to work** — `/handoff codex` (or `/swap codex`) writes the handoff where overcodex's Codex hook loads it, so work continues in the Codex CLI when every Claude account is out; typing `$handoff-claude` in Codex (overcodex 0.3) hands it back. The automatic 97% weekly policy uses `/handoff codex auto` to run a packaged continuation directly; manual `/handoff codex` retains the startup-hook workflow.
-- **Codex limits on the statusline** — `↳ codex 5h 12% · week 18% ↻ …` (every window that Codex account has), read from Codex's own session logs, one line per Codex account. `SWAP_HIDE_CODEX=1` hides them.
+- **Codex limits on the statusline** — `↳ codex 5h 12% · week 18% ↻ …` (every window that Codex account has), asked live from Codex's own server (`codex app-server`, no model turn), the way the Claude lines are, with Codex's session logs as the fallback; one line per Codex account, styled and coloured like the Claude account lines. `OVERCLAUDE_CODEX_LIVE=off` reads only the logs. `SWAP_HIDE_CODEX=1` hides them.
 - **Codex as an independent reviewer** — `swap-guard codex-review` runs a read-only, ephemeral `codex exec` with a timeout (optional JSON verdict schema, `--stdin` for a diff). ULTRACODE now recommends one cross-family voter on verdicts that matter.
 - **Routing guard** — on a Fable session, a subagent launched without a model (or a Workflow `agent()` call without one) is blocked with the fix, so the scarce tier is only spent on purpose. `/swap guard off` (or `OVERCLAUDE_ROUTE_GUARD=off`) disables it; the installer says when it turns on.
 - **Spend report** — `/swap spend`: what your usage would cost at API list prices, by model, account, day and session, against what your plans cost; the statusline shows `💵 $1.8k/7d · 19.2× plan` (refreshed in the background every 15 minutes; `SWAP_HIDE_SPEND=1` hides it). The plan cost counts every registered account; plan prices come from each account's tier and can be overridden in `~/.claude-swap-backup/plans.json`.
@@ -271,14 +272,14 @@ You lose the token bloat, not the thread. Works same-account (`/handoff`) or com
 **Artifacts travel too.** Before switching accounts, handoff runs `swap-guard artifacts`: it reads the session transcript (subagents and workflows included), finds every claude.ai artifact the session published or touched, copies each source out of the session's temporary scratchpad into `~/.claude-swap-backup/handoff-artifacts/<session>/`, and lists them in the package with their URLs and owner account. Artifacts belong server-side to the account that published them, so the next session updates them in place on the same account, and on a different account republishes from the saved source as a new artifact (or updates in place if you shared the original with edit access). Artifact database rows can be exported before the switch on request.
 
 ### Statusline
-The display at the top. Line 1 ends with the active account and when its **weekly limit resets** (local time + countdown). Line 2 is the live meters. Below that, each **other account** gets a compact line with its 5h / week / Fable usage and weekly reset, so you can see where to swap before you hit a wall — `⚠ relogin` flags a dead token, a dim `(2h old)` flags stale numbers, and `SWAP_HIDE_OTHERS=1` hides these lines.
+The display at the top. Line 1 is the model, the folder, the number of open Claude sessions on this Mac (`💬 3`), then the active account and when its **weekly limit resets** (local time + countdown). Line 2 is the live meters, with `⚙ 2 agents` right after the context bar while this session has subagents or workflow agents running (`SWAP_HIDE_AGENTS=1` hides it). Below that, each **other account** gets a compact line with its 5h / week / Fable usage and weekly reset, so you can see where to swap before you hit a wall — `⚠ relogin` flags a dead token, a dim `(2h old)` flags stale numbers, and `SWAP_HIDE_OTHERS=1` hides these lines.
 
 Usage numbers come from cswap's per-account cache, kept ≤ ~5 min fresh by a debounced background refresh (the render itself never waits on the network). It is also the kit's data spine: it publishes each session's context % to a relay the threshold hooks read. **Skip the kit's statusline and handoff offers never fire.**
 
 ### Memory guard — many sessions, one Mac *(1.7)*
 Several sessions, each with its own test runs, builds and MCP servers, can push a Mac into heavy swapping, and then every session stops responding at once. A small background agent checks memory every minute (`swap-guard mem watch on|off`, on by default; it reads `sysctl`, `memory_pressure` and `vm_stat`, which takes milliseconds):
 
-- **Statusline:** `mem 48% · swap 3.6G`, turning into a yellow `⚠` when memory is tight and a red `⚠ … critical`. `SWAP_HIDE_MEM=1` hides it.
+- **Statusline:** `cpu 34% · mem 48%` on line 2, after the limit meters and before the spend. CPU is the share of all cores in use and turns yellow from 85%. Memory turns into a yellow `⚠` when tight and a red `⚠ … !` when critical, and only then adds swap past 1 GB in brackets (`⚠ mem 85% (3.6G)`). `SWAP_HIDE_MEM=1` hides memory, `SWAP_HIDE_CPU=1` hides CPU.
 - **`/swap mem`** (or `swap-guard mem --text`): memory in use, swap, the biggest apps, each Claude session with what its child processes use, orphaned helpers, and what to close.
 - **When it gets tight** (warn: kernel pressure raised or under 20% free; critical: kernel pressure critical or under 10% free, or, while memory is tight, swap over half of RAM. Swap alone never counts, because macOS keeps it allocated for hours after the pressure is gone):
   - **Cleanup** (`mem autoclean`, on): stops *orphaned helpers* whose session is provably gone. A process counts only when all of these hold:

@@ -65,10 +65,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do                  # wait until both have exec'd
 done
 for p in "$c1" "$c2" "$dead" 999999 "$$"; do echo '{}' > "$sd/$p.json"; done
 l1=$(echo '{}' | SWAP_SESSIONS_DIR="$sd" bash "$SL" | strip_ansi | sed -n 1p)
-assert_contains "$l1" "| 2 sessions |" "only live claude pids from the session registry are counted"
+assert_contains "$l1" "| 💬 2 |" "only live claude pids from the session registry are counted"
 kill "$c1" "$c2" 2>/dev/null; wait "$c1" "$c2" 2>/dev/null
 l1=$(echo '{}' | SWAP_SESSIONS_DIR="$sd" bash "$SL" | strip_ansi | sed -n 1p)
-assert_contains "$l1" "| 1 session |" "no live sessions in the registry -> floor of 1"
+assert_contains "$l1" "| 💬 1 |" "no live sessions in the registry -> floor of 1"
 
 # Unknown usage (no cache for the account, no rate_limits on stdin) keeps "5h n/a".
 rm -f "$HOME/.claude-swap-backup/cache/usage.json"
@@ -128,4 +128,25 @@ err=$(printf '{"session_id":"acw1","model":{"id":"m"},"context_window":{"used_pe
 assert_eq "$err" "" "a payload without the window size prints nothing on stderr"
 assert_eq "$(jq -r .pct "$relay")" "22" "and keeps the full-window percentage"
 assert_contains "$offer" "Context is at 62%" "ctx-watch offers a handoff at 62% of the auto-compact window (25% of the full window)"
+# --- running agents (line 2, only while there are some) -------------------------
+TP="$HOME/tr/sess.jsonl"; AD="$HOME/tr/sess/subagents"; mkdir -p "$AD/workflows/wf_1"
+ag() { printf '{"model":{"display_name":"M"},"transcript_path":"%s","context_window":{"used_percentage":12}}' "$TP" | SWAP_NO_REFRESH=1 "$@" bash "$SL" | sed -n 2p | strip_ansi; }
+assert_absent "$(ag env)" "⚙" "no agents: nothing shown"
+: > "$AD/agent-a1.jsonl"; printf '{"agentType":"x"}' > "$AD/agent-a1.meta.json"
+assert_contains "$(ag env)" "12% | ⚙ 1 agent | " "one running agent, right after the context bar"
+: > "$AD/workflows/wf_1/agent-b1.jsonl"; printf '{"agentType":"y"}' > "$AD/workflows/wf_1/agent-b1.meta.json"
+: > "$AD/agent-a2.jsonl"; printf '{"agentType":"x","finished":true}' > "$AD/agent-a2.meta.json"
+assert_contains "$(ag env)" "⚙ 2 agents" "workflow agents count; finished ones do not"
+touch -t "$(date -r $(( $(date +%s) - 300 )) +%Y%m%d%H%M.%S)" "$AD/workflows/wf_1/agent-b1.jsonl"
+assert_contains "$(ag env)" "⚙ 1 agent " "a workflow agent quiet for 2+ minutes is done (they are never marked finished)"
+assert_absent "$(ag env SWAP_HIDE_AGENTS=1)" "⚙" "SWAP_HIDE_AGENTS hides it"
+touch -t "$(date -r $(( $(date +%s) - 7200 )) +%Y%m%d%H%M.%S)" "$AD/agent-a1.jsonl" "$AD/workflows/wf_1/agent-b1.jsonl"
+assert_absent "$(ag env)" "⚙" "an unfinished agent silent for over an hour is not counted"
+# --- effort names are shortened on line 1 ---------------------------------------
+ef() { printf '{"model":{"display_name":"M"},"effort":{"level":"%s"}}' "$1" | SWAP_NO_REFRESH=1 bash "$SL" | sed -n 1p | strip_ansi; }
+assert_contains "$(ef low)" "🧠 M (lo) | 📁 " "effort low -> lo"
+assert_contains "$(ef medium)" "🧠 M (med) | 📁 " "effort medium -> med"
+assert_contains "$(ef high)" "🧠 M (hi) | 📁 " "effort high -> hi"
+assert_contains "$(ef xhigh)" "🧠 M (xhi) | 📁 " "effort xhigh -> xhi"
+assert_contains "$(ef max)" "🧠 M (max) | 📁 " "effort max stays"
 finish
