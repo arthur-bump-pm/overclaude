@@ -513,7 +513,7 @@ mem_seg=$(mem_segment 2>/dev/null) || mem_seg=""
 # (<transcript>/subagents/agent-*.meta.json) is not marked finished and whose
 # transcript moved in the last hour (a crashed one never gets marked), plus workflow
 # agents written to in the last 2 minutes.
-# Shown after the session count, "💬 2 (5 agents)", only when there is one. SWAP_HIDE_AGENTS=1 hides it.
+# Shown after the session count, "💬 2 (5)" (not bold), only when there is one. SWAP_HIDE_AGENTS=1 hides it.
 agents_segment() {
   local tp dir n=0 f
   [ -z "${SWAP_HIDE_AGENTS:-}" ] || return 0
@@ -532,10 +532,9 @@ agents_segment() {
 $(find "$dir" -name 'agent-*.jsonl' -mmin -60 2>/dev/null)
 EOF
   [ "$n" -gt 0 ] || return 0
-  if [ "$n" -eq 1 ]; then printf '(1 agent)'; else printf '(%d agents)' "$n"; fi
+  printf '(%d)' "$n"
 }
 agents_seg=$(agents_segment 2>/dev/null) || agents_seg=""
-[ -n "$agents_seg" ] && segment_sessions="$segment_sessions $agents_seg"
 
 # Order: this session (model), where (folder, sessions), then the account
 # together with its weekly reset.
@@ -543,6 +542,8 @@ agents_seg=$(agents_segment 2>/dev/null) || agents_seg=""
 # agents in brackets), 👤 account.
 line1="${BOLD}🧠 ${model_seg}${RESET}"
 line1="$line1 | ${BOLD}📁 ${segment_dir}${RESET} | ${BOLD}${segment_sessions}${RESET}"
+# Running agents: plain (not bold) after the session count.
+[ -n "$agents_seg" ] && line1="$line1 ${agents_seg}"
 
 account_seg=$(swap_account_segment 2>/dev/null) || account_seg=""
 if [ -n "$account_seg" ]; then
