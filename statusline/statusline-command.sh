@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Claude Code status line - two-line layout
 #
-# Line 1: model (effort) | dir (branch*) | 💬 N | account ↻ weekly reset
-# Line 2: ctx bar | ⚙ N agents (only while running) | 5h bar | week bar | Fable bar  (10-char bars, one line;
+# Line 1: model (effort) | dir (branch*) | 💬 N (agents running) | account ↻ weekly reset
+# Line 2: ctx bar | 5h bar | week bar | Fable bar  (10-char bars, one line;
 #         5h is left out when the plan has no 5-hour window, e.g. Ultra)
 # Line 3+: one compact line per OTHER cswap account (limits + weekly reset)
 #
@@ -509,29 +509,11 @@ mem_segment() {
 }
 mem_seg=$(mem_segment 2>/dev/null) || mem_seg=""
 
-# Order: this session (model), where (folder, sessions), then the account
-# together with its weekly reset.
-# Every piece of line 1 leads with an icon: 🧠 model, 📁 folder, 💬 sessions, 👤 account.
-line1="${BOLD}🧠 ${model_seg}${RESET}"
-line1="$line1 | ${BOLD}📁 ${segment_dir}${RESET} | ${BOLD}${segment_sessions}${RESET}"
-
-account_seg=$(swap_account_segment 2>/dev/null) || account_seg=""
-if [ -n "$account_seg" ]; then
-  line1="$line1 | ${BOLD}${account_seg}${RESET}"
-  reset_seg=$(week_reset_segment 2>/dev/null) || reset_seg=""
-  [ -n "$reset_seg" ] && line1="$line1 ${reset_seg}"
-  active_slot=$(jq -r '.activeAccountNumber // empty' "${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}" 2>/dev/null) || active_slot=""
-  if [ -n "$active_slot" ]; then
-    lw=$(login_warn "$active_slot" 2>/dev/null) || lw=""
-    [ -n "$lw" ] && line1="$line1 ${lw}"
-  fi
-fi
-
 # Agents this session has running right now: subagents whose record
 # (<transcript>/subagents/agent-*.meta.json) is not marked finished and whose
 # transcript moved in the last hour (a crashed one never gets marked), plus workflow
 # agents written to in the last 2 minutes.
-# Shown only when there is one. SWAP_HIDE_AGENTS=1 hides it.
+# Shown after the session count, "💬 2 (5 agents)", only when there is one. SWAP_HIDE_AGENTS=1 hides it.
 agents_segment() {
   local tp dir n=0 f
   [ -z "${SWAP_HIDE_AGENTS:-}" ] || return 0
@@ -550,16 +532,35 @@ agents_segment() {
 $(find "$dir" -name 'agent-*.jsonl' -mmin -60 2>/dev/null)
 EOF
   [ "$n" -gt 0 ] || return 0
-  if [ "$n" -eq 1 ]; then printf '⚙ 1 agent'; else printf '⚙ %d agents' "$n"; fi
+  if [ "$n" -eq 1 ]; then printf '(1 agent)'; else printf '(%d agents)' "$n"; fi
 }
 agents_seg=$(agents_segment 2>/dev/null) || agents_seg=""
+[ -n "$agents_seg" ] && segment_sessions="$segment_sessions $agents_seg"
+
+# Order: this session (model), where (folder, sessions), then the account
+# together with its weekly reset.
+# Every piece of line 1 leads with an icon: 🧠 model, 📁 folder, 💬 sessions (and running
+# agents in brackets), 👤 account.
+line1="${BOLD}🧠 ${model_seg}${RESET}"
+line1="$line1 | ${BOLD}📁 ${segment_dir}${RESET} | ${BOLD}${segment_sessions}${RESET}"
+
+account_seg=$(swap_account_segment 2>/dev/null) || account_seg=""
+if [ -n "$account_seg" ]; then
+  line1="$line1 | ${BOLD}${account_seg}${RESET}"
+  reset_seg=$(week_reset_segment 2>/dev/null) || reset_seg=""
+  [ -n "$reset_seg" ] && line1="$line1 ${reset_seg}"
+  active_slot=$(jq -r '.activeAccountNumber // empty' "${SWAP_SEQ_JSON:-$HOME/.claude-swap-backup/sequence.json}" 2>/dev/null) || active_slot=""
+  if [ -n "$active_slot" ]; then
+    lw=$(login_warn "$active_slot" 2>/dev/null) || lw=""
+    [ -n "$lw" ] && line1="$line1 ${lw}"
+  fi
+fi
 
 # --- Line 2: usage bars, all on one line ---
 # The 5h bar is left out when the account has no 5-hour window: plans without
 # one (Ultra) report five_hour as null. Unknown usage (no cache, no response yet)
 # still renders "5h n/a" like week/Fable.
 line2="$(render_bar "ctx" "$ctx_used")"
-[ -n "$agents_seg" ] && line2="$line2 | ${BOLD}${agents_seg}${RESET}"
 if [ -z "$five_hour" ] && [ -n "$no_five_hour" ]; then :
 else line2="$line2 | $(render_bar "5h" "$five_hour")"; fi
 line2="$line2 | $(render_bar "week" "$seven_day") | $(render_bar "Fable" "$fable_pct")"

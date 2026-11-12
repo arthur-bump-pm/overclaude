@@ -130,18 +130,18 @@ assert_eq "$(jq -r .pct "$relay")" "22" "and keeps the full-window percentage"
 assert_contains "$offer" "Context is at 62%" "ctx-watch offers a handoff at 62% of the auto-compact window (25% of the full window)"
 # --- running agents (line 2, only while there are some) -------------------------
 TP="$HOME/tr/sess.jsonl"; AD="$HOME/tr/sess/subagents"; mkdir -p "$AD/workflows/wf_1"
-ag() { printf '{"model":{"display_name":"M"},"transcript_path":"%s","context_window":{"used_percentage":12}}' "$TP" | SWAP_NO_REFRESH=1 "$@" bash "$SL" | sed -n 2p | strip_ansi; }
-assert_absent "$(ag env)" "⚙" "no agents: nothing shown"
+ag() { printf '{"model":{"display_name":"M"},"transcript_path":"%s","context_window":{"used_percentage":12}}' "$TP" | SWAP_NO_REFRESH=1 "$@" bash "$SL" | sed -n 1p | strip_ansi; }
+assert_absent "$(ag env)" "agent)" "no agents: nothing shown"
 : > "$AD/agent-a1.jsonl"; printf '{"agentType":"x"}' > "$AD/agent-a1.meta.json"
-assert_contains "$(ag env)" "12% | ⚙ 1 agent | " "one running agent, right after the context bar"
+assert_contains "$(ag env)" " (1 agent) | " "one running agent, in brackets after the session count"
 : > "$AD/workflows/wf_1/agent-b1.jsonl"; printf '{"agentType":"y"}' > "$AD/workflows/wf_1/agent-b1.meta.json"
 : > "$AD/agent-a2.jsonl"; printf '{"agentType":"x","finished":true}' > "$AD/agent-a2.meta.json"
-assert_contains "$(ag env)" "⚙ 2 agents" "workflow agents count; finished ones do not"
+assert_contains "$(ag env)" "(2 agents)" "workflow agents count; finished ones do not"
 touch -t "$(date -r $(( $(date +%s) - 300 )) +%Y%m%d%H%M.%S)" "$AD/workflows/wf_1/agent-b1.jsonl"
-assert_contains "$(ag env)" "⚙ 1 agent " "a workflow agent quiet for 2+ minutes is done (they are never marked finished)"
-assert_absent "$(ag env SWAP_HIDE_AGENTS=1)" "⚙" "SWAP_HIDE_AGENTS hides it"
+assert_contains "$(ag env)" "(1 agent)" "a workflow agent quiet for 2+ minutes is done (they are never marked finished)"
+assert_absent "$(ag env SWAP_HIDE_AGENTS=1)" "agent)" "SWAP_HIDE_AGENTS hides it"
 touch -t "$(date -r $(( $(date +%s) - 7200 )) +%Y%m%d%H%M.%S)" "$AD/agent-a1.jsonl" "$AD/workflows/wf_1/agent-b1.jsonl"
-assert_absent "$(ag env)" "⚙" "an unfinished agent silent for over an hour is not counted"
+assert_absent "$(ag env)" "agent)" "an unfinished agent silent for over an hour is not counted"
 # --- effort names are shortened on line 1 ---------------------------------------
 ef() { printf '{"model":{"display_name":"M"},"effort":{"level":"%s"}}' "$1" | SWAP_NO_REFRESH=1 bash "$SL" | sed -n 1p | strip_ansi; }
 assert_contains "$(ef low)" "🧠 M (lo) | 📁 " "effort low -> lo"
