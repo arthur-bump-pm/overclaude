@@ -20,7 +20,6 @@ FILES = (
     ("hooks/ctx-watch.sh", ".claude/hooks/ctx-watch.sh", 0o755),
     ("hooks/ctx-notify.sh", ".claude/hooks/ctx-notify.sh", 0o755),
     ("statusline/statusline-command.sh", ".claude/statusline-command.sh", 0o755),
-    ("claude/ULTRACODE.md", ".claude/ULTRACODE.md", None),
 )
 
 FILES += tuple(("bin/overclaude_runtime/" + name, ".local/bin/overclaude_runtime/" + name, 0o644)
@@ -67,11 +66,6 @@ def verify(payload, home, version):
             errors.append("installed kit version does not match the package")
     except (OSError, UnicodeError, ValueError):
         errors.append("installed kit version is missing or unreadable")
-    try:
-        if "@ULTRACODE.md" not in _read(home / ".claude/CLAUDE.md", follow=True).decode().splitlines():
-            errors.append("CLAUDE.md does not import @ULTRACODE.md")
-    except (OSError, UnicodeError, ValueError):
-        errors.append("CLAUDE.md is missing or unreadable")
     try:
         snippet = _read(payload / "shell/zshrc-snippet.sh").decode()
         zshrc = _read(home / ".zshrc", follow=True).decode()
@@ -124,6 +118,11 @@ def verify(payload, home, version):
                     return all(any(hook_matches(candidate, hook) for candidate in candidates) for hook in required["hooks"])
                 if not any(matches(group) for group in groups):
                     errors.append(f"missing or incorrect {event} hook: {required['hooks'][0]['command']}")
+        # The routing guard is retired: a hook still calling it is left from an old install.
+        if any(isinstance(g, dict) and isinstance(h, dict) and "swap-guard route-guard" in str(h.get("command", ""))
+               for groups in hooks.values() if isinstance(groups, list) for g in groups
+               for h in (g.get("hooks") if isinstance(g, dict) and isinstance(g.get("hooks"), list) else [])):
+            errors.append("a retired routing-guard hook is still in settings.json")
         allow = settings.get("permissions", {}).get("allow", [])
         if not isinstance(allow, list) or any(item not in allow for item in fragment["permissions"]["allow"]):
             errors.append("required kit permissions are missing")

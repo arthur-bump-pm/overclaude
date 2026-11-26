@@ -44,7 +44,8 @@ result="$("$RUN" --package "$HOME/package.md")"
 assert_eq "$?" 0 'real routing and runner complete together'
 assert_eq "$(jq -r .exit_code <<< "$result")" 0 'Codex completion returned'
 assert_contains "$(cat "$(jq -r .final_message <<< "$result")")" 'checks passed' 'final evidence readable'
-assert_contains "$(cat "$HOME/received-package")" 'Use the installed $ultracode' 'orchestration harness reaches Codex'
+assert_contains "$(cat "$HOME/received-package")" "Follow the project's own instructions" 'continuation note reaches Codex'
+assert_absent "$(cat "$HOME/received-package")" 'ultracode' 'and prescribes no orchestration policy'
 assert_eq "$(cat "$HOME/launches")" "$(cd "$HOME/.codex" && pwd -P)" 'selected account home pinned end to end'
 assert_eq "$(stat -f %Lp "$(jq -r .output_dir <<< "$result")/package.md")" 600 'saved context is private'
 QA_LOGIN_RC=1 "$RUN" --package "$HOME/package.md" > "$HOME/declined" 2>&1 && fail 'logout blocks real route' || pass

@@ -53,7 +53,6 @@ for f in \
   "$SCRIPT_DIR/hooks/ctx-watch.sh" \
   "$SCRIPT_DIR/hooks/ctx-notify.sh" \
   "$SCRIPT_DIR/statusline/statusline-command.sh" \
-  "$SCRIPT_DIR/claude/ULTRACODE.md" \
   "$FRAG" \
   "$ZSNIPPET" ; do
   [ -f "$f" ] || die "kit file missing: $f (run from the repo root)"
@@ -143,6 +142,21 @@ KIT_VER="${OVERCLAUDE_VERSION:-}"
 [ -n "$KIT_VER" ] || KIT_VER=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SCRIPT_DIR/pyproject.toml" 2>/dev/null | head -1)
 [ -n "$KIT_VER" ] || KIT_VER=$(overclaude version 2>/dev/null | head -1)
 [ -n "$KIT_VER" ] || die "cannot determine kit version"
+# Older versions shipped ~/.claude/ULTRACODE.md (imported from CLAUDE.md) and a
+# routing-guard hook; the transaction below removes all three. Its journal keeps the
+# old contents, and a plain copy of each file it changes goes here first.
+RETIRED_BAK="$HOME/.claude-swap-backup/retired"
+for f in "$CLAUDE_DIR/ULTRACODE.md" "$CLAUDE_MD" "$SETTINGS"; do
+  case "$f" in
+    "$CLAUDE_DIR/ULTRACODE.md") [ -f "$f" ] && [ ! -L "$f" ] || continue;;
+    # Same rule as the removal: a line that is @ULTRACODE.md once surrounding
+    # whitespace (spaces, tabs, a CRLF's \r) is stripped.
+    "$CLAUDE_MD") [ -f "$f" ] && LC_ALL=C grep -qE $'^[ \t\r\v\f]*@ULTRACODE\\.md[ \t\r\v\f]*$' "$f" || continue;;
+    "$SETTINGS") [ -f "$f" ] && grep -qF 'swap-guard route-guard' "$f" || continue;;
+  esac
+  mkdir -p "$RETIRED_BAK" && cp -p "$f" "$RETIRED_BAK/$(basename "$f").$EPOCH" &&
+    note_did "backed up $(basename "$f") to $RETIRED_BAK before removing what older versions added"
+done
 python3 "$SCRIPT_DIR/bin/overclaude-install-transaction" --payload "$SCRIPT_DIR" apply --version "$KIT_VER" ||
   die "managed file transaction failed; package/dependency changes, if any, are separate; inspect or recover the transaction"
 note_did "managed payload and settings verified"

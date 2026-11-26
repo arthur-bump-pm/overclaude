@@ -76,7 +76,7 @@ if [ -n "$relay_pct" ] && [ "$relay_pct" != null ]; then
     relay_pct=$(awk -v t="$tok" -v w="$relay_acw" 'BEGIN { p = t * 100 / w; if (p > 100) p = 100; printf "%.2f", p }')
   fi
 fi
-# A null pct is still published when the model is known, so the routing guard knows the
+# A null pct is still published when the model is known, so hooks reading the relay know the
 # session model from the first turn (ctx-watch ignores a null pct).
 if [ -n "$relay_session_id" ] && [ -n "$relay_pct" ] && { [ "$relay_pct" != null ] || [ -n "$relay_model" ]; }; then
   case "$relay_session_id" in

@@ -6,7 +6,11 @@ import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, pat
 from unittest import mock
 repo, root = map(pathlib.Path, sys.argv[1:]); script = repo / 'bin/overclaude-install-transaction'
 loader = importlib.machinery.SourceFileLoader('txn', str(script)); spec=importlib.util.spec_from_loader(loader.name,loader); mod=importlib.util.module_from_spec(spec); loader.exec_module(mod)
-verifier = mod.read_payload(repo); count = len(verifier.FILES) + len(mod.SHARED)
+verifier = mod.read_payload(repo)
+# Writes in a fresh home: every payload file and shared file except CLAUDE.md, which the
+# installer only edits (to take out a retired import) and never creates; retired files
+# that are absent stay absent.
+count = len(verifier.FILES) + len(mod.SHARED) - 1
 
 def newhome(label):
     home = root / label; home.mkdir(); (home/'.claude').mkdir(); (home/'.claude/settings.json').write_text('{"model":"mine"}\n'); return home

@@ -106,7 +106,7 @@ done
 echo
 
 # ---------------------------------------------------------------------------
-# 2. CLAUDE.md — remove the @ULTRACODE.md import line.
+# 2. CLAUDE.md — remove the @ULTRACODE.md import line older versions added.
 # ---------------------------------------------------------------------------
 echo "-- CLAUDE.md --"
 if [ -f "$CLAUDE_MD" ] && grep -qxF '@ULTRACODE.md' "$CLAUDE_MD"; then

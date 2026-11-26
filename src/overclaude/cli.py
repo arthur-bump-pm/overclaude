@@ -1,7 +1,7 @@
 """overclaude CLI — runs the bundled kit installer/uninstaller.
 
 The package wheel carries the same payload a git clone has (bin/, skills/,
-hooks/, statusline/, claude/, settings/, shell/, vendor/claude-swap, and the
+hooks/, statusline/, settings/, shell/, vendor/claude-swap, and the
 install/uninstall/doctor scripts). This CLI just locates that payload and runs the
 battle-tested bash scripts against it.
 """
@@ -82,7 +82,7 @@ def _update(check_only):
 def main():
     ap = argparse.ArgumentParser(
         prog="overclaude",
-        description="Claude Code, overclocked — /swap, /handoff, statusline, ULTRACODE model routing.",
+        description="Claude Code, overclocked — /swap, /handoff, statusline.",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("install", help="install/refresh the kit into ~/.claude (idempotent, backs everything up)")

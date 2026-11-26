@@ -37,7 +37,7 @@ for src, dst, mode in FILES:
     shutil.copyfile(payload / src, path)
     if mode is not None:
         path.chmod(mode)
-(home / '.claude/CLAUDE.md').write_text(chr(10).join(['user text', '@ULTRACODE.md', '']))
+(home / '.claude/CLAUDE.md').write_text(chr(10).join(['user text', '']))
 (home / '.claude-swap-backup/kit-version').write_text('1.2.3\n')
 settings = json.loads((payload / 'settings/settings-fragment.json').read_text())
 settings['model'] = 'user choice'

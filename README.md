@@ -57,6 +57,14 @@ Not in a release yet (work on branch `feat/fleet-feed`).
 - **Each Mac's own reading wins over an SSH read** — an SSH login often cannot open the keychain, so a live read there says `keychain_unavailable` or `token_expired`. The keepalive and auto ticks (launchd, where the keychain opens) now leave `~/.claude-swap-backup/cache/self.json`; fleet status uses it (if under 3 hours old) for any account the SSH read could not see, and says so (`source: "self-report"`, with the SSH answer in `liveStatus`). Fleet swap still picks a worker's target by what SSH saw, since that is how it switches. The auto tick records at most every 5 minutes. A Mac on an older kit shows its live read as before; login end dates there come from its login cache.
 - **Usage history** — `~/.claude-swap-backup/usage-history.jsonl` on each Mac, written by the keepalive and auto ticks, so it no longer depends on `cswap --menubar` running. A row per account when its week %, Fable %, active state or status changes, plus an hourly heartbeat (as often as a tick runs: every 2 hours with keepalive alone, every 3 minutes with auto-swap on): `{"ts","mac","acct","active","w","fable","resetsAt","last","status","sessions","busy"}`. Every account switch adds `{"ts","mac","ev":"swap","from","to","by"}`. 180 days are kept, trimmed once a month (about 2 MB a year). `swap-guard usage-history [--days N] [--mac NAME] [--text]` prints it (JSON array, last 7 days by default). The Mac's name is its Tailscale name; set `OVERCLAUDE_MAC_NAME` or write `~/.claude-swap-backup/mac-name` to override. `SWAP_NO_USAGE_HISTORY=1` turns it off.
 
+## Unreleased: no more ULTRACODE or routing guard
+
+Not in a release yet. overclaude no longer tells sessions how to structure their work: it does not ship `ULTRACODE.md` and has no routing guard. How a project organizes agents, models and reviews is up to that project.
+
+- **Removed:** `~/.claude/ULTRACODE.md` and its `@ULTRACODE.md` import in `~/.claude/CLAUDE.md`, the routing-guard PreToolUse hook (`swap-guard route-guard`) and `/swap guard`. The installer no longer writes to `CLAUDE.md` at all.
+- **Cleaned on update:** `overclaude update` (or `install.sh`) removes all three from a Mac an older version set up. It copies each file it changes to `~/.claude-swap-backup/retired/` first, and keeps the old contents in its transaction journal (`overclaude recover`). Your own lines in `CLAUDE.md` and your own hooks stay. A symlinked `ULTRACODE.md` is left alone. `overclaude doctor` warns about any of them still there. Until a Mac has updated its settings, `swap-guard route-guard` is a silent no-op, so a leftover hook never blocks an agent.
+- **Neutral now:** the usage note (`swap-guard budget --hook`) states the account's usage bands and which account has room, and gives no routing advice. `swap-guard codex-review` stays as a plain tool. The Codex continuation note asks Codex to follow the project's own instructions instead of a fixed orchestration recipe.
+
 ## What's new in 1.9.1
 
 The bundled cswap moves from 0.26.0 to 0.29.0. You don't need to do anything: `overclaude update` (or `pipx upgrade overclaude && overclaude install`) upgrades an older installed cswap to it, and never downgrades a newer one. What 0.27–0.29 bring is in the [cswap release notes](https://github.com/realiti4/claude-swap/releases); the parts that matter here:
@@ -305,9 +313,6 @@ Several sessions, each with its own test runs, builds and MCP servers, can push 
 
 It never quits an app or ends a live session: those stay suggestions. Orphans it can't prove dead (a dev server on a port, something still working, a background job a live session may own) are only listed, with `swap-guard mem clean --pid N` to stop one. `swap-guard mem clean --dry-run` shows what a cleanup would stop.
 
-### `ULTRACODE.md` — model routing for multi-agent workflows
-A policy loaded into every session: bulk work rides cheap models, verification rides opus, only final judgment spends the top tier. Routing table, hard floors, escalation rules included.
-
 ## Cheat sheet
 
 | Command | Effect |
@@ -339,7 +344,6 @@ A policy loaded into every session: bulk work rides cheap models, verification r
 | `overclaude recover --list` | Inspect managed-file recovery transactions *(1.9)* |
 | `overclaude recover --transaction <id>` | Restore eligible files from a failed/interrupted update *(1.9)* |
 | `/swap spend [days N]` | API-price value of your usage vs your plans *(1.4)* |
-| `/swap guard on\|off\|status` | Routing guard for subagents on Fable *(1.4)* |
 | `swap-guard keepalive on\|off\|status` *(shell)* | Background refresh that keeps idle accounts' logins alive (default on) *(1.5)* |
 | `swap-guard browser list\|set\|clear` *(shell)* | Which Chrome profile a re-login opens in *(1.6)* |
 | `/swap auto prewarm on\|off` | Start idle accounts' 5-hour windows early (opt-in) *(1.6, experimental)* |
@@ -420,7 +424,6 @@ The heavy lifting — credential storage, keychain switching, OAuth refresh, usa
 | `hooks/ctx-watch.sh` | `~/.claude/hooks/` | UserPromptSubmit: fires the 60/75/85% offers with re-arm hysteresis |
 | `hooks/ctx-notify.sh` | `~/.claude/hooks/` | Stop: threshold banners |
 | `statusline/statusline-command.sh` | `~/.claude/statusline-command.sh` | Renders the statusline; publishes the ctx relay |
-| `claude/ULTRACODE.md` | `~/.claude/` + `CLAUDE.md` import | Model/effort routing policy |
 | `settings/settings-fragment.json` | merged into `~/.claude/settings.json` | hooks (SessionStart handoff inject; UserPromptSubmit ctx-watch + usage bands; Stop banners; StopFailure `rate_limit` instant swap; PostToolUse `Artifact` registry), statusLine, 2 permission allows |
 | `shell/zshrc-snippet.sh` | `~/.zshrc` (markers) | `claude()` relaunch wrapper, `swap` alias, PATH guard |
 | `vendor/claude-swap/` | pipx/uv-installed if absent or older | The bundled credential engine (0.29.0) |
@@ -466,6 +469,6 @@ The parent hooks check all enabled Claude subscription accounts before routing w
 
 When the selected Codex home is logged in and has no known exhausted window, `/handoff codex auto` packages the goal, constraints, current changes, unfinished work, artifacts, next steps, and validation. `overclaude-codex-continue` checks the route again and starts a persistent `codex exec` with workspace-write permissions. Automatic continuation passes context on stdin and also works without overcodex installed; manual startup handoffs still require its hook. Codex usage is inferred from local session logs: missing or stale observations are disclosed, and a launch failure is preserved without automatic retry.
 
-The runner selects supported model/effort pairs from that home's local model catalog (Sol/high for ordinary work, Astra/xhigh for complex work, with catalog-validated alternatives). Without a compatible catalog it retains the configured Codex default. The task instructions use installed UltraCode or native bounded subagents, disjoint writer ownership, objective checks, and independent review when needed. Claude waits while Codex owns the task. Results and the original package remain under the selected Codex home's `overcodex/continuations/` directory.
+The runner selects supported model/effort pairs from that home's local model catalog (Sol/high for ordinary work, Astra/xhigh for complex work, with catalog-validated alternatives). Without a compatible catalog it retains the configured Codex default. The task note asks Codex to follow the project's own instructions (AGENTS.md and the like), which decide how the work is organized; to run the project's checks and record what they show; and to save checkpoints at safe points. It never claims the goal is done just because the process exited. Claude waits while Codex owns the task. Results and the original package remain under the selected Codex home's `overcodex/continuations/` directory.
 
 Inspect the decision with `swap-guard codex-route`; preview a prepared package with `overclaude-codex-continue --package <path> --dry-run`. This does not forcibly terminate an interactive Claude session. It continues the work inside a Codex execution and returns its result to Claude. A fresh pending Codex handoff or another continuation in the same directory blocks duplicate startup.

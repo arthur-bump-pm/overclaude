@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "overclaude"
 version = "1.10.2"
-description = "Claude Code, overclocked — multi-account hot-swap, context-threshold handoff, instrumented statusline, and model routing for multi-agent workflows"
+description = "Claude Code, overclocked — multi-account hot-swap, context-threshold handoff, and an instrumented statusline"
 readme = "README.md"
 license = { text = "MIT" }
 license-files = ["LICENSE"]
@@ -39,7 +39,6 @@ packages = ["src/overclaude"]
 "skills" = "overclaude/payload/skills"
 "hooks" = "overclaude/payload/hooks"
 "statusline" = "overclaude/payload/statusline"
-"claude" = "overclaude/payload/claude"
 "settings" = "overclaude/payload/settings"
 "shell" = "overclaude/payload/shell"
 "vendor/claude-swap" = "overclaude/payload/vendor/claude-swap"

@@ -22,7 +22,10 @@ ORIG="$(jq -S . "$S")"
 bash "$REPO/install.sh" > "$HOME/i1.log" 2>&1
 assert_eq "$?" "0" "install exits 0"
 assert_contains "$(cat "$HOME/i1.log")" "Instant swap is ON" "the installer says when it turns instant swap on"
-assert_contains "$(cat "$HOME/i1.log")" "Routing guard is ON" "and when it turns the routing guard on"
+assert_absent "$(cat "$HOME/i1.log")" "Routing guard" "no routing guard is installed"
+assert_eq "$(jq '[.hooks[]?[]?.hooks[]?.command // "" | select(contains("route-guard"))] | length' "$S")" "0" "and no route-guard hook"
+assert_eq "$([ -e "$HOME/.claude/ULTRACODE.md" ] && echo yes || echo no)" "no" "no ULTRACODE.md is shipped"
+assert_eq "$([ -e "$HOME/.claude/CLAUDE.md" ] && echo yes || echo no)" "no" "and CLAUDE.md is not created"
 for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "UserPromptSubmit:swap-guard budget --hook" \
             "Stop:ctx-notify.sh" "StopFailure:swap-guard ratelimit" "PostToolUse:swap-guard artifact-log" \
             "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" "PostToolUse:swap-guard checkpoint"; do
@@ -101,5 +104,41 @@ assert_eq "$(stat -f %Lp "$HOME/dotfiles/zshrc")" "600" "and the file mode"
 assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-continue" ] && echo present || echo gone)" "gone" "Codex continuation runner removed"
 assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-probe" ] && echo present || echo gone)" "gone" "Codex policy probe removed"
 assert_eq "$([ -e "$HOME/.local/bin/overclaude-codex-pool" ] && echo present || echo gone)" "gone" "Codex pool preview removed"
+# An update from an older version takes away what it added: ULTRACODE.md, the
+# @ULTRACODE.md import (the user's own lines stay) and the routing-guard hook
+# (the user's own hooks stay), each backed up first.
+rm -rf "$HOME"
+new_home; export SWAP_GUARD_NO_LAUNCHCTL=1
+export PATH="$STUB:$HOME/.local/bin:$PATH"
+S="$HOME/.claude/settings.json"
+printf 'my policy\n' > "$HOME/.claude/ULTRACODE.md"
+printf '%s\n' 'my rules' '@ULTRACODE.md' 'more' > "$HOME/.claude/CLAUDE.md"
+cat > "$S" <<'EOF'
+{"hooks": {"PreToolUse": [{"matcher": "Agent|Task|Workflow", "hooks": [{"type": "command", "command": "~/.local/bin/swap-guard route-guard", "timeout": 10}]},
+                          {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-own-hook"}]}]}}
+EOF
+bash "$REPO/install.sh" > "$HOME/u.log" 2>&1
+assert_eq "$?" "0" "an update over an older install exits 0"
+assert_eq "$([ -e "$HOME/.claude/ULTRACODE.md" ] && echo yes || echo no)" "no" "the old ULTRACODE.md is removed"
+assert_eq "$(cat "$HOME/.claude/CLAUDE.md")" "$(printf 'my rules\nmore')" "the @ULTRACODE.md line goes, the user's lines stay"
+assert_eq "$(jq '[.hooks[]?[]?.hooks[]?.command // "" | select(contains("route-guard"))] | length' "$S")" "0" "the route-guard hook is removed"
+assert_eq "$(jq -r '[.hooks.PreToolUse[]?.hooks[]?.command] | index("my-own-hook") != null' "$S")" "true" "the user's own PreToolUse hook stays"
+assert_eq "$(cat "$HOME/.claude-swap-backup/retired/ULTRACODE.md."*)" "my policy" "ULTRACODE.md is backed up first"
+assert_contains "$(cat "$HOME/.claude-swap-backup/retired/CLAUDE.md."*)" "@ULTRACODE.md" "and CLAUDE.md"
+assert_contains "$(cat "$HOME/.claude-swap-backup/retired/settings.json."*)" "route-guard" "and settings.json"
+tx="$(ls "$HOME/.claude-swap-backup/install-transactions" | grep -v '^\.' | tail -n 1)"
+assert_eq "$(jq -r '.entries[] | select(.rel == ".claude/ULTRACODE.md") | [.before.exists, .after.exists, .status] | map(tostring) | join(",")' "$HOME/.claude-swap-backup/install-transactions/$tx/journal.json")" "true,false,applied" "the journal records the removal (recoverable)"
+assert_eq "$(OVERCLAUDE_VERSION= bash "$REPO/install.sh" > "$HOME/u2.log" 2>&1; echo $?)" "0" "a second install loads that journal and is a no-op"
+assert_eq "$("$HOME/.local/bin/swap-guard" route-guard < /dev/null; echo "rc=$?")" "rc=0" "a leftover hook calling route-guard is a silent no-op, never a block"
+
+# A CRLF CLAUDE.md (or one with trailing spaces): the import line still goes, and
+# the file is backed up first, by the same rule the removal uses.
+rm -rf "$HOME"; new_home
+export PATH="$STUB:$HOME/.local/bin:$PATH" SWAP_GUARD_NO_LAUNCHCTL=1
+printf '%s\r\n' 'my rules' '@ULTRACODE.md  ' 'more' > "$HOME/.claude/CLAUDE.md"
+bash "$REPO/install.sh" > "$HOME/c.log" 2>&1
+assert_eq "$?" "0" "install over a CRLF CLAUDE.md exits 0"
+assert_eq "$(od -c "$HOME/.claude/CLAUDE.md" | tr -s ' ')" "$(printf 'my rules\r\nmore\r\n' | od -c | tr -s ' ')" "the CRLF import line goes; the other lines keep their CRLF"
+assert_eq "$(ls "$HOME/.claude-swap-backup/retired/" 2>/dev/null | grep -c '^CLAUDE.md\.')" "1" "and CLAUDE.md is backed up first"
 rm -rf "$HOME"
 finish

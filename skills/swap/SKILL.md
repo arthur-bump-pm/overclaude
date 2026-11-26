@@ -1,11 +1,11 @@
 ---
 name: swap
-description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, run-out forecast (which account to use first), this Mac's memory (what is using it, cleaning up orphaned processes), model-routing guard, kit health check, continue in the Codex CLI, your other Macs (fleet status, switch them off a capped account, start a session there). Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
-argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | forecast | auto [on|off|status|instant on|off|prewarm on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | mem [clean|watch|autoclean|nudge|gate on|off] | guard [on|off|status] | fleet [swap] | remote <mac> [goal] | doctor [fix]"
+description: "Claude account management: switch accounts (hot-swap all sessions), account/usage dashboard, revive a dead account token safely (relogin), add an account, auto/instant swap settings, artifact search, spend report, run-out forecast (which account to use first), this Mac's memory (what is using it, cleaning up orphaned processes), kit health check, continue in the Codex CLI, your other Macs (fleet status, switch them off a capped account, start a session there). Use ONLY when the user explicitly asks for one of these in their own words (e.g. 'swap me to work', 'my work account says relogin', 'check my setup')."
+argument-hint: "[account] [handoff|restart|now|force] | codex | add | relogin <account> | forecast | auto [on|off|status|instant on|off|prewarm on|off] [threshold N] [model X] | artifacts [words] [account X] | spend [days N] | mem [clean|watch|autoclean|nudge|gate on|off] | fleet [swap] | remote <mac> [goal] | doctor [fix]"
 allowed-tools: Bash(cswap *), Bash(swap-guard *), Bash(overclaude doctor), Bash(overclaude doctor *), Bash(bash *doctor.sh*)
 ---
 
-Consent gate. If this skill was invoked by you (the model) rather than typed by the user, first confirm the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, memory check/cleanup, routing guard, continue in Codex, fleet, remote session, doctor). Don't invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task; without that request, stop and ask. Fix a dead account token with `swap-guard login <N>` (the relogin section), never a plain `/login`, which kills the live account's token.
+Consent gate. If this skill was invoked by you (the model) rather than typed by the user, first confirm the user explicitly asked, in their own words in this conversation, for this account action (switch, relogin, add, auto/instant settings, artifacts search, spend report, memory check/cleanup, continue in Codex, fleet, remote session, doctor). Don't invoke it on your own initiative — not after a usage-limit error (the instant-swap hook handles that) and not to "help" mid-task; without that request, stop and ask. Fix a dead account token with `swap-guard login <N>` (the relogin section), never a plain `/login`, which kills the live account's token.
 
 # /swap — Claude account switcher
 
@@ -17,7 +17,7 @@ Consent gate. If this skill was invoked by you (the model) rather than typed by 
 ## Parsing $ARGUMENTS
 
 <!-- SHARED:RESERVED-WORDS BEGIN -->
-Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `forecast`, `guard`, `fleet`, `remote`, `mem` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
+Treat `$ARGUMENTS` as a token SET, not positions. Reserved keywords — `add`, `handoff`, `restart`, `now`, `force`, `status`, `cancel`, `history`, `restore`, `auto`, `doctor`, `relogin`, `artifacts`, `codex`, `spend`, `forecast`, `fleet`, `remote`, `mem` — are flags/subcommands wherever they appear; the first non-reserved token is the target account (slot number, email, or alias). An account aliased to a reserved word stays reachable via slot number or email — error messages must say so. Ignore redundant reserved tokens, with a brief note.
 <!-- SHARED:RESERVED-WORDS END -->
 
 Example: `/swap work handoff` ≡ `/swap handoff work`.
@@ -44,7 +44,6 @@ Example: `/swap work handoff` ≡ `/swap handoff work`.
 | `/swap mem [clean]` | this Mac's memory: in use, swap, the biggest apps, each session with its child processes, orphaned helpers, what to close; `clean` stops orphaned helpers | never closes an app or a live session |
 | `/swap mem watch\|autoclean\|nudge\|gate [on\|off]` | the memory watcher (every minute) and what it does when memory gets tight: clean up orphans, tell every session to hold back, refuse new subagents at critical (all on by default) | — |
 | `/swap spend [days N]` | what your usage would cost at API prices, by model / account / day, vs your plans | — |
-| `/swap guard [on\|off\|status]` | the routing guard that blocks un-routed subagents on Fable (default on) | — |
 | `/swap fleet [swap\|auto on\|off]` | your other Macs: sessions, accounts, dead logins; `swap` moves Macs on a capped account to the one with the most room; `auto off` stops the instant swap here from moving them | Macs added with `overclaude fleet add` |
 | `/swap remote <mac> [goal]` | start a Claude session on another Mac that you drive from claude.ai/code or the app; `remote list\|logs\|stop <mac>` | a /login login on that Mac |
 | `/swap artifacts carry` | after an account change, copy this session's artifacts to the account you are on now (new links) | only this session's artifacts |
@@ -63,7 +62,7 @@ Edge rulings:
 - `remote` is followed either by `list`/`logs`/`stop`/`attach` and then the Mac (and a session name), or by the Mac and then free goal text; it never has an account target. A goal whose first word is one of those four words still works when the Mac comes first (`/swap remote mini stop the flaky test`).
 - `forecast` takes nothing else and never has a target; it never switches.
 - `mem` takes an optional `clean`, or `watch`/`autoclean`/`nudge`/`gate` with `on`/`off` (alone → status); it never has a target and never switches.
-- `spend` takes an optional `days N` (default 7); `guard` takes `on`/`off`/`status` (alone → `status`). Neither has a target.
+- `spend` takes an optional `days N` (default 7); it has no target.
 - `codex` present (e.g. `/swap codex`, `/swap codex handoff`) → invoke the handoff skill as `/handoff codex` (continue in the Codex CLI); `codex` is never a Claude account target. This takes precedence over the `/swap handoff` (no target) ruling. An account aliased `codex` stays reachable by slot number or email.
 - Target is already the active account → cswap returns reason `already-active`; report the no-op, do nothing else.
 - Flag mode vocabulary matches the command names exactly: `{"mode":"handoff"}` and `{"mode":"restart","sessionId":...}` — never "fresh"/"resume" or other synonyms.
@@ -149,7 +148,7 @@ Why this exists: refresh tokens rotate and are single-use. A plain `/login` whil
 
 1. Tell the user a browser window will open for the NEW account's sign-in. No `/logout` is needed and live sessions are unaffected.
 2. Run `swap-guard login --new` with a 10-minute Bash timeout (same throwaway-profile flow as relogin; registers the next free slot and returns it as `.slot`). Errors as in relogin step 3.
-3. `cswap alias <.slot> <name>` — optional; do not use a reserved word (any word in the reserved-keywords list above, e.g. `codex`, `spend`, `guard`).
+3. `cswap alias <.slot> <name>` — optional; do not use a reserved word (any word in the reserved-keywords list above, e.g. `codex`, `spend`, `fleet`).
 
 ## `/swap forecast`
 
@@ -164,10 +163,6 @@ Run `swap-guard forecast --text` and relay it: when the weekly (and Fable) limit
 ## `/swap spend [days N]`
 
 Run `swap-guard spend --days N` (default 7; the first run reads up to a week of session logs and can take ~30 s, later runs reuse a per-file cache). Render: total `usd` vs `planUsd` with `ratio` ("$1,774 of API-priced usage over 7 days — 19.2× what your plans cost for those days"), then `byModel` (model, $, share %), `byAccount` (label, $, plan $, ratio), `byDay`, and `topSessions` (first 8 chars of sessionId, $, fableShare %). Say once that it is an estimate at API list prices as of `pricesAsOf` (subscriptions are not billed per token), and list `unpricedModels` if any. Plan prices come from each account's tier; the user can override them in `~/.claude-swap-backup/plans.json` as `{"<slot>": <usd-per-month>}`.
-
-## `/swap guard [on|off|status]`
-
-The routing guard is a PreToolUse hook (`swap-guard route-guard`): when the session runs on Fable, an Agent call without `model` (general-purpose/default/Plan, or a custom agent whose definition sets no model) and a Workflow script with un-routed `agent()` calls are denied with a reason, so the top tier is never spent by accident. A deliberate top-tier subagent passes `model: "fable"`; in a Workflow, a step whose label names fable counts as deliberate. Run `swap-guard route-guard on|off|status` (no argument → `status`) and report the JSON. The guard reads the session model from the transcript, so it also works with a custom statusline; agents defined by plugins cannot be inspected and are allowed.
 
 ## `/swap fleet [swap]`
 

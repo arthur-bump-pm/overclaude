@@ -48,8 +48,7 @@ $HOME/.claude/skills/checkpoint/SKILL.md:skills/checkpoint/SKILL.md
 $HOME/.claude/hooks/handoff-inject.sh:hooks/handoff-inject.sh
 $HOME/.claude/hooks/ctx-watch.sh:hooks/ctx-watch.sh
 $HOME/.claude/hooks/ctx-notify.sh:hooks/ctx-notify.sh
-$HOME/.claude/statusline-command.sh:statusline/statusline-command.sh
-$HOME/.claude/ULTRACODE.md:claude/ULTRACODE.md"
+$HOME/.claude/statusline-command.sh:statusline/statusline-command.sh"
 for runtime_file in README.md __init__.py tomli/LICENSE tomli/__init__.py tomli/_parser.py tomli/_re.py tomli/_types.py tomli/py.typed; do
   PAIRS="$PAIRS
 $HOME/.local/bin/overclaude_runtime/$runtime_file:bin/overclaude_runtime/$runtime_file"

@@ -22,8 +22,9 @@ assert_eq "$(hook)" "" "below every band → silent"
 cache 10 50 82
 out="$(hook)"
 assert_contains "$out" "Fable 82% used (resets" "crossing Fable 75 → note with the reset time"
-assert_contains "$out" "ULTRACODE budget pressure applies" "note carries the routing rule"
-assert_contains "$out" "the user can /swap work" "note suggests the account with room"
+assert_absent "$out" "ULTRACODE" "the note states numbers only: no routing policy"
+assert_absent "$out" "route agents" "and no routing advice"
+assert_contains "$out" "Account work has room (week 20%, Fable 12%)." "it names the account with room"
 assert_eq "$(hook)" "" "same band again → silent"
 assert_contains "$(hook s2)" "Fable 82%" "a different session gets its own note"
 
@@ -52,7 +53,7 @@ assert_absent "$(PATH="$STUBB:$PATH" hook)" "/handoff codex" "a dead account wit
 
 cache 10 50 82 "" '"lastError":"invalid_grant","authDeadStrikes":1,'
 rm -f "$HOME/.claude-swap-backup/ctx/s9.budget"
-assert_absent "$(hook s9)" "/swap work" "a dead account is never suggested"
+assert_absent "$(hook s9)" "Account work has room" "a dead account is never suggested"
 
 # Alternatives must be usable and measured: no data, disabled and API-key accounts are never suggested.
 cat > "$HOME/.claude-swap-backup/sequence.json" <<'EOF2'
@@ -66,7 +67,7 @@ cache 10 50 82
 rm -f "$HOME/.claude-swap-backup/ctx/s10.budget"
 out="$(hook s10)"
 assert_contains "$out" "Fable 82%" "pressure still reported"
-assert_absent "$out" "/swap" "no swap suggestion when no other account is usable and measured"
+assert_absent "$out" "has room" "no other account named when none is usable and measured"
 write_seq 2
 assert_eq "$("$SG" budget | jq -r .pressure)" "true" "plain 'budget' reports pressure as JSON"
 assert_eq "$(printf '{"prompt":"x"}' | "$SG" budget --hook)" "" "no session id → silent"

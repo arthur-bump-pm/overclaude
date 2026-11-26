@@ -97,7 +97,6 @@ check_file hooks/handoff-inject.sh          "$CLAUDE_DIR/hooks/handoff-inject.sh
 check_file hooks/ctx-watch.sh               "$CLAUDE_DIR/hooks/ctx-watch.sh"
 check_file hooks/ctx-notify.sh              "$CLAUDE_DIR/hooks/ctx-notify.sh"
 check_file statusline/statusline-command.sh "$CLAUDE_DIR/statusline-command.sh"
-check_file claude/ULTRACODE.md              "$CLAUDE_DIR/ULTRACODE.md"
 
 # ---------------------------------------------------------------------------
 echo "-- settings.json --"
@@ -108,7 +107,7 @@ elif ! jq -e . "$SETTINGS" >/dev/null 2>&1; then
 else
   for pair in "SessionStart:handoff-inject.sh" "UserPromptSubmit:ctx-watch.sh" "Stop:ctx-notify.sh" \
               "UserPromptSubmit:swap-guard budget --hook" "StopFailure:swap-guard ratelimit" "StopFailure:swap-guard server-retry" "PostToolUseFailure:swap-guard loop-guard" \
-              "PostToolUse:swap-guard artifact-log" "PostToolUse:swap-guard checkpoint" "PreToolUse:swap-guard route-guard" \
+              "PostToolUse:swap-guard artifact-log" "PostToolUse:swap-guard checkpoint" \
               "PreToolUse:swap-guard mem --gate"; do
     ev="${pair%%:*}"; hk="${pair#*:}"
     if jq -e --arg ev "$ev" --arg hk "$hk" '[.hooks[$ev][]?.hooks[]?.command // ""] | any(contains($hk))' "$SETTINGS" >/dev/null 2>&1; then
@@ -117,6 +116,9 @@ else
       _fail "$ev hook for $hk is not registered" "overclaude install"
     fi
   done
+  if jq -e '[.hooks[]?[]?.hooks[]?.command // ""] | any(contains("swap-guard route-guard"))' "$SETTINGS" >/dev/null 2>&1; then
+    _warn "a retired routing-guard hook is still registered (older version)" "overclaude install"
+  fi
   sl=$(jq -r '.statusLine.command // ""' "$SETTINGS" 2>/dev/null)
   case "$sl" in
     *statusline-command.sh*) ok "statusLine → overclaude statusline" ;;
@@ -126,9 +128,7 @@ else
 fi
 
 if [ -f "$CLAUDE_DIR/CLAUDE.md" ] && grep -qxF '@ULTRACODE.md' "$CLAUDE_DIR/CLAUDE.md"; then
-  ok "CLAUDE.md imports @ULTRACODE.md"
-else
-  _warn "CLAUDE.md does not import @ULTRACODE.md (model-routing policy not loaded)" "overclaude install"
+  _warn "CLAUDE.md still imports @ULTRACODE.md, which overclaude no longer ships" "overclaude install"
 fi
 
 if [ -f "$HOME/.zshrc" ] && grep -qF "$BEGIN_MARKER" "$HOME/.zshrc"; then

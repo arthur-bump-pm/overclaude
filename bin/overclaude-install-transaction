@@ -18,6 +18,16 @@ LIMIT = 4 * 1024 * 1024
 JOURNAL_LIMIT = 64 * 1024 * 1024
 ID_RE = re.compile(r'^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$')
 SHARED = ('.claude-swap-backup/kit-version', '.claude/CLAUDE.md', '.claude/settings.json', '.zshrc')
+# Files older versions installed and this one takes away (the journal keeps their
+# contents, so `overclaude recover` can bring them back). They stay in every
+# journal, which keeps older journals (where they were managed files) loadable.
+RETIRED = ('.claude/ULTRACODE.md',)
+RETIRED_IMPORTS = (b'@ULTRACODE.md',)
+RETIRED_HOOKS = ('swap-guard route-guard',)
+
+
+def linkable(rel):
+    return rel in SHARED[1:] or rel in RETIRED
 
 
 class TransactionError(Exception):
@@ -231,7 +241,9 @@ def load_journal(root, ident, allowed, home):
                     raise TransactionError('invalid transaction data')
             elif snap.get('data') is not None or snap.get('mode') is not None or snap.get('link') is not None or snap.get('sha256') is not None:
                 raise TransactionError('invalid absent snapshot')
-        if not item['after']['exists'] or item['before']['target'] != item['after']['target'] or item['before']['link'] != item['after']['link']:
+        # Only a retired file may end absent (or a shared one that was absent and stays so).
+        removable = item['rel'] in RETIRED or not item['before']['exists']
+        if (not item['after']['exists'] and not removable) or item['before']['target'] != item['after']['target'] or item['before']['link'] != item['after']['link']:
             raise TransactionError('invalid transaction target')
     if seen != allowed:
         raise TransactionError('transaction entries are incomplete')
@@ -276,6 +288,24 @@ def merge_settings(raw, fragment):
     for value in fragment['permissions']['allow']:
         if value not in allow:
             allow.append(value)
+    # Hooks older versions registered and this one no longer ships: drop them.
+    for event in list(hooks):
+        entries = hooks[event]
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for entry in entries:
+            inner = entry.get('hooks') if isinstance(entry, dict) else None
+            if isinstance(inner, list):
+                left = [h for h in inner if not (isinstance(h, dict) and isinstance(h.get('command'), str)
+                                                 and any(r in h['command'] for r in RETIRED_HOOKS))]
+                if len(left) != len(inner):
+                    print('  [-] removed a retired hook: ' + event + ' (routing guard)')
+                    if not left:
+                        continue
+                    entry = dict(entry, hooks=left)
+            kept.append(entry)
+        hooks[event] = kept
     for event, groups in fragment['hooks'].items():
         existing = hooks.setdefault(event, [])
         if not isinstance(existing, list):
@@ -288,8 +318,6 @@ def merge_settings(raw, fragment):
                 existing.append(group)
                 if event == 'StopFailure' and 'ratelimit' in name:
                     print('  [!] Instant swap is ON: usage limits can switch accounts.')
-                if event == 'PreToolUse' and 'route-guard' in name:
-                    print('  [!] Routing guard is ON: agent launches are checked.')
     if current.get('statusLine') is None:
         current['statusLine'] = fragment['statusLine']
     elif current['statusLine'] != fragment['statusLine']:
@@ -302,6 +330,7 @@ def plan(payload, home, version, verifier):
         raise TransactionError('kit version is unavailable')
     specs = [(src, rel, mode, False) for src, rel, mode in verifier.FILES]
     specs += [(None, rel, None, rel != SHARED[0]) for rel in SHARED]
+    specs += [(None, rel, None, True) for rel in RETIRED]
     if len({rel for _, rel, _, _ in specs}) != len(specs):
         raise TransactionError('duplicate managed destination')
     snapshots, targets = {}, set()
@@ -322,10 +351,27 @@ def plan(payload, home, version, verifier):
             desired, _ = read_regular(payload / src)
         elif rel == SHARED[0]:
             desired = (version + '\n').encode()
+        elif rel in RETIRED:
+            # A regular file goes (its contents stay in the journal); a symlink is
+            # the user's own arrangement and is left alone.
+            if before['exists'] and before['link'] is None:
+                print('  [-] removing ' + rel + ' (no longer shipped; kept in transaction ' + 'journal)')
+                entries.append({'rel': rel, 'before': before, 'status': 'planned',
+                                'after': dict(before, exists=False, mode=None, data=None, sha256=None)})
+            else:
+                entries.append({'rel': rel, 'before': before, 'after': dict(before), 'status': 'planned'})
+            continue
         elif rel == SHARED[1]:
-            desired = old or b''
-            if b'@ULTRACODE.md' not in desired.splitlines():
-                desired += (b'\n' if desired and not desired.endswith(b'\n') else b'') + b'@ULTRACODE.md\n'
+            # The kit no longer adds anything to CLAUDE.md; it only takes out the
+            # import lines older versions added.
+            if old is None:
+                entries.append({'rel': rel, 'before': before, 'after': dict(before), 'status': 'planned'})
+                continue
+            lines = old.split(b'\n')
+            kept = [line for line in lines if line.strip() not in RETIRED_IMPORTS]
+            desired = b'\n'.join(kept)
+            if desired != old:
+                print('  [-] removed the @ULTRACODE.md import from ~/.claude/CLAUDE.md (kept in the transaction journal)')
         elif rel == SHARED[2]:
             desired = merge_settings(old, fragment)
             # Preserve formatting on semantically identical JSON.
@@ -367,11 +413,11 @@ def rollback(directory, journal, home):
             continue
         rel, before, after = item['rel'], item['before'], item['after']
         try:
-            current = snapshot(home, rel, rel in SHARED[1:])
+            current = snapshot(home, rel, linkable(rel))
             if same(current, before):
                 item['status'] = 'rolled_back'
             elif same(current, after):
-                apply_snapshot(home, rel, before, after, rel in SHARED[1:])
+                apply_snapshot(home, rel, before, after, linkable(rel))
                 item['status'] = 'rolled_back'
             else:
                 item['status'] = 'conflict'; conflicts.append(rel)
@@ -392,7 +438,7 @@ def retain_conflicts(directory, journal, home):
         validate_ancestors(home, rel)
         logical = home / rel
         try:
-            current = snapshot(home, rel, rel in SHARED[1:])
+            current = snapshot(home, rel, linkable(rel))
             evidence = {key: current[key] for key in ('exists', 'link', 'target', 'mode', 'sha256')}
         except (FileNotFoundError, TransactionError):
             # Describe the entry itself when it cannot safely be opened; never
@@ -425,7 +471,7 @@ def main():
     lockfd = None
     try:
         verifier = read_payload(payload)
-        allowed = {rel for _, rel, _ in verifier.FILES} | set(SHARED)
+        allowed = {rel for _, rel, _ in verifier.FILES} | set(SHARED) | set(RETIRED)
         root, lockfd = setup(home)
         if args.action == 'list':
             output = []
@@ -477,7 +523,7 @@ def main():
                 if same(item['before'], item['after']):
                     item['status'] = 'skipped'; continue
                 item['status'] = 'intent'; store_manifest(directory, journal)
-                apply_snapshot(home, item['rel'], item['after'], item['before'], item['rel'] in SHARED[1:])
+                apply_snapshot(home, item['rel'], item['after'], item['before'], linkable(item['rel']))
                 item['status'] = 'applied'; store_manifest(directory, journal)
             errors, notes = verifier.verify(payload, home, args.version)
             for note in notes: print('  [!] ' + note)

@@ -33,7 +33,7 @@
 #   server-retry on|off|status|--hook  StopFailure hook (server_error|overloaded): capped auto-resume, opt-in
 #   loop-guard on|off|status|--hook    PostToolUseFailure hook: same call failing the same way, opt-in
 #   checkpoint on|off|status|--hook    PostToolUse hook: wrap up once when the account nears its limit
-#   budget [--hook]                 usage bands for ULTRACODE budget pressure (UserPromptSubmit hook)
+#   budget [--hook]                 usage bands the model should know about (UserPromptSubmit hook)
 #   mem [--text] | clean | watch | autoclean | nudge | gate | --gate
 #                                   this Mac's memory: report, orphan cleanup, watcher, session notes, agent gate
 #   browser list | set <account> <profile> | clear <account>  the Chrome profile a re-login opens in
@@ -114,7 +114,6 @@ usage: swap-guard <subcommand> [args]
   codex-usage [--refresh]         Codex CLI rate limits per Codex home, live from Codex (logs as fallback)
   codex-ready                     can /handoff codex work here? (CLI, overcodex hook, limits)
   codex-route                     read-only Claude-first automatic routing decision
-  route-guard [on|off|status]     PreToolUse hook (Agent|Workflow): deny un-routed subagents on Fable
   spend [--days N]                API-price value of your usage (by model/account/session/day) vs plan cost
   codex-review [--dir D] [--model M] [--effort E] [--schema F] [--timeout S] [--raw] <prompt> [--stdin < input]
                                   cross-family second opinion: read-only, ephemeral `codex exec`
@@ -3785,8 +3784,8 @@ cmd_mem() {
 }
 
 # --- budget: tell the model when usage crosses a band (UserPromptSubmit hook) ------
-# ULTRACODE's budget-pressure rules key off "Fable ~75%+", a number the model cannot
-# see. `budget --hook` injects one line when the active account crosses a band
+# The model cannot see the account's usage. `budget --hook` injects one plain line of
+# numbers (no advice) when the active account crosses a band
 # (scoped/Fable 75/90/100, week 85/95/100, 5h 90/100) and one when pressure clears.
 # Silent otherwise — at most one note per band change per session.
 _budget_eval() { # prints: key<US>pressure-message<US>cleared-message
@@ -3828,15 +3827,14 @@ _budget_eval() { # prints: key<US>pressure-message<US>cleared-message
         + (if ($hot | any(.b >= 100 and (.name == "5h" or .name == "week")))
            then "This account is out of quota until the reset: every call will fail. "
            elif ($hot | any(.b >= 100))
-           then "\($hot | map(select(.b >= 100) | .name) | join("/")) is exhausted: calls on it will fail, so route agents to opus/sonnet. "
+           then "\($hot | map(select(.b >= 100) | .name) | join("/")) is exhausted: calls on it will fail. "
            else "" end)
-        + "ULTRACODE budget pressure applies: cut fan-out width and batch more per agent first, keep the scarce tier as a read-only reserve for the final synthesis, and keep verifier floors."
         + (if $alt != null and $alt.worst < 75
-           then " Account \(lbl($alt.k)) has room (\($alt.ws | map(select(.name == "week" or (.name as $nm | $hot | any(.name == $nm))) | "\(.name) \(.p | p0)") | join(", "))): the user can /swap \(lbl($alt.k))."
-           else "" end)
+           then "Account \(lbl($alt.k)) has room (\($alt.ws | map(select(.name == "week" or (.name as $nm | $hot | any(.name == $nm))) | "\(.name) \(.p | p0)") | join(", ")))."
+           else "" end) | sub(" $"; "")
       end) as $msg
     | ("[overclaude budget] Budget pressure cleared: account \(lbl($n)) is at "
-       + ($ws | map("\(.name) \(.p | p0)") | join(", ")) + ". Normal ULTRACODE routing applies.") as $clr
+       + ($ws | map("\(.name) \(.p | p0)") | join(", ")) + ".") as $clr
     | [$key, $msg, $clr] | join("\u001f") end' 2>/dev/null
 }
 
@@ -4627,7 +4625,7 @@ _route_note() { # shared per-session dedup across both hooks, independent of bud
   fi
 }
 
-# cmd_codex_review — a cross-family second opinion for ULTRACODE verify stages:
+# cmd_codex_review — a second opinion from another model family:
 # `codex exec` in a READ-ONLY sandbox, ephemeral (no session file), on the active
 # Codex account, with a hard timeout. Prompt = args, plus stdin with --stdin (e.g. a
 # diff). Prints JSON {ok, message, json?, ...}; --raw prints only the message.
@@ -4754,179 +4752,12 @@ EOF
   printf '%s\n' "$out"
 }
 
-# --- route-guard: ULTRACODE rule 1 as a gate (PreToolUse on Agent|Workflow) --------
-# An un-annotated subagent silently inherits the session's model; on Fable that is a
-# spend from the small Fable bucket nobody chose. When the session runs on a Fable/
-# Mythos-tier model (read from the statusline relay — hooks get no model field):
-#   Agent    — no `model`, subagent_type general-purpose/claude/Plan/default → deny.
-#              Forks and agent types whose own definition sets a model are allowed.
-#   Workflow — every agent() call needs `model:`; a call whose text names fable/apex
-#              (e.g. label 'synthesize (fable/xhigh)') is a deliberate inherit.
-# Deny = hookSpecificOutput permissionDecision "deny" with a reason Claude reads and
-# fixes. Off switch: `swap-guard route-guard off` (or OVERCLAUDE_ROUTE_GUARD=off).
-ROUTE_OFF="$STATE_ROOT/route-guard.off"
-
-_route_deny() { # _route_deny <reason>
-  jq -cn --arg r "$1" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
-  exit 0
-}
-
-_agent_def_file() { # _agent_def_file <type> <cwd> — path of a custom agent definition, if any
-  local t="$1" d="${2:-}" f
-  case "$t" in ''|*/*|*..*) return 1;; esac
-  # Project agents may sit in any parent of the cwd (Claude Code walks up to the repo root).
-  while [ -n "$d" ] && [ "$d" != "/" ]; do
-    [ -f "$d/.claude/agents/$t.md" ] && { printf '%s\n' "$d/.claude/agents/$t.md"; return 0; }
-    d="$(dirname "$d")"
-  done
-  f="$HOME/.claude/agents/$t.md"; [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
-  return 1
-}
-
-_agent_def_has_model() { # _agent_def_has_model <type> <cwd> — does its definition pin a model?
-  local t="$1" cwd="$2" f
-  case "$t" in ''|*/*|*..*) return 1;; esac
-  f="$(_agent_def_file "$t" "$cwd")" || return 1
-  awk '{ sub(/\r$/, "") } NR == 1 && $0 != "---" { exit 1 } NR > 1 && $0 == "---" { exit 1 }
-       NR > 1 && /^model:[[:space:]]*[^[:space:]]/ && $0 !~ /inherit/ { found = 1; exit 0 }
-       END { exit !found }' "$f"
-}
-
-# _workflow_unrouted — read a JS script on stdin; print each agent(...) call that is
-# not routed (first 100 chars, one per line). Pass 1 builds a same-length copy with
-# comments blanked and string / template / regex-literal CONTENTS masked, so text in
-# prompts can neither create a call nor satisfy the check. A call is routed when its
-# last argument is an object literal with a depth-1 `model` key (also shorthand
-# `{ model }`) whose value is not ''/undefined/null — or whose `label` names
-# fable/apex (a deliberate top-tier stage). Options passed by variable, or with a
-# spread, cannot be seen into and are allowed; so is a call whose parens do not
-# close within 20 KB (parse failure fails open, it never blocks).
-_workflow_unrouted() {
-  perl -e '
-    local $/; my $src = <STDIN>; my $n = length $src;
-    my ($code, $i, $prev) = ("", 0, "");
-    while ($i < $n) {
-      my $c = substr($src, $i, 1); my $d = substr($src, $i + 1, 1);
-      if ($c eq "/" && $d eq "/") { my $e = index($src, "\n", $i); $e = $n if $e < 0; $code .= " " x ($e - $i); $i = $e; next }
-      if ($c eq "/" && $d eq "*") { my $e = index($src, "*/", $i + 2); $e = $e < 0 ? $n : $e + 2;
-        (my $seg = substr($src, $i, $e - $i)) =~ s/[^\n]/ /g; $code .= $seg; $i = $e; next }
-      if ($c eq "\"" || $c eq "\x27" || $c eq "`") {
-        my ($j, $out) = ($i + 1, $c);
-        while ($j < $n) { my $x = substr($src, $j, 1);
-          if ($x eq "\\") { $out .= "xx"; $j += 2; next }
-          last if $x eq $c;
-          $out .= ($x eq "\n" ? "\n" : "x"); $j++ }
-        if ($j < $n) { $out .= $c; $j++ }
-        $code .= $out; $i = $j; $prev = $c; next }
-      if ($c eq "/" && ($prev eq "" || $prev =~ /[(,=:\[!&|?{};]/)) {
-        my ($j, $out, $cls) = ($i + 1, "/", 0);
-        while ($j < $n) { my $x = substr($src, $j, 1);
-          if ($x eq "\\") { $out .= "xx"; $j += 2; next }
-          last if $x eq "\n";
-          if ($cls) { $cls = 0 if $x eq "]" } elsif ($x eq "[") { $cls = 1 } elsif ($x eq "/") { last }
-          $out .= "x"; $j++ }
-        if ($j < $n && substr($src, $j, 1) eq "/") { $out .= "/"; $j++ }
-        $code .= $out; $i = $j; $prev = "/"; next }
-      $code .= $c; $prev = $c unless $c =~ /\s/; $i++;
-    }
-    my @bad;
-    while ($code =~ /(?<![\w.\$])agent\s*\(/g) {
-      my ($start, $p) = ($-[0], $+[0]); my $depth = 1; my @arg = ($p);
-      my $lim = $p + 20000; $lim = $n if $lim > $n;
-      while ($p < $lim && $depth > 0) { my $c = substr($code, $p, 1);
-        if ($c =~ /[(\[{]/) { $depth++ } elsif ($c =~ /[)\]}]/) { $depth-- }
-        elsif ($c eq "," && $depth == 1) { push @arg, $p + 1 }
-        $p++ }
-      next if $depth > 0;
-      my $close = $p - 1;
-      my @ends = (map({ $_ - 1 } @arg[1 .. $#arg]), $close);
-      my @a = map { [$arg[$_], $ends[$_]] } 0 .. $#arg;
-      pop @a if @a > 1 && substr($code, $a[-1][0], $a[-1][1] - $a[-1][0]) =~ /^\s*$/;   # trailing comma
-      my $routed = 0;
-      if (@a >= 2) {
-        my ($s0, $e0) = @{$a[-1]};
-        my $t = substr($code, $s0, $e0 - $s0);
-        (my $lead) = $t =~ /^(\s*)/; my $b = $s0 + length($lead);
-        if (substr($code, $b, 1) ne "{") { $routed = 1 }          # opts by variable or expression
-        else {
-          my ($flat, $dd) = ("", 0);
-          for my $k ($b + 1 .. $e0 - 1) { my $ch = substr($code, $k, 1);
-            if ($ch =~ /[\[{(]/) { $dd++; $flat .= " "; next }
-            if ($ch =~ /[\]})]/) { last if $dd == 0; $dd--; $flat .= " "; next }
-            $flat .= $dd ? " " : $ch }
-          if ($flat =~ /\.\.\./) { $routed = 1 }                   # spread: cannot see inside
-          elsif ($flat =~ /(?:^|[,\s])model\s*(:|,|$)/g) {
-            if ($1 eq ":") { my $v = substr($src, $b + 1 + pos($flat), 40);
-              $routed = ($v =~ /^\s*(\x27\x27|""|``|undefined|null)\s*(,|\}|$)/) ? 0 : 1 }
-            else { $routed = 1 }                                   # shorthand { model }
-          }
-          if (!$routed && $flat =~ /(?:^|[,\s])label\s*:/g) {
-            my $vs = $b + 1 + pos($flat); my $rest = substr($flat, pos($flat));
-            my $len = index($rest, ","); $len = length($rest) if $len < 0;
-            $routed = 1 if substr($src, $vs, $len) =~ /fable|apex/i }
-        }
-      }
-      next if $routed;
-      (my $one = substr($src, $start, $close - $start + 1)) =~ s/\s+/ /g;
-      push @bad, substr($one, 0, 100);
-    }
-    print "$_\n" for @bad;'
-}
-
-cmd_route_guard() {
-  local input tool sid cwd model ti st m bad n script sp
-  case "${1:-}" in
-    on)  rm -f "$ROUTE_OFF"; jq -cn '{routeGuard: true}'; exit 0;;
-    off) mkdir -p "$STATE_ROOT" && touch "$ROUTE_OFF"; jq -cn '{routeGuard: false}'; exit 0;;
-    status) jq -cn --argjson on "$([ -f "$ROUTE_OFF" ] && echo false || echo true)" '{routeGuard: $on}'; exit 0;;
-  esac
-  # Run by hand (a terminal, no hook JSON coming): report status instead of waiting.
-  if [ -t 0 ]; then jq -cn --argjson on "$([ -f "$ROUTE_OFF" ] && echo false || echo true)" '{routeGuard: $on}'; exit 0; fi
-  exec 2>/dev/null
-  command -v jq >/dev/null 2>&1 || exit 0
-  [ "${OVERCLAUDE_ROUTE_GUARD:-}" = off ] && exit 0
-  [ -f "$ROUTE_OFF" ] && exit 0
-  input="$(cat)" || exit 0
-  tool="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
-  sid="$(printf '%s' "$input" | jq -r '.session_id // empty' | tr -cd 'A-Za-z0-9_-')"
-  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
-  # The session's model: its last assistant entry in the transcript (authoritative and
-  # follows /model), else the statusline relay. Unknown → never guess, allow.
-  local tp; tp="$(printf '%s' "$input" | jq -r '.transcript_path // empty')"
-  model=""
-  [ -n "$tp" ] && [ -f "$tp" ] && model="$(tail -n 300 "$tp" 2>/dev/null | /usr/bin/grep '"type":"assistant"' | tail -n 1 |
-    jq -r '.message.model // empty' 2>/dev/null)"
-  [ -n "$model" ] || model="$(jq -r '.model // empty' "$CTX_DIR/$sid.json" 2>/dev/null)"
-  # Only the top tier is guarded: inheriting Sonnet/Opus/Haiku is not a hidden Fable spend.
-  case "$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')" in *fable*|*mythos*) :;; *) exit 0;; esac
-  case "$tool" in
-    Agent|Task)
-      m="$(printf '%s' "$input" | jq -r '.tool_input.model // empty')"
-      st="$(printf '%s' "$input" | jq -r '.tool_input.subagent_type // empty')"
-      [ -n "$m" ] && exit 0
-      case "$st" in
-        fork) exit 0;;                              # forks always inherit, by design
-        ''|general-purpose|claude|Plan) :;;         # inherit the session model → guarded
-        *) # A custom agent file without a model inherits too; other built-in types
-           # (Explore, …) carry their own defaults and are left alone.
-           _agent_def_file "$st" "$cwd" >/dev/null || exit 0
-           _agent_def_has_model "$st" "$cwd" && exit 0;;
-      esac
-      _route_deny "ULTRACODE rule 1 (overclaude route-guard): this session runs on $model, so an Agent call without \`model\` silently spends the Fable bucket. Set model explicitly — haiku (scouting, extraction), sonnet (finders, scoped edits), opus (verifiers, tricky edits) — or pass model \"fable\" when the top tier is the deliberate choice." ;;
-    Workflow)
-      script="$(printf '%s' "$input" | jq -r '.tool_input.script // empty')"
-      if [ -z "$script" ]; then
-        sp="$(printf '%s' "$input" | jq -r '.tool_input.scriptPath // empty')"
-        [ -n "$sp" ] && [ -f "$sp" ] && script="$(cat "$sp")"
-      fi
-      [ -n "$script" ] || exit 0   # a saved workflow by name: its author owns the routing
-      bad="$(printf '%s' "$script" | _workflow_unrouted)"
-      [ -n "$bad" ] || exit 0
-      n="$(printf '%s\n' "$bad" | grep -c .)"
-      _route_deny "ULTRACODE rule 1 (overclaude route-guard): this session runs on $model and $n agent() call(s) have no \`model:\` — each would silently spend the Fable bucket. Add model: 'haiku'|'sonnet'|'opus' per the routing table; for a deliberate top-tier stage keep model omitted but put fable in its label (e.g. label: 'synthesize (fable/xhigh)'). Unrouted: $(printf '%s\n' "$bad" | head -n 5 | sed 's/^/• /' | tr '\n' ' ')" ;;
-  esac
-  exit 0
-}
+# --- route-guard: retired --------------------------------------------------------
+# overclaude no longer decides how sessions route their subagents. `overclaude install`
+# removes the old PreToolUse hook; until a Mac has run it, that hook still calls
+# `swap-guard route-guard`, so the name stays as a silent no-op (exit 0, no output)
+# rather than an unknown subcommand, whose exit 2 would block every agent launch.
+cmd_route_guard() { exit 0; }
 
 # --- spend: what this usage would have cost at API prices ---------------------------
 # Every assistant entry in a transcript carries message.usage (input, cache writes by

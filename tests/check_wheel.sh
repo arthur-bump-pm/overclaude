@@ -9,7 +9,7 @@ list=$(unzip -l "$whl")
 for f in install.sh uninstall.sh doctor.sh bin/swap-guard bin/overclaude-install-transaction bin/overclaude-checkpoint \
          bin/overclaude-codex-continue bin/overclaude-codex-probe bin/overclaude-codex-pool hooks/handoff-inject.sh \
          hooks/ctx-watch.sh hooks/ctx-notify.sh statusline/statusline-command.sh \
-         skills/swap/SKILL.md skills/handoff/SKILL.md skills/checkpoint/SKILL.md claude/ULTRACODE.md \
+         skills/swap/SKILL.md skills/handoff/SKILL.md skills/checkpoint/SKILL.md \
          settings/settings-fragment.json shell/zshrc-snippet.sh vendor/claude-swap/pyproject.toml \
          bin/overclaude_runtime/tomli/_parser.py bin/overclaude_runtime/tomli/LICENSE; do
   printf '%s\n' "$list" | grep -q "overclaude/payload/$f" || { echo "payload missing: $f"; exit 1; }
