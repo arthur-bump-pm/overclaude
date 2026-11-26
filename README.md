@@ -23,6 +23,7 @@ bars and percentages turn yellow at 50% · red at 80%
 
 | Version | Status | Highlights |
 |---|---|---|
+| **1.11.0** | ✅ 2026-11-26 | `fleet status` schema 2 (per-Mac data age, clock skew, best target, sessions, per-Mac login dates, a top-level usage list), per-Mac self reports that beat a keychain-blocked SSH read, and a usage history log (`swap-guard usage-history`). ULTRACODE.md and the routing guard are removed; update cleans them off each Mac with backups |
 | **1.10.2** | ✅ 2026-11-12 | The running-agent count is just the number in brackets, not bold: `💬 2 (5)` |
 | **1.10.1** | ✅ 2026-11-12 | The running-agent count moved to line 1, in brackets after the session count (`💬 2 (5 agents)`), so line 2 is only meters again |
 | **1.10.0** | ✅ 2026-11-12 | Statusline: CPU next to memory (`cpu 34% · mem 48%`, on line 2 before the spend; swap only while memory is tight, as `(3.6G)`), `⚙ N agents` while this session has subagents or workflow agents running, icons on line 1 (`🧠 model (hi) | 📁 folder | 💬 sessions | 👤 account`) with short effort names. Codex limits are asked live from Codex's server (logs as fallback) and the Codex line is styled like the Claude account lines |
@@ -49,21 +50,20 @@ Install or upgrade: `pipx install overclaude && overclaude install` (upgrade: `o
 
 Release details: [1.9.1](#whats-new-in-191) · [1.9](#whats-new-in-19) · [1.8](#whats-new-in-18) · [1.7](#whats-new-in-17) · [1.6](#whats-new-in-16) · [1.5](#whats-new-in-15)
 
-## Unreleased: fleet feed and usage history
-
-Not in a release yet (work on branch `feat/fleet-feed`).
+## What's new in 1.11.0: fleet feed and usage history
 
 - **`swap-guard fleet status` tells the truth about every Mac** — the JSON keeps every field it had (`checkedAt`, and per Mac `name`, `online`, `sessions`, `busy`, `accounts[].email/active/status`, `dead`, …) and adds `schema: 2`. Each Mac's row now carries, as read on that Mac: `activeAlias`; per account `alias`, `sevenDay` (`pct`, `resetsAt`, `expectedPct`, `aheadOfPace`, `projectedExhaustionAt`, `willLastToReset`, as cswap gives them), `fable`, `loginExpiresAt` (that Mac's own login), `usageFetchedAt` and `usageAgeSeconds` (worked out at read time), and `source`; `sessionList` with each session's `ctxPct`; `autoThreshold`, `instantSwap`, `deferred` (a swap waiting on busy sessions, since when); `source` (`self` when the numbers are the Mac's own, `ssh` when only an SSH read was available), `reportedAt` and `dataAgeSec` (the age of that data), `readAt`, `selfReportedAt`, `selfReportAgeSec`. A top-level `usage` list has one entry per account (limits are per account, so the freshest reading on any Mac wins) with `room` (100 − week %), `activeOn` (which Macs use it), and `best` on the account with the most room that lasts to its reset with over 6 hours of login left. Codex limits follow as `kind: "codex"`. `--text` adds context % per Mac and a `room left:` line.
 - **Each Mac's own reading wins over an SSH read** — an SSH login often cannot open the keychain, so a live read there says `keychain_unavailable` or `token_expired`. The keepalive and auto ticks (launchd, where the keychain opens) now leave `~/.claude-swap-backup/cache/self.json`; fleet status uses it (if under 3 hours old) for any account the SSH read could not see, and says so (`source: "self-report"`, with the SSH answer in `liveStatus`). Fleet swap still picks a worker's target by what SSH saw, since that is how it switches. The auto tick records at most every 5 minutes. A Mac on an older kit shows its live read as before; login end dates there come from its login cache.
 - **Usage history** — `~/.claude-swap-backup/usage-history.jsonl` on each Mac, written by the keepalive and auto ticks, so it no longer depends on `cswap --menubar` running. A row per account when its week %, Fable %, active state or status changes, plus an hourly heartbeat (as often as a tick runs: every 2 hours with keepalive alone, every 3 minutes with auto-swap on): `{"ts","mac","acct","active","w","fable","resetsAt","last","status","sessions","busy"}`. Every account switch adds `{"ts","mac","ev":"swap","from","to","by"}`. 180 days are kept, trimmed once a month (about 2 MB a year). `swap-guard usage-history [--days N] [--mac NAME] [--text]` prints it (JSON array, last 7 days by default). The Mac's name is its Tailscale name; set `OVERCLAUDE_MAC_NAME` or write `~/.claude-swap-backup/mac-name` to override. `SWAP_NO_USAGE_HISTORY=1` turns it off.
 
-## Unreleased: no more ULTRACODE or routing guard
+## What's new in 1.11.0: no more ULTRACODE or routing guard
 
-Not in a release yet. overclaude no longer tells sessions how to structure their work: it does not ship `ULTRACODE.md` and has no routing guard. How a project organizes agents, models and reviews is up to that project.
+overclaude no longer tells sessions how to structure their work: it does not ship `ULTRACODE.md` and has no routing guard. How a project organizes agents, models and reviews is up to that project.
 
 - **Removed:** `~/.claude/ULTRACODE.md` and its `@ULTRACODE.md` import in `~/.claude/CLAUDE.md`, the routing-guard PreToolUse hook (`swap-guard route-guard`) and `/swap guard`. The installer no longer writes to `CLAUDE.md` at all.
 - **Cleaned on update:** `overclaude update` (or `install.sh`) removes all three from a Mac an older version set up. It copies each file it changes to `~/.claude-swap-backup/retired/` first, and keeps the old contents in its transaction journal (`overclaude recover`). Your own lines in `CLAUDE.md` and your own hooks stay. A symlinked `ULTRACODE.md` is left alone. `overclaude doctor` warns about any of them still there. Until a Mac has updated its settings, `swap-guard route-guard` is a silent no-op, so a leftover hook never blocks an agent.
 - **Neutral now:** the usage note (`swap-guard budget --hook`) states the account's usage bands and which account has room, and gives no routing advice. `swap-guard codex-review` stays as a plain tool. The Codex continuation note asks Codex to follow the project's own instructions instead of a fixed orchestration recipe.
+- **Going back to 1.10.x:** a 1.10 install refuses the journals 1.11 writes (`invalid transaction target`). Move `~/.claude-swap-backup/install-transactions` aside first.
 
 ## What's new in 1.9.1
 
