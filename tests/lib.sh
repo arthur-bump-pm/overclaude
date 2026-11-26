@@ -20,6 +20,8 @@ new_home() {
   export SWAP_NO_REFRESH=1
   # Never ask a real Codex server; test_codex.sh turns this on with a stub codex.
   export OVERCLAUDE_CODEX_LIVE=off
+  # The fleet name of "this Mac" (else the real Tailscale name would be read).
+  export OVERCLAUDE_MAC_NAME=testmac
   # A default `security` that finds nothing: the real keychain is never read (logins,
   # preflight). Tests that need one put their own stub earlier on PATH.
   mkdir -p "$TH/.stub-security"

@@ -35,8 +35,8 @@ while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done; shift
 h="$1"; shift
 case "$h" in
   offline) exit 255;;
-  hung)    sleep "$STRAY"; exit 255;;
-  partial) printf 'host\tp\nkit\t1.5.0\n'; sleep "$STRAY"; exit 255;;
+  hung)    sleep "$STRAY" & echo "$!" >> "$HOME/stub-pids"; wait "$!"; exit 255;;
+  partial) printf 'host\tp\nkit\t1.5.0\n'; sleep "$STRAY" & echo "$!" >> "$HOME/stub-pids"; wait "$!"; exit 255;;
 esac
 [ -d "$HOME/hosts/$h" ] || exit 255
 [ "$*" = "bash -s" ] || cat > /dev/null
@@ -97,7 +97,8 @@ assert_absent "$(echo '{"model":{"display_name":"M"}}' | SWAP_NO_REFRESH=1 SWAP_
 assert_eq "$("$SG" fleet list)" '["bare","worker1"]' "fleet rm removes a Mac"
 assert_eq "$(pgrep -f "sleep $STRAY" | wc -l | tr -d ' ')" "0" "the deadline leaves no stray processes"
 assert_eq "$(pgrep -f "sleep $FD\$" | wc -l | tr -d ' ')" "0" "and neither does the watchdog"
-pkill -f "sleep $STRAY" 2>/dev/null
+# Belt and braces: stop only the sleeps this test's stub started (recorded PIDs).
+while read -r p; do kill "$p" 2>/dev/null; done < "$HOME/stub-pids" 2>/dev/null
 "$SG" fleet add worker2 >/dev/null 2>&1
 
 # fleet swap: worker1 and worker2 are on work (1), which the hub sees capped. extra (3)

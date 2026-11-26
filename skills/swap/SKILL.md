@@ -172,7 +172,7 @@ The routing guard is a PreToolUse hook (`swap-guard route-guard`): when the sess
 ## `/swap fleet [swap]`
 
 Your other Macs over Tailscale SSH. No Macs registered (`swap-guard fleet list` is `[]`) → say how to add one: on that Mac turn on Remote Login, then here `ssh-copy-id <mac>` and `overclaude fleet add <mac>`; never run `fleet add` yourself without the user naming the Mac.
-- `/swap fleet` → run `swap-guard fleet status --text` and show its lines (this Mac first). Point out offline Macs, `⚠ relogin` (fixed ON that Mac with `swap-guard login <slot>`), and Macs whose overclaude is behind this one.
+- `/swap fleet` → run `swap-guard fleet status --text` and show its lines (this Mac first). Point out offline Macs, `⚠ relogin` (fixed ON that Mac with `swap-guard login <slot>`), and Macs whose overclaude is behind this one. The last line, `room left:`, lists each account's room (week % left), marks the best one and names the Macs on it; a status in brackets (e.g. `(keychain_unavailable)`) is what an SSH read saw where that Mac has not yet left its own report.
 - `/swap fleet swap` → first `swap-guard fleet swap --dry-run`, show each Mac's planned move (`from` → `to`, or why it is skipped), and ask before running `swap-guard fleet swap`. Report each result (`switched` / `failed` with detail). It moves only Macs whose active account is capped by this Mac's usage numbers; each Mac switches with its own cswap. Logins are never copied between Macs.
 
 ## `/swap remote <mac> [goal]`

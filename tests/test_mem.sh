@@ -127,7 +127,20 @@ printf '#!/bin/bash\nexec python3 -c "import socket,time; s=socket.socket(); s.b
 printf '#!/bin/bash\nsleep 300 &\nwait\n' > "$HOME/bin/claude"
 printf '#!/bin/bash\n"%s/bin/claude" --strict-mcp-config --print %s &\nwait\n' "$HOME" "$TAG" > "$HOME/bin/$TAG-wrap"
 chmod +x "$HOME/bin/"*
-trap 'pkill -f "$TAG" 2>/dev/null' EXIT
+# Cleanup stops only the processes this test started: their PIDs are recorded below
+# (and their children, found by parent PID), never matched by a name pattern.
+MY_PIDS=""
+kill_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done; kill "$1" 2>/dev/null; }
+# A recorded PID is stopped only while its command still carries this run's $TAG (a
+# PID the system reused for something else is left alone).
+kill_mine() {
+  local p
+  for p in $MY_PIDS; do
+    case "$(ps -o command= -p "$p" 2>/dev/null)" in *"$TAG"*) kill_tree "$p";; esac
+  done
+  MY_PIDS=""
+}
+trap kill_mine EXIT
 # -idle: stdin and stdout are pipes whose other ends are gone (a stdio helper whose
 # session died). -bg: stdin /dev/null, like a live session's own `cmd &`. -pipe: a
 # session's `producer | cmd > file &` (dead stdin, stdout a file). -srv: on a port.
@@ -151,6 +164,7 @@ bg_pid="$(pid_of "$HOME/bin/$TAG-bg" 1)"; pipe_pid="$(pid_of "$HOME/bin/$TAG-pip
 srv_pid="$(pid_of "Python -c import socket" 1)"; [ -n "$srv_pid" ] || srv_pid="$(pid_of "time.sleep(300) $TAG" 1)"
 cl_pid="$(pid_of "--mcp-config cfg.json --print $TAG" 1)"
 wrap_pid="$(pid_of "$HOME/bin/$TAG-wrap" 1)"; wrapped="$(pgrep -P "$wrap_pid" | head -n 1)"
+MY_PIDS="$idle_pid $bg_pid $pipe_pid $srv_pid $cl_pid $wrap_pid"
 printf '{"pid":%s,"sessionId":"bg1","cwd":"%s","status":"busy"}\n' "$cl_pid" "$HOME" > "$HOME/.claude/sessions/$cl_pid.json"
 printf '{"pid":%s,"sessionId":"bg2","cwd":"%s","status":"busy"}\n' "$wrapped" "$HOME" > "$HOME/.claude/sessions/$wrapped.json"
 for v in idle_pid idle_child bg_pid pipe_pid srv_pid cl_pid wrap_pid wrapped; do
@@ -211,7 +225,7 @@ sleep 0.5
 assert_eq "$(kill -0 "$srv_pid" 2>/dev/null && echo alive || echo gone)" "gone" "clean --pid stops a listed orphan on request"
 export SWAP_MEM_TEST_ONLY="$NOMATCH"; unset SWAP_MEM_ORPHAN_MIN
 rm -f "$HOME/.claude/sessions/"*.json
-pkill -f "$TAG" 2>/dev/null
+kill_mine
 
 # --- notifications: on the way up, again while critical, once on recovery ---
 : > "$HOME/notes"

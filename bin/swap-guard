@@ -21,6 +21,7 @@
 #   prewarm on|off|status|tick      start idle accounts' 5-hour windows early (opt-in; long-lived tokens)
 #   token add|list|rm|run           one-year setup-tokens for headless jobs (keychain; never shown)
 #   fleet add|rm|list|status|swap|auto  other Macs over Tailscale SSH: sessions, accounts, logins
+#   usage-history [--days N] [--mac NAME] [--text]  per-account usage log (keepalive/auto ticks write it)
 #   remote start|list|logs|stop|attach  Remote Control sessions on another Mac (claude --bg)
 #   artifacts [--session <id>] [--cwd <dir>]
 #                                   collect this session's claude.ai artifacts: copy sources to
@@ -78,7 +79,10 @@ usage: swap-guard <subcommand> [args]
                                   one-year tokens for headless jobs (claude -p), kept in the keychain
   fleet add <host> | rm <host> | list | status [--text] | swap [--from <email>] [--model M] [--dry-run] | auto on|off
                                   your other Macs (Tailscale SSH): sessions, accounts, dead logins, load;
-                                  swap moves them off a capped account
+                                  swap moves them off a capped account; status JSON (schema 2) also has
+                                  usage per account, login end dates per Mac, sessions with context %, data ages
+  usage-history [--days N] [--mac NAME] [--text]
+                                  usage log per account (week %, Fable %, active, status; swaps), 180 days kept
   remote start <mac> [--dir D] [--name N] [goal…] | handoff <mac> [--dir D] [--name N] [--force] | list <mac> | logs|stop|attach <mac> <id|name>
                                   a session on another Mac you drive from claude.ai/code or the app
   artifacts [--session <id>] [--cwd <dir>]
@@ -564,6 +568,7 @@ auto_plist() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$AUTO_LABEL"
 _auto_log() { # _auto_log <json> — append + keep the last 500 lines
   mkdir -p "$STATE_ROOT" 2>/dev/null || return 0
   printf '%s\n' "$1" >> "$AUTO_LOG"
+  _usage_history_event "$1"
   if [ "$(wc -l < "$AUTO_LOG" 2>/dev/null || echo 0)" -gt 600 ]; then
     tail -n 500 "$AUTO_LOG" > "$AUTO_LOG.tmp.$$" && mv "$AUTO_LOG.tmp.$$" "$AUTO_LOG"
   fi
@@ -788,7 +793,17 @@ _auto_status() {
 cmd_auto() {
   local sub="${1:-status}"; [ $# -gt 0 ] && shift
   case "$sub" in
-    tick)      _auto_tick "$@"; exit $?;;
+    tick)
+      local rc; _auto_tick "$@"; rc=$?
+      # The history log and self report ride on the tick; a probe writes nothing.
+      # At most every 5 minutes (the plan's report cadence), so an idle account is
+      # never fetched more often than cswap's own polling would.
+      case " $* " in *" --probe "*) ;; *)
+        if [ -z "${SWAP_NO_USAGE_HISTORY:-}" ] && command -v cswap >/dev/null 2>&1 &&
+           [ $(( $(date +%s) - $(stat -f %m "$SELF_REPORT" 2>/dev/null || echo 0) )) -ge 300 ]; then
+          _usage_history_record "$(cswap list --json 2>/dev/null)"
+        fi;; esac
+      exit "$rc";;
     install)   _auto_install "$@"; exit $?;;
     uninstall) _auto_uninstall; exit 0;;
     status)    _auto_status; exit 0;;
@@ -896,6 +911,7 @@ _keepalive_tick() {
       ending:[$ending[] | .slot | tonumber? // .]}
      + (if ($pw | length) > 0 then {prewarm:$pw} else {} end)')"
   _keepalive_log "$out"; printf '%s\n' "$out"
+  _usage_history_record "$list"
   return 0
 }
 
@@ -947,6 +963,156 @@ cmd_keepalive() {
     status) _keepalive_status; exit 0;;
     *) echo "usage: swap-guard keepalive tick|on|off|status" >&2; exit 1;;
   esac
+}
+
+# --- usage history + self report ------------------------------------------------
+# Every keepalive and auto tick (launchd, where the login keychain is readable)
+# hands its `cswap list --json` here. Two files come out of it:
+#   cache/self.json       this Mac's own reading; `fleet status` on another Mac reads
+#                         it back over SSH, where a live read often cannot open the
+#                         keychain and says keychain_unavailable / token_expired
+#   usage-history.jsonl   a row per account when its week %, Fable %, active state or
+#                         status changes, plus an hourly heartbeat (as often as the
+#                         ticks run); every switch adds an event row. 180 days are
+#                         kept, trimmed once a month. Read it: swap-guard usage-history.
+USAGE_HISTORY="$STATE_ROOT/usage-history.jsonl"
+USAGE_HISTORY_STATE="$STATE_ROOT/cache/usage-history-state.json"
+USAGE_HISTORY_DAYS=180
+SELF_REPORT="$STATE_ROOT/cache/self.json"
+SELF_REPORT_MAX_AGE=10800   # fleet status trusts a self report this long (keepalive runs every 2 h)
+
+# _mac_name — this Mac's name in the fleet: OVERCLAUDE_MAC_NAME, else the file
+# $STATE_ROOT/mac-name, else its Tailscale name (cached a day), else LocalHostName.
+_mac_name() {
+  local n f="$STATE_ROOT/cache/mac-name"
+  n="$(printf '%s' "${OVERCLAUDE_MAC_NAME:-}" | tr -cd 'A-Za-z0-9._-')"
+  [ -n "$n" ] || n="$(head -n 1 "$STATE_ROOT/mac-name" 2>/dev/null | tr -cd 'A-Za-z0-9._-')"
+  if [ -z "$n" ] && [ -s "$f" ] && [ -z "$(find "$f" -mtime +0 2>/dev/null)" ]; then n="$(head -n 1 "$f" | tr -cd 'A-Za-z0-9._-')"; fi
+  if [ -z "$n" ] && command -v tailscale >/dev/null 2>&1; then
+    # At most 2 s: a stuck Tailscale daemon must never hold a tick or a hook.
+    local tf tp i=0
+    tf="$(mktemp "${TMPDIR:-/tmp}/oc-tsname.XXXXXX")" || tf=""
+    if [ -n "$tf" ]; then
+      tailscale status --self --json > "$tf" 2>/dev/null & tp=$!
+      while kill -0 "$tp" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done
+      kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
+      n="$(jq -r '.Self.HostName // empty' "$tf" 2>/dev/null | tr -cd 'A-Za-z0-9._-')"; rm -f "$tf"
+    fi
+    [ -n "$n" ] && mkdir -p "$STATE_ROOT/cache" 2>/dev/null && printf '%s\n' "$n" > "$f.tmp.$$" 2>/dev/null && mv "$f.tmp.$$" "$f"
+  fi
+  [ -n "$n" ] || n="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+  printf '%s\n' "$n"
+}
+
+# The history lock: every writer (rows, events, the monthly trim's copy + mv) holds it.
+# _uh_lock [wait-tenths] — take it, waiting up to that long (default: not at all);
+# a lock older than 2 minutes is a crash leftover and is taken over.
+_uh_lock() {
+  local l="$STATE_ROOT/cache/usage-history.lock" i=0
+  mkdir -p "$STATE_ROOT/cache" 2>/dev/null || return 1
+  until mkdir "$l" 2>/dev/null; do
+    if [ -n "$(find "$l" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rmdir "$l" 2>/dev/null; continue; fi
+    [ "$i" -lt "${1:-0}" ] || return 1
+    sleep 0.1; i=$((i + 1))
+  done
+}
+_uh_unlock() { rmdir "$STATE_ROOT/cache/usage-history.lock" 2>/dev/null; return 0; }
+
+# _usage_history_record <cswap-list-json> — write self.json and any history rows due.
+# Prints nothing and never fails: a tick's own output and exit code stay as they were.
+_usage_history_record() {
+  [ -n "${SWAP_NO_USAGE_HISTORY:-}" ] && return 0
+  local list="$1" now mac ses st out stamp
+  printf '%s' "$list" | jq -e '.accounts | type == "array"' >/dev/null 2>&1 || return 0
+  _uh_lock || return 0
+  now="$(date +%s)"; mac="$(_mac_name)"
+  printf '%s' "$list" | jq -c --argjson now "$now" --arg mac "$mac" --arg kit "$(cat "$STATE_ROOT/kit-version" 2>/dev/null)" \
+    '{schema:1, reportedAt:$now, mac:$mac, kit:$kit, list:.}' > "$SELF_REPORT.tmp.$$" 2>/dev/null &&
+    mv "$SELF_REPORT.tmp.$$" "$SELF_REPORT" 2>/dev/null || rm -f "$SELF_REPORT.tmp.$$"
+  ses="$(sessions_json 2>/dev/null)"; printf '%s' "$ses" | jq -e 'type == "array"' >/dev/null 2>&1 || ses="[]"
+  st="$(jq -c 'if type == "object" then . else {} end' "$USAGE_HISTORY_STATE" 2>/dev/null)"; [ -n "$st" ] || st="{}"
+  out="$(printf '%s' "$list" | jq -c --argjson now "$now" --arg mac "$mac" --argjson ses "$ses" --argjson st "$st" '
+    ($now | todate) as $ts | ($ses | length) as $n | ([$ses[] | select(.status == "busy")] | length) as $busy
+    | [.accounts[] | select(.email != null)
+       | (first((.usage.scoped // [])[]? | select((.name // "" | ascii_downcase) == "fable")) // {}) as $f
+       | {k: (.email | ascii_downcase),
+          row: {ts: $ts, mac: $mac, acct: (.alias // (.email | split("@")[0])), active: (.active // false),
+                w: (.usage.sevenDay.pct // null), fable: ($f.pct // null), resetsAt: (.usage.sevenDay.resetsAt // null),
+                last: (.usage.sevenDay.willLastToReset), status: (.usageStatus // "unknown"), sessions: $n, busy: $busy}}
+       | .key = ([.row.w, .row.fable, .row.active, .row.status] | map(tostring) | join("|"))
+       | . + {due: (($st[.k].key // "") != .key or ($now - ($st[.k].at // 0)) >= 3600)}] as $a
+    | {rows: [$a[] | select(.due) | .row],
+       state: ($st + ([$a[] | select(.due) | {key: .k, value: {key: .key, at: $now}}] | from_entries))}' 2>/dev/null)"
+  if [ -n "$out" ]; then
+    printf '%s' "$out" | jq -c '.rows[]' >> "$USAGE_HISTORY" 2>/dev/null
+    printf '%s' "$out" | jq -c '.state' > "$USAGE_HISTORY_STATE.tmp.$$" 2>/dev/null &&
+      mv "$USAGE_HISTORY_STATE.tmp.$$" "$USAGE_HISTORY_STATE" 2>/dev/null || rm -f "$USAGE_HISTORY_STATE.tmp.$$"
+  fi
+  # Retention: rows older than 180 days go, checked once a month.
+  stamp="$STATE_ROOT/cache/usage-history.trimmed"
+  if [ -s "$USAGE_HISTORY" ] && { [ ! -f "$stamp" ] || [ -n "$(find "$stamp" -mtime +30 2>/dev/null)" ]; }; then
+    jq -cR --argjson cut $(( now - USAGE_HISTORY_DAYS * 86400 )) "$JQ_EPOCH"'fromjson? | select(type == "object" and ((.ts | ep) // 0) >= $cut)' \
+      "$USAGE_HISTORY" > "$USAGE_HISTORY.tmp.$$" 2>/dev/null &&
+      mv "$USAGE_HISTORY.tmp.$$" "$USAGE_HISTORY" 2>/dev/null && touch "$stamp" || rm -f "$USAGE_HISTORY.tmp.$$"
+  fi
+  _uh_unlock
+  return 0
+}
+
+# _usage_history_event <auto.log-json> — a switch becomes an event row
+# ({"ev":"swap","from","to","by"}: by = auto / ratelimit / fleet); anything else is ignored.
+_usage_history_event() {
+  [ -n "${SWAP_NO_USAGE_HISTORY:-}" ] && return 0
+  case "$1" in *'"switched"'*) ;; *) return 0;; esac
+  local row seq
+  seq="$(jq -c '.accounts // {}' "$STATE_ROOT/sequence.json" 2>/dev/null)"; [ -n "$seq" ] || seq="{}"
+  row="$(printf '%s' "$1" | jq -c --arg mac "$(_mac_name)" --argjson now "$(date +%s)" --argjson seq "$seq" '
+    def nm($n): if $n == null then null else ($n | tostring) as $k
+      | ($seq[$k].alias // (($seq[$k].email // "") | split("@")[0]) | if . == "" then $k else . end) end;
+    select(.action == "switched")
+    | {ts: (if (.ts | type) == "string" then .ts else ($now | todate) end), mac: $mac, ev: "swap",
+       from: nm(.from), to: nm(.to), by: (.source // "auto")}
+      + (if .trigger then {trigger} else {} end) + (if (.model // "") != "" then {model} else {} end)' 2>/dev/null)"
+  [ -n "$row" ] || return 0
+  # Under the lock, so the monthly trim (copy + mv) can never drop it. A swap row is
+  # worth a short wait (3 s); past that the writer is stuck and the row goes in anyway.
+  if _uh_lock 30; then printf '%s\n' "$row" >> "$USAGE_HISTORY" 2>/dev/null; _uh_unlock
+  else printf '%s\n' "$row" >> "$USAGE_HISTORY" 2>/dev/null; fi
+  return 0
+}
+
+# usage-history [--days N] [--mac NAME] [--text]: the log as a JSON array (default:
+# the last 7 days), or one line per row with --text.
+cmd_usage_history() {
+  local days=7 mac="" text=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days) days="${2:-}"; shift;;
+      --mac) mac="${2:-}"; shift;;
+      --text) text=1;;
+      --json) text=0;;
+      *) echo "usage: swap-guard usage-history [--days N] [--mac NAME] [--text]" >&2; exit 2;;
+    esac
+    shift
+  done
+  case "$days" in ''|*[!0-9]*) echo "usage-history: --days must be a whole number" >&2; exit 2;; esac
+  local rows
+  if [ -s "$USAGE_HISTORY" ]; then
+    rows="$(jq -cR --argjson cut $(( $(date +%s) - days * 86400 )) --arg mac "$mac" "$JQ_EPOCH"'
+      fromjson? | select(type == "object" and ((.ts | ep) // 0) >= $cut and ($mac == "" or .mac == $mac))' "$USAGE_HISTORY" 2>/dev/null | jq -sc '.')"
+  fi
+  [ -n "${rows:-}" ] || rows="[]"
+  if [ "$text" -eq 1 ]; then
+    [ "$(printf '%s' "$rows" | jq 'length')" -gt 0 ] || { echo "No usage history in the last $days day(s) yet (keepalive and auto ticks write it)."; exit 0; }
+    printf '%s' "$rows" | jq -r "$JQ_EPOCH"'.[] |
+      (((.ts | ep) // 0) | strflocaltime("%Y-%m-%d %H:%M")) + "  " + (.mac // "?") + "  "
+      + (if .ev then "\(.ev) \(.from // "?") → \(.to // "?") (\(.by // "?"))"
+         else "\(.acct)\(if .active then "*" else "" end)  week \(.w // "?")% · Fable \(.fable // "?")% · \(.status // "?")"
+              + (if .last == false then " · will not last to reset" else "" end) end)'
+  else
+    printf '%s\n' "$rows"
+  fi
+  exit 0
 }
 
 # --- logins: when each account's login ends -------------------------------------
@@ -1729,14 +1895,37 @@ printf 'keepalive\t%s\n' "$(swap-guard keepalive status 2>/dev/null | tr -d '\n'
 printf 'load\t%s\n' "$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
 printf 'memgb\t%s\n' "$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
 printf 'cpus\t%s\n' "$(sysctl -n hw.ncpu 2>/dev/null)"
+# The feed (schema 2): this Mac's clock, its own launchd-written reading (an SSH
+# login often cannot open the keychain), login end dates, auto-swap settings, the
+# tail of auto.log and each session's context fill. Raw files only: no jq here.
+B="$HOME/.claude-swap-backup"
+printf 'now\t%s\n' "$(date +%s)"
+printf 'home\t%s\n' "$HOME"
+printf 'self\t%s\n' "$(tr -d '\n' < "$B/cache/self.json" 2>/dev/null)"
+printf 'logins\t%s\n' "$(tr -d '\n' < "$B/cache/logins.json" 2>/dev/null)"
+printf 'instantoff\t%s\n' "$([ -f "$B/instant-swap.off" ] && echo 1 || echo 0)"
+printf 'autoargs\t%s\n' "$(plutil -extract ProgramArguments json -o - "$HOME/Library/LaunchAgents/com.overclaude.autoswap.plist" 2>/dev/null | tr -d '\n')"
+tail -n 30 "$B/auto.log" 2>/dev/null | while IFS= read -r l; do printf 'autolog\t%s\n' "$l"; done
+find "$B/ctx" -maxdepth 1 -name '*.json' -mtime -2 2>/dev/null | while IFS= read -r f; do
+  n="${f##*/}"; printf 'ctx\t%s\t%s\n' "${n%.json}" "$(tr -d '\n\t' < "$f" 2>/dev/null)"
+done
 printf 'done\t1\n'
 EOF
 }
 
-# _fleet_snapshot_json <name> <probe-output> — one Mac's row as JSON.
+# _fleet_snapshot_json <name> <probe-output> [source] — one Mac's row as JSON.
+# source: "self" (this Mac read in place, or another Mac whose own report filled in
+# what the SSH read could not see; reportedAt/dataAgeSec are then that report's) or
+# "ssh" (another Mac's live SSH read only). readAt is when the probe ran.
+# Each account takes the live read unless that says keychain_unavailable /
+# token_expired / unknown (an SSH login often cannot open the keychain) and the
+# Mac's own launchd-written report (cache/self.json, if under SELF_REPORT_MAX_AGE)
+# knows better; its `source` says which, and `liveStatus` keeps the SSH answer.
+# Ages are worked out here, from each number's fetch time.
 _fleet_snapshot_json() {
-  local name="$1" raw="$2" k v
+  local name="$1" raw="$2" rsrc="${3:-ssh}" k v
   local host="" kit="" cl="" sgp="" ses="[]" acc="{}" ka="{}" load="" mem="" cpus=""
+  local pnow="" phome="" self="{}" logins="{}" instoff="" aargs="" alog="" ctx=""
   while IFS="$(printf '\t')" read -r k v; do
     case "$k" in
       host) host="$v";; kit) kit="$v";; claude) cl="$v";; swapguard) sgp="$v";;
@@ -1744,19 +1933,119 @@ _fleet_snapshot_json() {
       accounts) printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1 && acc="$v";;
       keepalive) printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1 && ka="$v";;
       load) load="$v";; memgb) mem="$v";; cpus) cpus="$v";;
+      now) pnow="$v";; home) phome="$v";; instantoff) instoff="$v";; autoargs) aargs="$v";;
+      self) printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1 && self="$v";;
+      logins) printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1 && logins="$v";;
+      autolog) alog="$alog$v
+";;
+      ctx) ctx="$ctx$v
+";;
     esac
   done <<EOF
 $raw
 EOF
   jq -cn --arg name "$name" --arg host "$host" --arg kit "$kit" --arg cl "$cl" --arg sg "$sgp" \
     --argjson ses "$ses" --argjson acc "$acc" --argjson ka "$ka" --arg load "$load" --arg mem "$mem" --arg cpus "$cpus" \
-    '{name:$name, online:true, host:$host, kit:(if $kit == "" then null else $kit end), claude:(if $cl == "" then null else $cl end),
+    --arg rsrc "$rsrc" --arg pnow "$pnow" --arg home "$phome" --argjson self "$self" --argjson logins "$logins" \
+    --arg instoff "$instoff" --arg aargs "$aargs" --arg alog "$alog" --arg ctxraw "$ctx" --argjson hubnow "$(date +%s)" \
+    --argjson maxage "$SELF_REPORT_MAX_AGE" \
+    "$JQ_EPOCH"'
+    def lc: ascii_downcase;
+    def bad: . == null or . == "keychain_unavailable" or . == "token_expired" or . == "unknown";
+    def win($w): if ($w | type) != "object" then null
+      else {pct: $w.pct, resetsAt: $w.resetsAt, expectedPct: $w.expectedPct, aheadOfPace: $w.aheadOfPace,
+            projectedExhaustionAt: $w.projectedExhaustionAt, willLastToReset: $w.willLastToReset}
+           | with_entries(select(.value != null)) end;
+    def fable($u): (first(($u.scoped // [])[]? | select((.name // "" | lc) == "fable")) // null);
+    # Times from that Mac are on its clock: measure them against its own `now`
+    # (from the probe), so a clock that runs ahead or behind never skews an age.
+    ($pnow | tonumber? // null) as $readat
+    | ($readat // $hubnow) as $ref
+    | def age($t): ($t | ep) as $f | if $f == null then null else ([$ref - $f, 0] | max) end;
+    ((($self.reportedAt | numbers) // 0) | $ref - . <= $maxage) as $selfok
+    | (if $selfok then ($self.list.accounts // []) else [] end) as $sa | ($logins.accounts // []) as $la
+    | ($ctxraw | split("\n") | map(select(length > 0) | index("\t") as $i | select($i != null)
+        | {key: .[0:$i], value: (.[($i + 1):] | fromjson? // null)}) | from_entries) as $ctx
+    | [($acc.accounts // [])[] | . as $live | ($live.email // "" | lc) as $e
+        | (first($sa[] | select((.email // "" | lc) == $e)) // null) as $s
+        | (if ($live.usageStatus | bad) and $s != null and (($s.usageStatus | bad) | not)
+           then {a: $s, src: "self-report"} else {a: $live, src: "live"} end) as $p
+        | $p.a as $a
+        | (((first($la[] | select((.email // "" | lc) == $e))) // {}) | .endsAt // null) as $le
+        | {email: $live.email, active: ($live.active // false), status: ($a.usageStatus // "unknown"),
+           alias: ($live.alias // $a.alias // null), number: ($live.number // null),
+           loginExpiresAt: ($live.loginExpiresAt // ($s // {}).loginExpiresAt // (if ($le | type) == "number" then ($le | todate) else null end)),
+           sevenDay: win($a.usage.sevenDay), fable: win(fable($a.usage)),
+           usageFetchedAt: ($a.usageFetchedAt // null), usageAgeSeconds: age($a.usageFetchedAt // null),
+           source: $p.src}
+          + (if $p.src == "self-report" then {liveStatus: ($live.usageStatus // "unknown")} else {} end)] as $accts
+    | ($alog | split("\n") | map(fromjson?) | map(select(type == "object" and .source == null)) | reverse) as $r
+    | ([$r | to_entries[] | select(.value.action != "deferred") | .key] | first // ($r | length)) as $k
+    | ($aargs | fromjson? // null) as $aa
+    | (any($accts[]; .source == "self-report")) as $usedself
+    | (if $usedself then $self.reportedAt else $readat end) as $rep
+    | {name:$name, online:true, host:$host, kit:(if $kit == "" then null else $kit end), claude:(if $cl == "" then null else $cl end),
       overclaude:($sg == "yes"),
       sessions:($ses | length), busy:([$ses[] | select(.status == "busy")] | length),
-      accounts:[($acc.accounts // [])[] | {email, active:(.active // false), status:(.usageStatus // "unknown")}],
-      dead:[($acc.accounts // [])[] | select(.usageStatus == "relogin_required") | .email],
+      accounts:$accts,
+      dead:[$accts[] | select(.status == "relogin_required") | .email],
       keepalive:($ka.loaded // false),
-      load:($load | tonumber? // null), memGB:($mem | tonumber? // null), cpus:($cpus | tonumber? // null)}'
+      load:($load | tonumber? // null), memGB:($mem | tonumber? // null), cpus:($cpus | tonumber? // null),
+      activeAlias:((first($accts[] | select(.active)) // null) | if . == null then null else (.alias // .email) end),
+      source:(if $usedself then "self" else $rsrc end), readAt:$readat,
+      reportedAt:$rep, dataAgeSec:(if $rep == null then null else ([$ref - $rep, 0] | max) end),
+      clockSkewSec:(if $readat == null then null else $hubnow - $readat end),
+      selfReportedAt:($self.reportedAt // null),
+      selfReportAgeSec:(if ($self.reportedAt | type) == "number" then ([$ref - $self.reportedAt, 0] | max) else null end),
+      autoThreshold:(if ($aa | type) != "array" then null
+                     else ($aa | index("--threshold")) as $i | if $i == null then 97 else ($aa[$i + 1] | tonumber? // null) end end),
+      instantSwap:(if $instoff == "" then null else $instoff != "1" end),
+      deferred:(if $k == 0 then null
+                else {reason: $r[0].reason, busySessions: $r[0].busySessions, to: $r[0].to, since: $r[$k - 1].ts, lastAt: $r[0].ts} end),
+      sessionList:[$ses[] | (.sessionId // "") as $sid
+        | {sessionId: (.sessionId // null),
+           cwd: ((.cwd // null) | if type == "string" and $home != "" and startswith($home) then "~" + .[($home | length):] else . end),
+           status: (.status // "unknown"), ctxPct: ($ctx[$sid].pct // null), ctxAt: ($ctx[$sid].ts // null)}]}'
+}
+
+# _fleet_usage — the fleet-status object on stdin gains `usage`: one entry per
+# ACCOUNT (limits are per account, so any Mac's reading will do; the freshest wins),
+# with room (100 - week %) and the Macs it is active on. Each Mac gets `bestTarget`:
+# among the accounts logged in THERE with status ok and over 6 h left on THAT Mac's
+# login (LOGINS_MIN), the one with the most room that lasts to its reset. `best` in
+# `usage` marks this Mac's bestTarget. Codex limits (this Mac's codex-usage cache)
+# follow as kind "codex".
+_fleet_usage() {
+  local codex
+  codex="$(jq -c 'if type == "array" then . else [] end' "$STATE_ROOT/cache/codex-usage.json" 2>/dev/null)"; [ -n "$codex" ] || codex="[]"
+  jq -c --argjson codex "$codex" --argjson now "$(date +%s)" --argjson min "$LOGINS_MIN" "$JQ_EPOCH"'
+    def lc: ascii_downcase;
+    . as $o
+    | [($o.macs // [])[] | select(.online == true) | .name as $m | (.accounts // [])[] | select(.email != null) | . + {mac: $m}]
+    | group_by(.email | lc)
+    | map(. as $rows
+        | ([$rows[] | select(.sevenDay.pct != null)] | sort_by(.usageAgeSeconds // 1e12) | first) as $b
+        | {alias: (([$rows[] | .alias // empty] | first) // ($rows[0].email | split("@")[0])), email: $rows[0].email,
+           sevenDay: ($b.sevenDay // null), fable: ($b.fable // null),
+           usageFetchedAt: ($b.usageFetchedAt // null), usageAgeSeconds: ($b.usageAgeSeconds // null), usageFrom: ($b.mac // null),
+           room: (if $b.sevenDay.pct != null then ((100 - $b.sevenDay.pct) * 10 | round / 10) else null end),
+           activeOn: [$rows[] | select(.active) | .mac]}) as $u
+    | def target($mac): [($mac.accounts // [])[] | select(.status == "ok" and .email != null)
+          | (.loginExpiresAt | ep) as $le | select($le == null or $le - $now > $min)
+          | (.email | lc) as $e
+          | first($u[] | select((.email | lc) == $e and .sevenDay.willLastToReset == true and .room != null))]
+        | max_by(.room) | .email // null;
+    [($o.macs // [])[] | if .online == true
+        then . + {bestTarget: (target(.) as $t | if $t == null then null else (first($u[] | select(.email == $t)) | .alias) end)}
+        else . end] as $macs
+    | ((first(($o.macs // [])[] | select(.self == true and .online == true)) // null) | if . == null then null else target(.) end) as $be
+    | ($u | map(. + (if $be != null and .email == $be then {best: true} else {} end)))
+      + [$codex[] | select(type == "object")
+        | {alias: (if (.name // "primary") == "primary" then "codex" else "codex-" + .name end), kind: "codex",
+           windows: [(.windows // [])[] | {pct, resetsAt, label}], asOf: (.asOf // null), limitReached: .limitReached,
+           usageAgeSeconds: (if (.asOf | type) == "number" then ([$now - .asOf, 0] | max) else null end),
+           room: ([(.windows // [])[] | .pct | numbers] | if length == 0 then null else 100 - max end)}]
+    | ($o + {schema: 2, usage: ., macs: $macs})'
 }
 
 _fleet_hosts() { jq -r '.hosts[]?.name' "$FLEET_JSON" 2>/dev/null; }
@@ -1886,7 +2175,7 @@ _fleet_status() {
   local watchdog=$!
   for p in $pids; do wait "$p" 2>/dev/null; done
   _fleet_kill_tree "$watchdog"; wait "$watchdog" 2>/dev/null
-  rows="$(_fleet_snapshot_json "this Mac" "$(cat "$d/0.raw" 2>/dev/null)" | jq -c '.self = true')"
+  rows="$(_fleet_snapshot_json "this Mac" "$(cat "$d/0.raw" 2>/dev/null)" self | jq -c --arg mn "$(_mac_name)" '.self = true | .macName = $mn')"
   local n=1
   while [ "$n" -le "$i" ]; do
     h="$(cat "$d/$n.name")"
@@ -1900,17 +2189,30 @@ $(jq -cn --arg h "$h" '{name:$h, online:false}')"
     n=$((n + 1))
   done
   rm -rf "$d"
-  out="$(printf '%s\n' "$rows" | jq -sc --argjson now "$(date +%s)" '{checkedAt:$now, macs:.}')"
+  # The schema-1 object (the old keys) always stands on its own: if the per-account
+  # part fails, status falls back to it, and an empty answer never reaches the cache.
+  local base
+  base="$(printf '%s\n' "$rows" | jq -sc --argjson now "$(date +%s)" '{checkedAt:$now, macs:[.[] | select(type == "object")]}' 2>/dev/null)"
+  out="$(printf '%s' "$base" | _fleet_usage 2>/dev/null)"
+  printf '%s' "$out" | jq -e '.schema == 2 and (.macs | type == "array")' >/dev/null 2>&1 || out="$base"
+  if ! printf '%s' "$out" | jq -e '.macs | type == "array"' >/dev/null 2>&1; then
+    echo '{"error":"fleet-status-failed"}'; return 1
+  fi
   mkdir -p "$STATE_ROOT/cache" && printf '%s\n' "$out" > "$FLEET_CACHE.tmp.$$" && mv "$FLEET_CACHE.tmp.$$" "$FLEET_CACHE"
   if [ "$text" -eq 1 ]; then
-    printf '%s' "$out" | jq -r '.macs[] |
+    printf '%s' "$out" | jq -r '(.macs[] |
       if .online then
         "\(.name)\(if .self then "" else " (" + .host + ")" end): \(.sessions) session(s)\(if .busy > 0 then ", \(.busy) busy" else "" end)"
         + " · load \(.load // "?") on \(.cpus // "?") cores · \(.memGB // "?") GB"
         + " · overclaude \(.kit // "not installed")"
-        + " · accounts: \(if (.accounts | length) == 0 then "none" else ([.accounts[] | (.email | split("@")[0]) + (if .active then "*" else "" end) + (if .status == "relogin_required" then " ⚠ relogin" else "" end)] | join(", ")) end)"
+        + " · accounts: \(if (.accounts | length) == 0 then "none" else ([.accounts[] | (.alias // (.email | split("@")[0])) + (if .active then "*" else "" end) + (if .status == "relogin_required" then " ⚠ relogin" elif .status != "ok" and .status != null then " (\(.status))" else "" end)] | join(", ")) end)"
         + (if .keepalive then "" else " · keepalive off" end)
-      else "\(.name): offline (no SSH answer)" end'
+        + (if (.sessionList // []) | any(.ctxPct != null) then " · ctx " + ([.sessionList[] | select(.ctxPct != null) | "\(.ctxPct)%"] | join(" ")) else "" end)
+      else "\(.name): offline (no SSH answer)" end),
+      (if (.usage // []) | length > 0 then
+        "room left: " + ([.usage[] | "\(.alias) " + (if .room == null then "?" else "\(.room | floor)%" end) + (if .best then " (best)" else "" end)
+          + (if (.activeOn // []) | length > 0 then " on " + (.activeOn | join("/")) else "" end)] | join(" · "))
+      else empty end)'
   else
     printf '%s\n' "$out"
   fi
@@ -1954,7 +2256,8 @@ _fleet_swap() {
                     (if $model == "" then 0 else pct([$u.scoped[]? | select((.name | lc) == ($model | lc))] | first) end)] | max;
     def listed($a): [$capped[] | select(.slot == ($a.number | tostring) and .until > $now
                       and (.model == "" or (.model | lc) == ($model | lc)))] | length > 0;
-    # A target needs the same filters instant swap uses on this Mac: not disabled,
+    # The worker switches over SSH, so it is judged by what SSH saw (liveStatus),
+    # never by a self report. A target needs the same filters instant swap uses on this Mac: not disabled,
     # a usable login here, numbers to judge by, and not recorded as capped.
     def room($e): acct($e) as $a
       | if $a == null or ($a.disabled // false) or (($a.usageStatus // "") | okstatus | not) or listed($a)
@@ -1968,7 +2271,7 @@ _fleet_swap() {
      | if $act == null then {name, action:"skip", reason:"no-active-account"}
        elif $from != "" and (($act.email // "") | lc) != ($from | lc) then {name, action:"skip", reason:"not-on-that-account", active:$act.email}
        elif $from == "" and (capped($act.email) | not) then {name, action:"skip", reason:"active-has-room", active:$act.email}
-       else ([.accounts[] | select((.active | not) and (.status | okstatus))
+       else ([.accounts[] | select((.active | not) and ((.liveStatus // .status) | okstatus))
               | . + {r: room(.email)} | select(.r != null and .r.score < 100)]
              | sort_by([.r.score, .r.reset]) | first) as $best
          | if $best == null then {name, action:"none", reason:"no-account-with-room-there", from:$act.email}
@@ -4832,6 +5135,7 @@ main() {
     token)         cmd_token "$@";;
     remote)        cmd_remote "$@";;
     fleet)         cmd_fleet "$@";;
+    usage-history) cmd_usage_history "$@";;
     artifacts)
       case "${1:-}" in
         find|list) shift; _art_find "$@"; exit $?;;
