@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "overclaude"
-version = "1.10.2"
+version = "1.11.0"
 description = "Claude Code, overclocked — multi-account hot-swap, context-threshold handoff, and an instrumented statusline"
 readme = "README.md"
 license = { text = "MIT" }
